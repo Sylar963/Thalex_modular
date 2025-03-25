@@ -1,0 +1,24 @@
+2025-02-12 13:52:17,396 - INFO - simple_quoter.py:116 - Portfolio updated - BTC-PERPETUAL position: 0.0
+2025-02-12 13:52:18,380 - INFO - simple_quoter.py:67 - Inserting Direction.BUY: 0.1 @ 97602
+2025-02-12 13:52:18,381 - INFO - simple_quoter.py:67 - Inserting Direction.SELL: 0.1 @ 97627
+2025-02-12 13:52:19,382 - INFO - simple_quoter.py:59 - Amending Direction.BUY to 0.1 @ 97590
+2025-02-12 13:52:19,382 - INFO - simple_quoter.py:59 - Amending Direction.SELL to 0.1 @ 97637
+2025-02-12 13:52:20,383 - INFO - simple_quoter.py:59 - Amending Direction.BUY to 0.1 @ 97549
+2025-02-12 13:52:20,384 - INFO - simple_quoter.py:59 - Amending Direction.SELL to 0.1 @ 97670
+2025-02-12 13:52:22,237 - INFO - simple_quoter.py:59 - Amending Direction.BUY to 0.1 @ 97537
+2025-02-12 13:52:22,238 - INFO - simple_quoter.py:59 - Amending Direction.SELL to 0.1 @ 97680
+2025-02-12 13:52:22,386 - INFO - simple_quoter.py:59 - Amending Direction.BUY to 0.1 @ 97518
+2025-02-12 13:52:22,387 - INFO - simple_quoter.py:59 - Amending Direction.SELL to 0.1 @ 97695
+2025-02-12 13:52:25,388 - INFO - simple_quoter.py:59 - Amending Direction.BUY to 0.1 @ 97506
+2025-02-12 13:52:25,388 - INFO - simple_quoter.py:59 - Amending Direction.SELL to 0.1 @ 97705
+2025-02-12 13:52:26,388 - INFO - simple_quoter.py:59 - Amending Direction.BUY to 0.1 @ 97499
+2025-02-12 13:52:26,389 - INFO - simple_quoter.py:59 - Amending Direction.SELL to 0.1 @ 97711
+2025-02-12 13:52:31,392 - INFO - simple_quoter.py:59 - Amending Direction.SELL to 0.1 @ 97701
+2025-02-12 13:52:31,393 - INFO - simple_quoter.py:59 - Amending Direction.BUY to 0.1 @ 97515
+2025-02-12 13:52:32,394 - INFO - simple_quoter.py:59 - Amending Direction.BUY to 0.1 @ 97525
+2025-02-12 13:52:32,395 - INFO - simple_quoter.py:59 - Amending Direction.SELL to 0.1 @ 97690
+2025-02-12 13:52:33,394 - INFO - simple_quoter.py:59 - Amending Direction.SELL to 0.1 @ 97679
+2025-02-12 13:52:33,395 - INFO - simple_quoter.py:59 - Amending Direction.BUY to 0.1 @ 97544
+2025-02-12 13:52:34,396 - INFO - simple_quoter.py:59 - Amending Direction.SELL to 0.1 @ 97697
+2025-02-12 13:52:34,396 - INFO - simple_quoter.py:59 - Amending Direction.BUY to 0.1 @ 97530
+2025-02-12 13:52:34,583 - INFO - simple_quoter.py:157 - Quoting cancelled
