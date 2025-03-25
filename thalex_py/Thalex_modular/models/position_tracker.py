@@ -1,9 +1,9 @@
-import logging
 import time
 import threading
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 
+from ..logging import LoggerFactory
 
 class Fill:
     """
@@ -26,6 +26,13 @@ class PositionTracker:
     Manages position accounting in a more robust way.
     """
     def __init__(self):
+        # Initialize logger
+        self.logger = LoggerFactory.configure_component_logger(
+            "position_tracker",
+            log_file="position_tracker.log",
+            high_frequency=False
+        )
+        
         self.current_position = 0.0
         self.average_entry_price = None
         self.weighted_entries = {}  # Dictionary to track entry prices and sizes
@@ -39,7 +46,8 @@ class PositionTracker:
         self.validation_interval = 15  # Validate every 15 seconds (reduced from 60)
         self.position_lock = threading.Lock()  # Lock for thread safety
         self.ZERO_THRESHOLD = 1e-6  # More precise zero threshold
-        self.logger = logging.getLogger(__name__)
+        
+        self.logger.info("Position tracker initialized")
         
     def update_on_fill(self, fill: Fill):
         """

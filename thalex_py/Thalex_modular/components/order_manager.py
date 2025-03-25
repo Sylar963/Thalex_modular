@@ -1,16 +1,14 @@
-import logging
+import asyncio
 import time
 from typing import List, Dict, Optional, Tuple
 import thalex as th
-import asyncio
 
 from ..models.data_models import Order, OrderStatus, Quote
 from ..config.market_config import (
-    ORDERBOOK_CONFIG,
-    MARKET_CONFIG,
-    QUOTING_CONFIG,
-    TRADING_CONFIG
+    TRADING_CONFIG,
+    MARKET_CONFIG
 )
+from ..logging import LoggerFactory
 
 class OrderManager:
     """Order management component handling order placement and tracking"""
@@ -18,6 +16,13 @@ class OrderManager:
     def __init__(self, thalex: th.Thalex):
         # Thalex client
         self.thalex = thalex
+        
+        # Initialize logger
+        self.logger = LoggerFactory.configure_component_logger(
+            "order_manager",
+            log_file="order_manager.log",
+            high_frequency=True
+        )
         
         # Order tracking
         self.orders: Dict[int, Order] = {}  # Main order tracking by ID
@@ -29,7 +34,7 @@ class OrderManager:
         self.order_id_lock = asyncio.Lock()
         
         # Operation control
-        self.operation_semaphore = asyncio.Semaphore(ORDERBOOK_CONFIG["max_pending_operations"])
+        self.operation_semaphore = asyncio.Semaphore(TRADING_CONFIG["quoting"]["max_pending_operations"])
         self.pending_operations = set()
         
         # Order metrics
@@ -45,8 +50,7 @@ class OrderManager:
         self.tick_size = 0.0
         self.perp_name = None
         
-        # Initialize logger
-        self.logger = logging.getLogger(__name__)
+        self.logger.info("Order manager initialized")
         
     def set_tick_size(self, tick_size: float) -> None:
         """Set tick size for order price alignment"""
@@ -279,6 +283,68 @@ class OrderManager:
             
         except Exception as e:
             self.logger.error(f"Error updating order: {str(e)}")
+            
+    async def handle_order_result(self, result: Dict, order_id: int) -> None:
+        """Handle order operation results from API"""
+        try:
+            # Check if order is in our tracking
+            if order_id not in self.orders:
+                self.logger.warning(f"Order {order_id} not found for result update")
+                return
+                
+            # Extract order details from result
+            order_data = result
+            
+            # Update order status if present in result
+            if order_data.get("status"):
+                # Create updated order
+                updated_order = Order(
+                    id=order_id,
+                    price=float(order_data.get("price", 0)),
+                    amount=float(order_data.get("amount", 0)),
+                    status=OrderStatus(order_data.get("status", "pending")),
+                    direction=order_data.get("direction", "")
+                )
+                
+                # Update order in our tracking
+                await self.update_order(updated_order)
+                
+            self.logger.debug(f"Processed result for order {order_id}")
+            
+        except Exception as e:
+            self.logger.error(f"Error handling order result: {str(e)}")
+            
+    async def handle_order_error(self, error: Dict, order_id: int) -> None:
+        """Handle order operation errors from API"""
+        try:
+            # Check if order is in our tracking
+            if order_id not in self.orders:
+                self.logger.warning(f"Order {order_id} not found for error update")
+                return
+                
+            error_msg = error.get("message", "")
+            error_code = error.get("code", -1)
+            
+            # Handle specific error cases
+            if "order not found" in error_msg.lower():
+                # Order already canceled or never existed, remove from tracking
+                if order_id in self.active_bids:
+                    del self.active_bids[order_id]
+                if order_id in self.active_asks:
+                    del self.active_asks[order_id]
+                    
+                # Update order status
+                order = self.orders[order_id]
+                order.status = OrderStatus.CANCELLED
+                
+                self.logger.info(f"Order {order_id} marked as cancelled (not found on exchange)")
+                
+            else:
+                # Generic error handling
+                self.logger.error(f"API error for order {order_id}: {error_code} - {error_msg}")
+                
+        except Exception as e:
+            self.logger.error(f"Error handling order error: {str(e)}")
 
     def is_level_one_quote(self, price: float, direction: str) -> bool:
         """

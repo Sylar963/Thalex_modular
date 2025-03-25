@@ -1,34 +1,69 @@
 import numpy as np
-import logging
 from typing import Dict, List, Optional, Tuple
 import time
 from collections import deque
-from datetime import datetime
 import math
 import random
+from datetime import datetime
 
-from thalex_py.Thalex_modular.config.market_config import TRADING_PARAMS, ORDERBOOK_CONFIG, TECHNICAL_PARAMS, RISK_LIMITS, TRADING_CONFIG
-from thalex_py.Thalex_modular.models.data_models import Quote, Ticker
-from thalex_py.Thalex_modular.models.position_tracker import PositionTracker, Fill
+from ..config.market_config import TRADING_CONFIG, RISK_LIMITS, ORDERBOOK_CONFIG
+from ..models.data_models import Ticker, Quote
+from ..models.position_tracker import PositionTracker, Fill
+from ..logging import LoggerFactory
 
 class AvellanedaMarketMaker:
-    """
-    Simplified implementation of the Avellaneda-Stoikov market making model.
-    """
+    """Avellaneda-Stoikov market making strategy implementation"""
     
     def __init__(self):
         # Initialize logger
-        self.logger = logging.getLogger(__name__)
+        self.logger = LoggerFactory.configure_component_logger(
+            "avellaneda_market_maker",
+            log_file="market_maker.log",
+            high_frequency=True
+        )
+        
+        # Trading parameters
+        self.gamma = TRADING_CONFIG["avellaneda"]["gamma"]  # Risk aversion
+        self.k_default = TRADING_CONFIG["avellaneda"]["kappa"]  # Inventory risk factor
+        self.kappa = self.k_default
+        
+        # Position tracking
+        self.position_tracker = PositionTracker()
+        
+        # Market parameters
+        self.volatility = TRADING_CONFIG["volatility"]["default"]
+        self.tick_size = 0.0
+        self.time_horizon = TRADING_CONFIG["avellaneda"]["time_horizon"]
+        self.reservation_price_offset = 0.0
+        
+        # Performance tracking
+        self.quote_count = 0
+        self.quote_levels = TRADING_CONFIG["quoting"]["levels"]
+        self.instrument = None
+        
+        # Strategy state
+        self.last_mid_price = 0.0
+        self.last_update_time = 0.0
+        self.volatility_grid = []
+        
+        # VAMP (Volume Adjusted Market Pressure) tracking
+        self.vamp_window = deque(maxlen=TRADING_CONFIG["vamp"]["window"])
+        self.vamp_aggressive_window = deque(maxlen=TRADING_CONFIG["vamp"]["aggressive_window"])
+        self.vamp_buy_volume = 0.0
+        self.vamp_sell_volume = 0.0
+        self.vamp_value = 0.0
+        self.vamp_impact = 0.0
+        self.vamp_impact_window = deque(maxlen=TRADING_CONFIG["vamp"]["impact_window"])
+        
+        self.logger.info("Avellaneda market maker initialized")
         
         # Avellaneda-Stoikov parameters
-        self.gamma = TRADING_CONFIG["avellaneda"]["gamma"]  # Risk aversion
         self.inventory_weight = TRADING_CONFIG["avellaneda"]["inventory_weight"]  # Inventory skew
         self.position_fade_time = TRADING_CONFIG["avellaneda"]["position_fade_time"]  # Time to fade position
         self.order_flow_intensity = TRADING_CONFIG["avellaneda"]["order_flow_intensity"]  # Order flow intensity
         
         # Add critical missing parameters
         self.position_limit = TRADING_CONFIG["avellaneda"]["position_limit"]  # Position limit
-        self.instrument = ""  # Instrument name must be set externally
         self.base_spread_factor = 1.0  # Base spread multiplier
         self.market_impact_factor = 0.5  # Market impact multiplier
         self.inventory_factor = 0.5  # Inventory adjustment factor
@@ -39,7 +74,6 @@ class AvellanedaMarketMaker:
         self.position_size = 0.0
         self.entry_price = None
         self.last_quote_time = 0.0
-        self.tick_size = None
         self.min_tick = 0.0
         self.last_position_check = 0
         self.last_quote_update = 0
@@ -54,18 +88,12 @@ class AvellanedaMarketMaker:
         self.aggressive_sells_sum = 0.0
         
         # Market conditions
-        self.volatility = TRADING_CONFIG["volatility"]["floor"]  # Initialize with floor
         self.market_impact = 0.0
         
         # Quote tracking
         self.active_quotes: Dict[str, Quote] = {}
         self.current_bid_quotes: List[Quote] = []
         self.current_ask_quotes: List[Quote] = []
-        
-        # Position tracking
-        self.position_tracker = PositionTracker()
-        
-        self.logger.info(f"Avellaneda-Stoikov market maker initialized with gamma={self.gamma}, inventory_weight={self.inventory_weight}")
 
     def set_tick_size(self, tick_size: float):
         """Set the tick size for the instrument"""

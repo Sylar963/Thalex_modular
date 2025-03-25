@@ -17,105 +17,35 @@ from dataclasses import dataclass, field
 import thalex as th
 from .keys import *  # Import from the local keys.py file
 
-# Configuration parameters
-UNDERLYING = "BTCUSD"
-LABEL = "P"
-AMEND_THRESHOLD = 25  # ticks
-NETWORK = th.Network.TEST
-SPREAD = 0.5  # Our best quotes will be index +/- SPREAD * tick size
-BID_STEP = 25  # ticks distance between quote levels
-BID_SIZES = [0.2, 0.8]  # sizes for each quoted level
-ASK_STEP = 25  # ticks distance between quote levels
-ASK_SIZES = [0.2, 0.8]  # sizes for each quoted level
+# Import configurations from market_config.py
+from ..config.market_config import (
+    BOT_CONFIG,
+    MARKET_CONFIG,
+    TRADING_CONFIG,
+    RISK_CONFIG,
+    PERFORMANCE_CONFIG
+)
 
-# Add to configuration section
-POSITION_LIMITS = {
-    "max_position": 1.0,  # Maximum absolute position size
-    "max_notional": 50000,  # Maximum notional value in USD
-    "stop_loss_pct": 0.06,  # 6% stop loss
-    "take_profit_pct": 0.03,  # 3% take profit
-    "base_take_profit_pct": 0.02,  # Base take profit
-    "max_take_profit_pct": 0.05,   # Maximum take profit
-    "min_take_profit_pct": 0.01,   # Minimum take profit
-    "trailing_stop_activation": 0.015,  # Activate trailing at 1.5% profit
-    "trailing_stop_distance": 0.01,     # 1% trailing distance
-    "rebalance_threshold": 0.8,  # Rebalance when position reaches 80% of max
-    "take_profit_levels": [
-        {"percentage": 0.01, "size": 0.2},  # Take 20% profit at 1%
-        {"percentage": 0.02, "size": 0.3},  # Take 30% profit at 2%
-        {"percentage": 0.03, "size": 0.3},  # Take 30% profit at 3%
-        {"percentage": 0.05, "size": 0.2},  # Take remaining 20% at 5%
-    ],
-    "trailing_stop_levels": [
-        {"activation": 0.015, "distance": 0.01},  # First trailing stop
-        {"activation": 0.03, "distance": 0.015},  # Second trailing stop
-        {"activation": 0.05, "distance": 0.02},   # Final trailing stop
-    ],
-}
+# Basic configuration - use values from MARKET_CONFIG
+UNDERLYING = MARKET_CONFIG["underlying"]
+LABEL = MARKET_CONFIG["label"]
+NETWORK = MARKET_CONFIG["network"]
 
-# Add to configuration section
-QUOTING_CONFIG = {
-    "base_levels": [
-        {"size": 0.2, "step": 10},  # Tighter spread, smaller size
-        {"size": 0.4, "step": 25},  # Medium spread, medium size
-        {"size": 0.4, "step": 40},  # Wider spread, larger size
-    ],
-    "min_spread": 0.3,  # Minimum spread in tick size
-    "max_spread": 2.0,  # Maximum spread in tick size
-    "position_skew_factor": 0.2,  # How much to skew quotes based on position
-    "volatility_spread_factor": 0.5,  # How much to widen spread in volatility
-    "market_impact_threshold": 0.01,  # 1% price impact threshold
-    "quote_lifetime": 30,  # Maximum quote lifetime in seconds
-    "amend_threshold": 15,  # Ticks difference to trigger amend
-    "min_quote_interval": 0.5,  # Reduce from 2.0 to 0.5 seconds
-    "error_retry_interval": 1.0,  # Reduce from 5.0 to 1.0 seconds
-    "order_operation_interval": 0.1,  # Reduce from 0.5 to 0.1 seconds
-    "max_pending_operations": 5,  # Maximum concurrent order operations
-    "fast_cancel_threshold": 0.005,  # 0.5% price movement for fast cancellation
-}
+# Order book configuration - use values from TRADING_CONFIG
+AMEND_THRESHOLD = TRADING_CONFIG["order"]["amend_threshold"]
+SPREAD = TRADING_CONFIG["order"]["spread"]
+BID_STEP = TRADING_CONFIG["order"]["bid_step"]
+ASK_STEP = TRADING_CONFIG["order"]["ask_step"]
+BID_SIZES = TRADING_CONFIG["order"]["bid_sizes"]
+ASK_SIZES = TRADING_CONFIG["order"]["ask_sizes"]
 
-# Add to configuration section
-INVENTORY_CONFIG = {
-    "max_inventory_imbalance": 0.7,  # Maximum allowed inventory imbalance (70%)
-    "target_inventory": 0.0,  # Target inventory level
-    "inventory_fade_time": 300,  # Time to fade inventory position (seconds)
-    "adverse_selection_threshold": 0.002,  # 0.2% price move threshold
-    "inventory_skew_factor": 0.3,  # How much to skew quotes based on inventory
-    "max_position_notional": 40000,  # Maximum notional position (80% of max_notional)
-    "min_profit_rebalance": 0.01,  # Minimum profit to trigger rebalance (1%)
-    "gradual_exit_steps": 4,  # Number of steps for gradual position exit
-    "max_loss_threshold": 0.03,  # Maximum loss before gradual exit (3%)
-    "inventory_cost_factor": 0.0001,  # Cost of holding inventory
-}
-
-# Add to configuration section
-SIGNAL_CONFIG = {
-    "bbands_period": 20,
-    "bbands_std": 2,
-    "momentum_period": 10,
-    "volume_ma_period": 20,
-    "min_signal_strength": 0.3,
-    "signal_cooldown": 300,
-    "trend_confirmation_threshold": 0.6,
-    "max_position_increase": 0.2,  # Maximum position increase per signal
-    "notional_utilization_threshold": 0.8,  # 80% of max notional
-    "signal_size_dampening": 0.5,  # Dampen signal impact on size
-    "min_trade_interval": 5,  # Minimum seconds between trades
-    "max_trade_count": 3,  # Maximum trades per interval
-}
-
-# Avellaneda-Stoikov model configuration
-AVELLANEDA_CONFIG = {
-    "gamma": 0.1,            # Risk aversion parameter
-    "k": 1.5,               # Order flow intensity
-    "window_size": 100,     # Window for volatility estimation
-    "reservation_spread": 0.002,  # Base spread as percentage
-    "position_limit": 1.0,   # Maximum position in base currency
-    "vol_window": 20,       # Window for volatility calculation
-    "inventory_weight": 0.5, # Weight for inventory impact
-    "min_spread": 0.001,    # Minimum spread
-    "max_spread": 0.01,     # Maximum spread
-}
+# These configuration dictionaries have been moved to market_config.py
+# Reference them from the imported configurations
+# POSITION_LIMITS now comes from RISK_CONFIG["limits"]
+# QUOTING_CONFIG now comes from TRADING_CONFIG["quoting"]
+# INVENTORY_CONFIG now comes from RISK_CONFIG["inventory"]
+# SIGNAL_CONFIG now comes from BOT_CONFIG["technical"]["signal"]
+# AVELLANEDA_CONFIG now comes from TRADING_CONFIG["avellaneda"]
 
 # Performance metrics
 performance_metrics = {
@@ -129,13 +59,13 @@ performance_metrics = {
 # Add metrics lock
 metrics_lock = Lock()
 
-# Call IDs for Thalex API
-CALL_ID_INSTRUMENTS = 0
-CALL_ID_INSTRUMENT = 1
-CALL_ID_SUBSCRIBE = 2
-CALL_ID_LOGIN = 3
-CALL_ID_CANCEL_SESSION = 4
-CALL_ID_SET_COD = 5
+# Call IDs for Thalex API - use from BOT_CONFIG
+CALL_ID_INSTRUMENTS = BOT_CONFIG["call_ids"].get("instruments", 0)
+CALL_ID_INSTRUMENT = BOT_CONFIG["call_ids"].get("ticker", 1)
+CALL_ID_SUBSCRIBE = BOT_CONFIG["call_ids"].get("subscribe", 2)
+CALL_ID_LOGIN = BOT_CONFIG["call_ids"].get("login", 3)
+CALL_ID_CANCEL_SESSION = BOT_CONFIG["call_ids"].get("cancel_all", 4)
+CALL_ID_SET_COD = BOT_CONFIG["call_ids"].get("set_cod", 5)
 
 # Order status enumeration
 class OrderStatus(Enum):
@@ -252,8 +182,17 @@ class Quote:
 class PerpQuoter:
     def __init__(self, thalex: th.Thalex):
         self.thalex = thalex
-        self.ticker: Optional[Ticker] = None
-        self.index: Optional[float] = None
+        self.ticker = None
+        self.instruments = []
+        self.perp_instrument_name = None
+        self.tick = 0
+        self.position_size = 0
+        self.entry_price = 0
+        self.realized_pnl = 0
+        self.unrealized_pnl = 0
+        
+        # Initialize operation semaphore with concurrency limit
+        self.operation_semaphore = asyncio.Semaphore(TRADING_CONFIG["quoting"]["max_pending_operations"])
         self.quote_cv = asyncio.Condition()
         self.portfolio: Dict[str, float] = {}
         self.orders: List[List[Order]] = [[], []]  # bids, asks
@@ -297,9 +236,6 @@ class PerpQuoter:
         self.highest_profit_levels = {}  # Track highest profit for each trailing stop level
         self.pending_operations = set()
         self.last_operation_times = {}
-        self.operation_semaphore = asyncio.Semaphore(QUOTING_CONFIG["max_pending_operations"])
-        
-        # Add these lines
         self.last_quote_task = 0
         self.last_quote_update = 0  # Also add this for quote update tracking
         self.last_position_check = 0
@@ -335,35 +271,25 @@ class PerpQuoter:
         return np.mean(high_low)
 
     async def check_risk_limits(self) -> bool:
-        """Check if current position is within risk limits with enhanced monitoring"""
-        current_time = time.time()
-        position = self.get_position_size()  # Use reconciled position
+        """Check if position and notional risk limits are exceeded"""
+        position = self.position_size
         
-        # Position size check
-        if abs(position) >= POSITION_LIMITS["max_position"]:
-            alert_key = "position_size"
-            if self.should_alert(alert_key, current_time):
-                logging.warning(f"Position size {position} exceeds limit")
-                await self.handle_risk_breach()
+        # Check absolute position limit
+        if abs(position) >= RISK_CONFIG["limits"]["max_position"]:
+            logging.warning(f"Position {position} exceeds limit of {RISK_CONFIG['limits']['max_position']}")
             return False
             
-        # Notional value check - FIXED to properly check notional limits
-        if self.ticker and self.ticker.mark_price > 0:
-            notional = abs(position * self.ticker.mark_price)
-            if notional >= POSITION_LIMITS["max_notional"]:
-                alert_key = "notional"
-                if self.should_alert(alert_key, current_time):
-                    logging.warning(f"Notional value {notional} exceeds limit of {POSITION_LIMITS['max_notional']}")
-                    await self.handle_risk_breach()
-                return False
-                
-        # Approaching limits check
-        if abs(position) >= POSITION_LIMITS["max_position"] * POSITION_LIMITS["rebalance_threshold"]:
-            alert_key = "approaching_limit"
-            if self.should_alert(alert_key, current_time):
-                logging.warning(f"Position approaching limit: {position}")
-                await self.rebalance_position()
-                
+        # Check notional value limit
+        price = self.ticker.mark_price if self.ticker else 0
+        notional = abs(position * price)
+        if notional >= RISK_CONFIG["limits"]["max_notional"]:
+            logging.warning(f"Notional value {notional} exceeds limit of {RISK_CONFIG['limits']['max_notional']}")
+            return False
+            
+        # Check if position is approaching max and needs rebalancing
+        if abs(position) >= RISK_CONFIG["limits"]["max_position"] * RISK_CONFIG["limits"]["position_rebalance_threshold"]:
+            logging.warning(f"Position {position} approaching max {RISK_CONFIG['limits']['max_position']}, consider rebalancing")
+            
         return True
 
     def should_alert(self, alert_key: str, current_time: float) -> bool:
@@ -1061,10 +987,11 @@ class PerpQuoter:
 
     def order_from_data(self, data: Dict) -> Order:
         return Order(
-            oid=data["client_order_id"],
-            price=data["price"],
-            amount=data["amount"],
-            status=OrderStatus(data["status"])
+            id=data.get("client_order_id", data.get("order_id", 0)),
+            price=float(data.get("price", 0)),
+            amount=float(data.get("amount", 0)),
+            status=OrderStatus(data.get("status", "pending")),
+            direction=data.get("direction", "")
         )
 
     # Add to existing class
@@ -1831,7 +1758,7 @@ class PerpQuoter:
 
                 # Create order object with timestamp
                 new_order = Order(
-                    oid=order_id,
+                    id=order_id,
                     price=quote.price,
                     amount=quote.amount,
                     status=OrderStatus.OPEN
