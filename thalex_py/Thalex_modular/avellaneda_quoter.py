@@ -20,7 +20,6 @@ from thalex_py.Thalex_modular.config.market_config import (
     CALL_IDS, 
     RISK_LIMITS,
     TRADING_PARAMS,
-    TECHNICAL_PARAMS,
     TRADING_CONFIG
 )
 from thalex_py.Thalex_modular.models.data_models import Ticker, Order, OrderStatus, Quote
@@ -35,56 +34,62 @@ from thalex_py.Thalex_modular.ringbuffer.market_data_buffer import MarketDataBuf
 class AvellanedaQuoter:
     def __init__(self, thalex: th.Thalex):
         """Initialize the Avellaneda-Stoikov market maker"""
+        # Core dependencies
         self.thalex = thalex
-        self.ticker: Optional[Ticker] = None
-        self.index: Optional[float] = None
-        self.quote_cv = asyncio.Condition()
-        self.portfolio: Dict[str, float] = {}
-        self.perp_name: Optional[str] = None
-        
-        # Initialize logging
         self.logger = LoggerFactory.configure_component_logger(
             "avellaneda_quoter",
             log_file="avellaneda_quoter.log",
             high_frequency=True
         )
         
-        # Initialize components with their specific loggers
-        self.risk_manager = RiskManager()
-        self.order_manager = OrderManager(thalex)
+        # Set up the market maker components
         self.market_maker = AvellanedaMarketMaker()
-        
-        # Initialize high-performance market data buffer
-        self.market_data = MarketDataBuffer(
-            capacity=TRADING_PARAMS["volatility"]["window"],
-            ema_periods={"fast": 12, "slow": 26, "medium": 20},
-            volatility_window=TRADING_PARAMS["volatility"]["window"],
-            atr_period=TECHNICAL_PARAMS["atr"]["period"]
-        )
-        
-        # Performance monitoring
-        self.performance_monitor = PerformanceMonitor(output_dir="metrics")
+        self.order_manager = OrderManager(self.thalex)
+        self.risk_manager = RiskManager()
+        self.performance_monitor = PerformanceMonitor()
         
         # Market data
-        self.price_history = deque(maxlen=TRADING_PARAMS["volatility"]["window"])
-        self.current_quotes: Tuple[List[Quote], List[Quote]] = ([], [])
+        self.ticker = None
+        self.index = None
+        self.perp_name = None
+        self.market_data = MarketDataBuffer()
         
-        # Performance tracking
-        self.quoting_enabled = True
-        self.last_quote_time = time.time()
-        self.last_position_check = time.time()
-        
-        # Rate limiting and connection health
-        self.request_counter = 0
-        self.request_reset_time = time.time()
-        self.request_counter_reset_time = time.time()
-        self.rate_limit_window = 60  # 1 minute window
-        self.rate_limit_warning_sent = False
+        # Rate limiting parameters
         self.max_requests_per_minute = BOT_CONFIG["connection"]["rate_limit"]
-        self.last_heartbeat = time.time()
+        self.request_counter = 0
+        self.request_counter_reset_time = time.time()
+        self.rate_limit_window = 60
+        self.rate_limit_warning_sent = False
+        
+        # For coordination
+        self.quote_cv = asyncio.Condition()
+        self.condition_met = False
+        self.setup_complete = asyncio.Event()
+        
+        # Connection parameters
         self.heartbeat_interval = BOT_CONFIG["connection"]["heartbeat_interval"]
+        self.last_heartbeat = time.time()
+        
+        # Quoting management
+        self.quoting_enabled = True
         self.cooldown_active = False
         self.cooldown_until = 0
+        
+        # Quote storage and metrics
+        self.price_history = deque(maxlen=100)  # Store last 100 prices
+        self.current_quotes = ([], [])  # (bid_quotes, ask_quotes)
+        
+        # Order management
+        self.max_orders_per_side = 5  # Maximum orders per side
+        self.max_total_orders = 16  # Maximum total orders
+        
+        # Set default tick size
+        self.tick_size = 1.0
+        
+        # Latest update timestamps
+        self.last_ticker_time = 0
+        self.last_quote_time = 0
+        self.last_quote_update_time = 0
         
         self.logger.info("Avellaneda quoter initialized")
 
@@ -94,22 +99,67 @@ class AvellanedaQuoter:
         await LoggerFactory.initialize()
         self.logger.info("Starting Avellaneda quoter...")
         
-        # Create and start tasks
-        tasks = [
-            asyncio.create_task(self.listen_task()),
-            asyncio.create_task(self.quote_task()),
-            asyncio.create_task(self.heartbeat_task()),
-            asyncio.create_task(self.performance_monitor.start_recording(self))
-        ]
-        
         try:
+            # Initialize required attributes
+            self.request_counter = 0
+            self.request_counter_reset_time = time.time()
+            self.rate_limit_warning_sent = False
+            self.cooldown_active = False
+            self.cooldown_until = 0
+            self.last_ticker_time = 0
+            self.last_quote_time = 0
+            self.max_requests_per_minute = BOT_CONFIG["connection"]["rate_limit"]
+            
+            # Connect to WebSocket
+            self.logger.info("Connecting to WebSocket...")
+            await self.thalex.connect()
+            
+            # Initialize instrument details
+            self.logger.info("Initializing instrument details...")
+            await self.await_instruments()
+            
+            # Login and setup
+            self.logger.info("Logging in and setting up...")
+            network = MARKET_CONFIG["network"]
+            key_id = key_ids[network]
+            private_key = private_keys[network]
+            await self.thalex.login(key_id, private_key, id=CALL_IDS["login"])
+            
+            # Set cancel on disconnect
+            await self.thalex.set_cancel_on_disconnect(6, id=CALL_IDS["set_cod"])
+            
+            # Subscribe to channels
+            self.logger.info("Subscribing to channels...")
+            if self.perp_name:  # Only subscribe if we have the instrument name
+                await self.thalex.public_subscribe(
+                    channels=[f"ticker.{self.perp_name}.raw", f"price_index.{BOT_CONFIG['market']['underlying']}"],
+                    id=CALL_IDS["subscribe"]
+                )
+                await self.thalex.private_subscribe(
+                    channels=["session.orders", "account.portfolio", "account.trade_history"],
+                    id=CALL_IDS["subscribe"] + 1
+                )
+            else:
+                raise ValueError("No instrument name available for subscriptions")
+
+            # Create and start tasks
+            self.logger.info("Creating tasks...")
+            tasks = [
+                asyncio.create_task(self.listen_task()),
+                asyncio.create_task(self.quote_task()),
+                asyncio.create_task(self.heartbeat_task()),
+                asyncio.create_task(self.performance_monitor.start_recording(self))
+            ]
+            
+            self.logger.info("Tasks created, waiting for completion...")
             await asyncio.gather(*tasks)
+            
         except Exception as e:
-            self.logger.error(f"Error in main quoter loop: {str(e)}")
+            self.logger.error(f"Error in main quoter loop: {str(e)}", exc_info=True)
         finally:
             # Ensure proper shutdown
             await self.shutdown()
-            
+
     async def shutdown(self):
         """Shutdown the quoter and cleanup resources"""
         try:
@@ -145,62 +195,68 @@ class AvellanedaQuoter:
 
     async def check_rate_limit(self, priority: str = "normal") -> bool:
         """Check if we're under the rate limit and increment counter if we are"""
-        # Get current rate limit from config
-        rate_limit = BOT_CONFIG["connection"]["rate_limit"]
-        
-        # Check if we need to reset the counter (new time window)
-        current_time = time.time()
-        if current_time - self.request_counter_reset_time > self.rate_limit_window:
-            # Reset counter for new window
-            previous_count = self.request_counter
-            self.request_counter = 0
-            self.request_counter_reset_time = current_time
-            self.rate_limit_warning_sent = False
+        try:
+            # Get current rate limit from config but reduce by 30%
+            rate_limit = int(self.max_requests_per_minute * 0.7)  # Reduced by 30%
             
-            # Log previous window's request rate
-            request_rate = previous_count / self.rate_limit_window
-            self.logger.debug(f"Request rate for previous window: {request_rate:.2f} requests/second")
+            # Check if we need to reset the counter (new time window)
+            current_time = time.time()
+            window_elapsed = current_time - self.request_counter_reset_time
             
-        # Calculate current usage percentage
-        usage_percentage = (self.request_counter / rate_limit) * 100
-        
-        # Implement progressive throttling based on current usage
-        if usage_percentage >= 100:
-            # Hard limit exceeded
-            if not self.rate_limit_warning_sent:
-                self.logger.warning(f"Rate limit reached: {self.request_counter} requests in the last {self.rate_limit_window}s")
-                self.rate_limit_warning_sent = True
-            return False
+            if window_elapsed >= self.rate_limit_window:
+                # Log previous window's stats before resetting
+                if self.request_counter > 0:
+                    request_rate = self.request_counter / min(window_elapsed, self.rate_limit_window)
+                    self.logger.debug(f"Previous window stats: {self.request_counter} requests, {request_rate:.1f} req/s")
+                
+                # Reset for new window
+                self.request_counter = 0
+                self.request_counter_reset_time = current_time
+                self.rate_limit_warning_sent = False
             
-        if usage_percentage >= 90:
-            # At 90% capacity, allow only critical operations
-            # For quote updates, only let through 10% of requests
-            if random.random() < 0.1:
-                self.logger.debug(f"Allowing operation at high usage ({usage_percentage:.1f}%)")
-                self.request_counter += 1
-                return True
-            return False
+            # Calculate current usage percentage
+            usage_percentage = (self.request_counter / rate_limit) * 100 if rate_limit > 0 else 0
             
-        if usage_percentage >= 75:
-            # At 75% capacity, start throttling
-            # Let through 30% of requests
-            if random.random() < 0.3:
-                self.logger.debug(f"Allowing operation at moderate usage ({usage_percentage:.1f}%)")
-                self.request_counter += 1
-                return True
-            return False
+            # Add minimum time between requests based on priority with longer minimum times
+            min_request_interval = 0.5  # Base 500ms minimum between requests (increased from 300ms)
+            if priority == "normal":
+                min_request_interval = 0.8  # 800ms for normal priority (increased from 500ms)
+            elif priority == "low":
+                min_request_interval = 1.5  # 1500ms for low priority (increased from 1000ms)
             
-        if usage_percentage >= 50:
-            # At 50% capacity, slow down slightly
-            # Let through 60% of requests
-            if random.random() < 0.6:
-                self.request_counter += 1
-                return True
-            return False
+            # Check if we're requesting too quickly
+            if hasattr(self, 'last_request_time'):
+                time_since_last = current_time - self.last_request_time
+                if time_since_last < min_request_interval:
+                    return False
             
-        # Under 50% capacity, allow operation
-        self.request_counter += 1
-        return True
+            # Stricter progressive throttling based on usage
+            if usage_percentage >= 70:  # Lowered from 80% to 70%
+                if not self.rate_limit_warning_sent:
+                    self.logger.warning(f"Rate limit high: {usage_percentage:.1f}% used")
+                    self.rate_limit_warning_sent = True
+                
+                # Only critical operations above 70%
+                if priority != "critical":
+                    return False
+            elif usage_percentage >= 50:  # Lowered from 60% to 50%
+                # Above 50%, only allow critical and high priority
+                if priority not in ["critical", "high"]:
+                    return False
+            elif usage_percentage >= 30:  # Lowered from 40% to 30%
+                # Random throttling for normal operations at 30-50% usage
+                if priority == "low" or (priority == "normal" and random.random() < 0.7):  # Increased throttling probability
+                    return False
+            
+            # Update tracking
+            self.request_counter += 1
+            self.last_request_time = current_time
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error in rate limit check: {str(e)}")
+            return False  # Fail safe - deny request on error
 
     async def send_heartbeat(self):
         """Send a heartbeat to keep the connection alive"""
@@ -484,6 +540,15 @@ class AvellanedaQuoter:
     async def handle_ticker_update(self, ticker_data: Dict):
         """Process ticker updates and generate quotes if conditions are met"""
         try:
+            current_time = time.time()
+            
+            # Add rate limiting check - Increase to 500ms to reduce ticker processing frequency
+            min_ticker_interval = 0.5  # Minimum 500ms between ticker processing (increased from 200ms)
+            if hasattr(self, 'last_ticker_time') and current_time - self.last_ticker_time < min_ticker_interval:
+                self.logger.debug("Skipping ticker update - too frequent")
+                return
+            self.last_ticker_time = current_time
+            
             # Create or update ticker object
             self.ticker = Ticker(ticker_data)
             
@@ -491,7 +556,7 @@ class AvellanedaQuoter:
             bid_display = f"{self.ticker.best_bid_price:.2f}" if self.ticker.best_bid_price else "None"
             ask_display = f"{self.ticker.best_ask_price:.2f}" if self.ticker.best_ask_price else "None"
             self.logger.info(
-                f"Ticker update: mark={self.ticker.mark_price:.2f}, "
+                f"Ticker update received: mark={self.ticker.mark_price:.2f}, "
                 f"bid={bid_display}, "
                 f"ask={ask_display}"
             )
@@ -516,67 +581,49 @@ class AvellanedaQuoter:
             
             # Get market state from the buffer
             market_state = self.market_data.get_market_state()
-            self.logger.info(f"Market state: {market_state}")
             
             # Update price history for metrics
-            prev_len = len(self.price_history)
             self.price_history.append(self.ticker.mark_price)
+            self.logger.debug(f"Price history samples: {len(self.price_history)}/{TRADING_PARAMS['volatility']['min_samples']}")
             
             # Get volatility from market data buffer
-            volatility = market_state["volatility"] if not np.isnan(market_state["volatility"]) else TRADING_CONFIG["avellaneda"]["fixed_volatility"]
+            if "yz_volatility" in market_state and not np.isnan(market_state["yz_volatility"]):
+                volatility = market_state["yz_volatility"]
+            else:
+                volatility = market_state["volatility"] if not np.isnan(market_state["volatility"]) else TRADING_CONFIG["avellaneda"]["fixed_volatility"]
             
             # Calculate market conditions using the buffer
             market_conditions = {
                 "volatility": volatility,
-                "is_volatile": market_state["volatility_regime"] == "high",
-                "is_trending": abs(market_state["trend_strength"]) > TECHNICAL_PARAMS["trend"]["confirmation_threshold"],
-                "trend_direction": market_state["trend_strength"] > 0,
-                "trend_strength": market_state["trend_strength"],
-                "market_impact": market_state["market_impact"]
+                "market_impact": market_state.get("market_impact", 0.0)
             }
-            
-            # Log market conditions summary
-            self.logger.info(f"Market conditions: volatile={market_conditions['is_volatile']}, trending={market_conditions['is_trending']}, impact={market_conditions['market_impact']:.4f}")
             
             # Update market maker with latest conditions
             self.market_maker.update_market_conditions(
                 volatility=market_conditions["volatility"],
                 market_impact=market_conditions["market_impact"]
-            )
-            
-            # Update VAMP calculation with latest price data
-            if hasattr(self.market_maker, 'update_vamp'):
-                self.market_maker.update_vamp(
-                    price=self.ticker.mark_price,
-                    volume=ticker_data.get("volume", 0.1),
-                    is_buy=ticker_data.get("direction", "buy") == "buy"
                 )
             
             # Check if we now have enough price history and signal the quote task
             min_samples = TRADING_PARAMS["volatility"]["min_samples"]
+            
+            # Only notify if we have enough samples and should update quotes
             if len(self.price_history) >= min_samples:
-                # 7. Check if quotes should be updated
                 current_quotes = self.current_quotes
                 should_update = self.market_maker.should_update_quotes(current_quotes, self.ticker.mark_price)
                 
-                if should_update:
-                    self.logger.info("Updating quotes based on market conditions")
-                    # Pass ticker directly to update_quotes
-                    task = asyncio.create_task(self.update_quotes(None, market_conditions))
-                    # Add callback to log completion
-                    task.add_done_callback(lambda t: self.logger.info(f"Quote update task completed: {t.exception() or 'success'}"))
+                # Only notify if we need to update quotes and enough time has passed
+                if should_update and (not hasattr(self, 'last_quote_time') or current_time - self.last_quote_time >= 2.0):
+                    self.logger.info("Notifying quote task to update quotes")
+                    async with self.quote_cv:
+                        self.quote_cv.notify()
+                        self.logger.debug("Quote task notified")
                 else:
-                    self.logger.info("No quote update needed")
-            else:
-                self.logger.info(f"Still waiting for price history: {len(self.price_history)}/{min_samples} samples")
+                    self.logger.debug(f"Waiting for more price history: {len(self.price_history)}/{min_samples}")
                 
             # Calculate execution time for performance monitoring
             execution_time = time.time() - start_time
             self.logger.debug(f"Ticker processing time: {execution_time*1000:.2f}ms")
-            
-            # Notify quote task of the ticker update
-            async with self.quote_cv:
-                self.quote_cv.notify()
                 
         except Exception as e:
             self.logger.error(f"Error handling ticker update: {str(e)}", exc_info=True)
@@ -628,11 +675,9 @@ class AvellanedaQuoter:
                     # Create comprehensive market conditions
                     market_state = self.market_data.get_market_state()
                     market_conditions = {
-                        "volatility": market_state["volatility"] if not np.isnan(market_state["volatility"]) else TRADING_CONFIG["avellaneda"]["fixed_volatility"],
-                        "is_volatile": market_state["volatility_regime"] == "high",
-                        "is_trending": abs(market_state["trend_strength"]) > TECHNICAL_PARAMS["trend"]["confirmation_threshold"],
-                        "trend_direction": market_state["trend_strength"] > 0,
-                        "market_impact": market_state["market_impact"],
+                        "volatility": market_state["yz_volatility"] if "yz_volatility" in market_state and not np.isnan(market_state["yz_volatility"]) else 
+                                     (market_state["volatility"] if not np.isnan(market_state["volatility"]) else TRADING_CONFIG["avellaneda"]["fixed_volatility"]),
+                        "market_impact": market_state.get("market_impact", 0.0),
                         # Add higher impact for a recent fill
                         "fill_impact": 0.5  # Increase market impact after fills
                     }
@@ -683,48 +728,107 @@ class AvellanedaQuoter:
             self.portfolio = portfolio_data
             
             # Update position tracking
+            position_size = 0.0
+            mark_price = 0.0
+            
+            # Extract account balance and margin information
+            account_balance = 0.0
+            margin_used = 0.0
+            margin_utilization = 0.0
+            
             for item in portfolio_data:
+                # Find position for our instrument
                 if item["instrument_name"] == self.perp_name:
                     position_size = item["position"]
                     mark_price = item["mark_price"]
-                    self.market_maker.update_position(position_size, mark_price)
-                    break
-                    
+                
+                # Extract account balance, usually in the account item
+                if "account_balance" in item:
+                    account_balance = float(item["account_balance"])
+                
+                # Extract margin information
+                if "margin_used" in item:
+                    margin_used = float(item["margin_used"])
+                
+                # Some exchanges provide utilization directly
+                if "margin_utilization" in item:
+                    margin_utilization = float(item["margin_utilization"])
+            
+            # Calculate margin utilization if not provided directly
+            if margin_utilization == 0.0 and account_balance > 0:
+                margin_utilization = margin_used / account_balance
+            
+            # Update market maker with position and margin information
+            self.market_maker.update_position(position_size, mark_price)
+            
+            # Set margin utilization in market maker
+            if hasattr(self.market_maker, 'margin_utilization'):
+                self.market_maker.margin_utilization = margin_utilization
+            else:
+                setattr(self.market_maker, 'margin_utilization', margin_utilization)
+            
+            # Log margin information
+            self.logger.info(
+                f"Portfolio update: Position={position_size:.4f}, Mark price={mark_price:.2f}, "
+                f"Margin utilization={margin_utilization:.2%}"
+            )
+            
         except Exception as e:
             self.logger.error(f"Error handling portfolio update: {str(e)}")
 
     async def handle_trade_update(self, trade_data: Dict):
-        """Process trade updates, update risk metrics, and check risk limits"""
+        """
+        Process trade updates
+        
+        Args:
+            trade_data: Trade data from the exchange
+        """
         try:
-            # Extract essential trade data
-            order_id = trade_data.get("order_id", "")
-            price = trade_data.get("price", 0.0)
-            amount = trade_data.get("amount", 0.0)
-            direction = trade_data.get("direction", "")
-            fill_type = trade_data.get("fill_type", "")
-            
-            # Update market impact directly in market data buffer
-            if price > 0 and amount > 0:
-                # Get previous price for impact calculation
-                prev_price = self.price_history[-1] if len(self.price_history) > 0 else price
-                price_change = abs(price - prev_price)
+            # Check if trade_data is a list and handle accordingly
+            if isinstance(trade_data, list):
+                for trade in trade_data:
+                    await self._process_single_trade(trade)
+            else:
+                await self._process_single_trade(trade_data)
                 
-                # Update impact in market data buffer
-                self.market_data.update_market_impact(amount, price_change)
-            
-            # Update risk metrics
-            await self.risk_manager.update_trade_metrics(trade_data)
-            
-            # Record trade in performance monitor
-            self.performance_monitor.record_trade(trade_data)
-            
-            # Check if we need to adjust our quoting
-            if not await self.risk_manager.check_risk_limits():
-                self.quoting_enabled = False
-                await self.cancel_all_quotes()
-                self.logger.warning("Quoting disabled due to risk limits")
         except Exception as e:
-            self.logger.error(f"Error handling trade update: {str(e)}")
+            self.logger.error(f"Error handling trade update: {str(e)}", exc_info=True)
+            
+    async def _process_single_trade(self, trade: Dict):
+        """Process a single trade update"""
+        try:
+            # Extract trade details
+            order_id = trade.get("order_id", "")
+            instrument = trade.get("instrument_name", "")
+            direction = trade.get("direction", "")
+            price = float(trade.get("price", 0))
+            amount = float(trade.get("amount", 0))
+            timestamp = trade.get("timestamp", 0)
+            
+            # Log the trade
+            self.logger.info(
+                f"Trade executed: {direction.upper()} {amount:.4f} @ {price:.2f} "
+                f"(Order ID: {order_id})"
+            )
+            
+            # Update market maker with fill information
+            if self.market_maker:
+                is_buy = direction.lower() == "buy"
+                self.market_maker.on_order_filled(
+                    order_id=order_id,
+                    fill_price=price,
+                    fill_size=amount,
+                    is_buy=is_buy
+                )
+                
+            # Force a quote update after significant fills
+            # This ensures we react quickly to executed trades
+            if self.ticker and amount >= 0.01:  # Only for fills >= 0.01 BTC
+                self.logger.info(f"Scheduling quote update after trade of {amount:.4f}")
+                asyncio.create_task(self.update_quotes(None, self.get_market_conditions()))
+                
+        except Exception as e:
+            self.logger.error(f"Error processing trade: {str(e)}", exc_info=True)
 
     async def handle_result(self, result: Dict, cid: Optional[int]):
         """Handle API call results"""
@@ -772,8 +876,8 @@ class AvellanedaQuoter:
                 
                 # Implement exponential backoff for cooldown duration based on error frequency
                 if self.rate_limit_errors > 1:
-                    # Calculate cooldown with exponential backoff (1s, 2s, 4s, 8s, max 9s instead of 30s)
-                    cooldown_time = min(2 ** (self.rate_limit_errors - 1), 9)
+                    # Calculate cooldown with shorter exponential backoff (0.5s, 1s, 2s, max 3s)
+                    cooldown_time = min(2 ** (self.rate_limit_errors - 2), 3)
                     self.cooldown_active = True
                     self.cooldown_until = current_time + cooldown_time
                     self.logger.warning(f"Rate limit cooldown active for {cooldown_time}s until: {time.ctime(self.cooldown_until)}")
@@ -781,8 +885,8 @@ class AvellanedaQuoter:
                     # If we're getting many consecutive errors, force a shorter pause
                     if self.rate_limit_errors >= 5:
                         self.logger.warning(f"Multiple consecutive rate limit errors, enforcing stronger cooldown")
-                        # Wait for a bit to let the rate limit reset, reduced from 3s to 1.5s
-                        await asyncio.sleep(1.5)
+                        # Wait for a bit to let the rate limit reset, reduced from 1.5s to 0.5s
+                        await asyncio.sleep(0.5)
                 
                 # For order-related rate limits, handle just that order error
                 if cid and cid >= 100:
@@ -800,334 +904,186 @@ class AvellanedaQuoter:
             self.logger.error(f"Error handling error message: {str(e)}")
 
     async def update_quotes(self, price_data: Dict, market_conditions: Dict):
-        """Generate and place quotes based on current market conditions"""
+        """
+        Update quotes based on new market data
+        
+        Args:
+            price_data: Current ticker/price data
+            market_conditions: Current market conditions (volatility, market impact)
+        """
         try:
-            # Generate quotes
-            if self.ticker is None:
-                self.logger.warning("No ticker data available for quote generation")
+            if not self.market_maker:
+                self.logger.warning("Cannot update quotes: Market maker not initialized")
                 return
                 
-            start_time = time.time()
+            # Create ticker from price data if provided, otherwise use the stored ticker
+            ticker = None
+            if price_data:
+                ticker = Ticker(price_data)
+            else:
+                ticker = self.ticker
+                
+            if not ticker or not ticker.mark_price or ticker.mark_price <= 0:
+                self.logger.warning("Cannot update quotes: Invalid ticker data")
+                return
+                
+            # Rate limiting - check time since last update
+            current_time = time.time()
+            if hasattr(self, 'last_quote_update_time'):
+                time_since_last = current_time - self.last_quote_update_time
+                min_update_interval = 1.0  # Minimum 1 second between quote updates
+                if time_since_last < min_update_interval:
+                    self.logger.info(f"Skipping quote update - too soon since last update ({time_since_last:.1f}s < {min_update_interval:.1f}s)")
+                    return
+                    
+            # Check if active quotes need updating
+            if len(self.current_quotes[0]) > 0 or len(self.current_quotes[1]) > 0:
+                # If we have active quotes, check if they need to be updated
+                should_update = self.market_maker.should_update_quotes(self.current_quotes, ticker.mark_price)
+                if not should_update:
+                    self.logger.info("Skipping quote update - current quotes still valid")
+                    return
+                
+            # Generate quotes using market maker
+            self.logger.info("Generating new quotes...")
+            bid_quotes, ask_quotes = self.market_maker.generate_quotes(ticker, market_conditions)
             
-            # Use ticker data directly for quote generation - more accurate than passing mid price
-            bid_quotes, ask_quotes = self.market_maker.generate_quotes(self.ticker, market_conditions)
+            if not bid_quotes and not ask_quotes:
+                self.logger.warning("No valid quotes generated")
+                return
             
-            # Log quotes for debugging
-            self.logger.info(f"Generated {len(bid_quotes)} bids and {len(ask_quotes)} asks")
-            
-            # Validate quotes
+            # Validate quotes before sending
             bid_quotes, ask_quotes = self.market_maker.validate_quotes(bid_quotes, ask_quotes)
             
-            # Cancel existing quotes that need to be replaced
-            # Get current active quote IDs
-            active_bid_ids = set(self.order_manager.active_bids.keys())
-            active_ask_ids = set(self.order_manager.active_asks.keys())
+            # Don't cancel existing quotes too aggressively
+            # Only cancel if necessary (e.g., price moved significantly, quotes expired, etc.)
+            should_cancel = True
             
-            # Determine which quotes to keep and which to cancel
-            # For each side, check which current quotes should be kept
-            new_bid_prices = {quote.price for quote in bid_quotes}
-            new_ask_prices = {quote.price for quote in ask_quotes}
+            # Check if cancellation is really needed
+            bid_prices = [q.price for q in bid_quotes]
+            ask_prices = [q.price for q in ask_quotes]
+            current_bid_prices = [q.price for q in self.current_quotes[0]]  
+            current_ask_prices = [q.price for q in self.current_quotes[1]]
             
-            # Track bids and asks to cancel
-            bids_to_cancel = []
-            asks_to_cancel = []
+            if current_bid_prices and current_ask_prices:
+                # We already have quotes - check if they're close enough to the new ones
+                price_tolerance = 10.0  # Allow up to $10 difference before cancelling
+                
+                if all(any(abs(new_p - old_p) <= price_tolerance for old_p in current_bid_prices) for new_p in bid_prices[:1]) and \
+                   all(any(abs(new_p - old_p) <= price_tolerance for old_p in current_ask_prices) for new_p in ask_prices[:1]):
+                    # Our current quotes are close enough to the new ones - just skip
+                    self.logger.info("Current quotes are close to desired prices - skipping update")
+                    self.last_quote_update_time = current_time
+                    return
             
-            # Check if bid needs to be cancelled
-            for order_id, order in self.order_manager.active_bids.items():
-                if order.price not in new_bid_prices:
-                    bids_to_cancel.append(order_id)
+            # Cancel existing quotes if needed
+            if should_cancel:
+                self.logger.info("Cancelling existing quotes...")
+                await self.cancel_all_quotes()
+                
+                # Brief pause to allow cancellations to process
+                await asyncio.sleep(0.5)
+                
+                # Place new quotes
+                self.logger.info("Placing new quotes...")
+                await self.place_quotes(bid_quotes, ask_quotes)
             
-            # Check if ask needs to be cancelled
-            for order_id, order in self.order_manager.active_asks.items():
-                if order.price not in new_ask_prices:
-                    asks_to_cancel.append(order_id)
-                    
-            # Cancel quotes that need to be replaced - use high priority for cancellations
-            for order_id in bids_to_cancel:
-                if not await self.check_rate_limit(priority="high"):
-                    self.logger.warning("Rate limit reached during cancel operations")
-                    break
-                    
-                # Only cancel if it still exists
-                if order_id in self.order_manager.active_bids:
-                    await self.order_manager.cancel_order(order_id)
-                    
-            for order_id in asks_to_cancel:
-                if not await self.check_rate_limit(priority="high"):
-                    self.logger.warning("Rate limit reached during cancel operations")
-                    break
-                    
-                # Only cancel if it still exists
-                if order_id in self.order_manager.active_asks:
-                    await self.order_manager.cancel_order(order_id)
-                    
-            # Place new quotes
-            new_bids = []
-            new_asks = []
-            
-            # For prioritizing quotes - determine the current market mid price
-            mid_price = self.ticker.mark_price
-            
-            # Place bid quotes
-            for quote in bid_quotes:
-                # Skip if price already has an active quote
-                existing_at_price = any(b.price == quote.price for b in self.order_manager.active_bids.values())
-                if existing_at_price:
-                    continue
-                    
-                # Set priority based on distance from market price
-                # Level 1 quotes (closest to market) get critical priority
-                price_distance_pct = abs(quote.price - mid_price) / mid_price
+            # Update last quote time
+            self.last_quote_time = current_time
+            self.last_quote_update_time = current_time
                 
-                if price_distance_pct < 0.002:  # Within 0.2% of mid price - critical priority
-                    priority = "critical"
-                elif price_distance_pct < 0.005:  # Within 0.5% of mid price - high priority
-                    priority = "high"
-                else:  # Further from market - normal priority
-                    priority = "normal"
-                
-                # Check rate limit with appropriate priority
-                if not await self.check_rate_limit(priority=priority):
-                    self.logger.warning(f"Rate limit reached during {priority} bid placement")
-                    break
-                
-                order_id = await self.order_manager.place_order(
-                    instrument=self.perp_name,
-                    direction="buy",
-                    price=quote.price,
-                    amount=quote.amount,
-                    label=MARKET_CONFIG["label"]
-                )
-                
-                if order_id:
-                    new_bids.append(order_id)
-                    
-            # Place ask quotes
-            for quote in ask_quotes:
-                # Skip if price already has an active quote
-                existing_at_price = any(a.price == quote.price for a in self.order_manager.active_asks.values())
-                if existing_at_price:
-                    continue
-                
-                # Set priority based on distance from market price
-                price_distance_pct = abs(quote.price - mid_price) / mid_price
-                
-                if price_distance_pct < 0.002:  # Within 0.2% of mid price - critical priority
-                    priority = "critical"
-                elif price_distance_pct < 0.005:  # Within 0.5% of mid price - high priority
-                    priority = "high"
-                else:  # Further from market - normal priority
-                    priority = "normal"
-                
-                # Check rate limit with appropriate priority
-                if not await self.check_rate_limit(priority=priority):
-                    self.logger.warning(f"Rate limit reached during {priority} ask placement")
-                    break
-                
-                order_id = await self.order_manager.place_order(
-                    instrument=self.perp_name,
-                    direction="sell",
-                    price=quote.price,
-                    amount=quote.amount,
-                    label=MARKET_CONFIG["label"]
-                )
-                
-                if order_id:
-                    new_asks.append(order_id)
-            
-            # Update current quotes
-            self.current_quotes = (bid_quotes, ask_quotes)
-            
-            # Log quote update timing
-            elapsed = time.time() - start_time
-            self.logger.info(f"Quote update completed in {elapsed:.2f}s. Added {len(new_bids)} bids, {len(new_asks)} asks")
-            
         except Exception as e:
             self.logger.error(f"Error updating quotes: {str(e)}", exc_info=True)
+            # On error, try to cancel all quotes for safety
+            try:
+                await self.cancel_all_quotes()
+            except Exception as cancel_error:
+                self.logger.error(f"Error cancelling quotes after update error: {str(cancel_error)}")
 
     async def cancel_all_quotes(self):
         """Cancel all open quotes"""
         try:
+            # Only cancel if we actually have quotes
+            order_count = len(self.order_manager.active_bids) + len(self.order_manager.active_asks)
+            if order_count == 0:
+                self.logger.info("No quotes to cancel")
+                self.current_quotes = ([], [])
+                return
+            
+            self.logger.info(f"Cancelling {order_count} quotes...")
             await self.order_manager.cancel_all_orders()
             self.current_quotes = ([], [])
+            self.logger.info("All quotes cancelled")
         except Exception as e:
-            self.logger.error(f"Error cancelling quotes: {str(e)}")
-            
-    def reset_cooldown(self):
-        """Reset cooldown state to allow order placement"""
-        self.cooldown_active = False
-        self.cooldown_until = 0
-        self.request_counter = 0
-        self.request_counter_reset_time = time.time()
-        self.rate_limit_warning_sent = False
-        
-        # Reset rate limit error tracking
-        if hasattr(self, 'rate_limit_errors'):
-            self.rate_limit_errors = 0
-            self.last_rate_limit_error = 0
-            
-        self.logger.info("Cooldown state has been manually reset")
-        
-        # Also reset the cooldown in order manager if needed
-        try:
-            if hasattr(self, 'order_manager') and self.order_manager:
-                self.order_manager.last_order_time = 0
-                self.logger.info("Order manager timing constraints also reset")
-        except Exception as e:
-            self.logger.error(f"Error resetting order manager state: {str(e)}")
+            self.logger.error(f"Error cancelling quotes: {str(e)}", exc_info=True)
 
     async def quote_task(self):
         """Main quoting loop - periodically checks if quotes need updating"""
-        self.logger.info("Starting quote task")
+        self.logger.info("Quote task started - waiting for updates")
         
-        force_update_timer = 0
-        last_update_attempt = 0
-        last_forced_update = 0
-        
-        # Track consecutive updates to prevent hammering
-        consecutive_updates = 0
+        last_quote_time = 0
+        min_quote_interval = 3.0  # Increase minimum interval to 3 seconds (up from 1 second)
         
         while True:
             try:
                 # Wait for price updates
-                self.logger.debug("Quote task waiting for updates")
+                self.logger.debug("Quote task waiting for notification")
                 async with self.quote_cv:
                     await self.quote_cv.wait()
                 
-                self.logger.debug("Quote task woken up")
-                
-                # First check if we're in cooldown due to rate limiting
+                self.logger.info("Quote task received notification")
                 current_time = time.time()
-                if self.cooldown_active and current_time < self.cooldown_until:
-                    remaining_cooldown = int(self.cooldown_until - current_time)
-                    self.logger.info(f"Skipping quote update - in cooldown for {remaining_cooldown}s")
+                
+                # Enforce minimum interval between quote updates
+                if current_time - last_quote_time < min_quote_interval:
+                    self.logger.info(f"Quote update too frequent - waiting {min_quote_interval}s between updates")
                     continue
-                elif self.cooldown_active:
-                    self.cooldown_active = False
-                    self.logger.info("Cooldown period ended, resuming quote updates")
+                    
+                # Check if we're in cooldown
+                if self.cooldown_active and current_time < self.cooldown_until:
+                    self.logger.info(f"In cooldown period - {(self.cooldown_until - current_time):.1f}s remaining")
+                    continue
                 
-                # Force update if we haven't updated in a long time (15 seconds is max)
-                time_since_last_update = current_time - last_update_attempt
-                time_since_forced_update = current_time - last_forced_update
-                min_quote_interval = TRADING_CONFIG["quoting"]["min_quote_interval"]
+                # Skip if no ticker data
+                if not self.ticker:
+                    self.logger.warning("Cannot quote - no ticker data available")
+                    continue
                 
-                # Always respect the minimum quote interval to avoid hammering the API
-                if time_since_last_update < min_quote_interval:
-                    self.logger.debug(f"Skipping update - too soon since last attempt ({time_since_last_update:.1f}s < {min_quote_interval}s)")
+                # Only proceed if we actually need to update quotes
+                if not self.market_maker.should_update_quotes(self.current_quotes, self.ticker.mark_price):
+                    self.logger.info("Market maker indicates no quote update needed")
                     continue
                 
                 # Check if we have enough price history
                 min_samples = TRADING_PARAMS["volatility"]["min_samples"]
-                enough_samples = len(self.price_history) >= min_samples
-                
-                if enough_samples:
-                    self.logger.info(f"We have enough price history: {len(self.price_history)}/{min_samples} samples")
-                else:
-                    self.logger.info(f"Not enough price history: {len(self.price_history)}/{min_samples} samples")
-                    # Even with insufficient samples, we might still want to quote after collecting some data
-                    if len(self.price_history) >= min_samples // 2:
-                        self.logger.info(f"Proceeding with quoting despite insufficient samples")
-                    else:
-                        continue
-                
-                # Check risk limits
-                risk_check_result = await self.risk_manager.check_risk_limits()
-                
-                if not risk_check_result:
-                    if self.quoting_enabled:
-                        self.logger.warning("Risk limits exceeded, disabling quoting")
-                        self.quoting_enabled = False
-                        await self.cancel_all_quotes()
-                    continue
-                else:
-                    if not self.quoting_enabled:
-                        self.logger.info("Risk limits OK, enabling quoting")
-                        self.quoting_enabled = True
-                
-                # Skip if no ticker data
-                if not self.ticker:
-                    self.logger.warning("No ticker data available")
+                if len(self.price_history) < min_samples:
+                    self.logger.info(f"Need more price history before quoting: {len(self.price_history)}/{min_samples}")
                     continue
                 
-                # Update comprehensive market conditions
+                # Get market state and conditions
                 market_state = self.market_data.get_market_state()
                 market_conditions = {
-                    "volatility": market_state["volatility"] if not np.isnan(market_state["volatility"]) else TRADING_CONFIG["avellaneda"]["fixed_volatility"],
-                    "is_volatile": market_state["volatility_regime"] == "high",
-                    "is_trending": abs(market_state["trend_strength"]) > TECHNICAL_PARAMS["trend"]["confirmation_threshold"],
-                    "trend_direction": market_state["trend_strength"] > 0,
-                    "trend_strength": market_state["trend_strength"],
-                    "market_impact": market_state["market_impact"]
+                    "volatility": market_state["yz_volatility"] if "yz_volatility" in market_state and not np.isnan(market_state["yz_volatility"]) else 
+                                 (market_state["volatility"] if not np.isnan(market_state["volatility"]) else TRADING_CONFIG["avellaneda"]["fixed_volatility"]),
+                    "market_impact": market_state.get("market_impact", 0.0)
                 }
-                
-                # Calculate mid price for quote update check
-                mid_price = None
-                if self.ticker.best_bid_price and self.ticker.best_ask_price:
-                    mid_price = (self.ticker.best_bid_price + self.ticker.best_ask_price) / 2
-                else:
-                    mid_price = self.ticker.mark_price
-                
-                # Update position's unrealized PnL with current market price
-                if self.market_maker:
-                    self.market_maker.position_tracker.update_unrealized_pnl(self.ticker.mark_price)
-                    position_info = self.market_maker.get_position_metrics()
-                    self.logger.info(
-                        f"Position: {position_info['position']:.4f}, "
-                        f"PnL: ${position_info['total_pnl']:.2f}, "
-                        f"Unrealized: ${position_info['unrealized_pnl']:.2f}, "
-                        f"Realized: ${position_info['realized_pnl']:.2f}"
-                    )
-                
-                # Determine if we should update quotes
-                should_update = False
-                
-                # Force quote generation if no active quotes
-                if len(self.current_quotes[0]) == 0 and len(self.current_quotes[1]) == 0:
-                    self.logger.info("No active quotes - forcing quote generation")
-                    should_update = True
-                    last_forced_update = current_time
-                # Force periodic updates but with increasing intervals during high rate limit pressure
-                elif time_since_forced_update > max(15, min_quote_interval * 3):
-                    # Forced updates happen less frequently when we've had many consecutive updates
-                    self.logger.info(f"Periodic forced quote update (last forced update {time_since_forced_update:.1f}s ago)")
-                    should_update = True
-                    last_forced_update = current_time
-                # Update if the market maker suggests it based on conditions
-                elif self.market_maker.should_update_quotes(self.current_quotes, mid_price):
-                    self.logger.info("Market conditions indicate quotes should be updated")
-                    should_update = True
-                
-                # Add rate limit awareness - if we've been updating frequently, slow down
-                if should_update:
-                    # Check if we're approaching rate limit
-                    usage_percentage = (self.request_counter / self.max_requests_per_minute) * 100
-                    
-                    # If we're over 65% of rate limit and have made several consecutive updates,
-                    # start throttling update frequency
-                    if usage_percentage > 65 and consecutive_updates > 2:
-                        # Probability of skipping decreases as time since last update increases
-                        skip_probability = max(0, 0.8 - (time_since_last_update / 30))
-                        if random.random() < skip_probability:
-                            self.logger.info(f"Skipping update to manage rate limit load ({usage_percentage:.1f}% usage)")
-                            should_update = False
-                    
-                    if should_update:
-                        consecutive_updates += 1
-                    else:
-                        consecutive_updates = max(0, consecutive_updates - 1)
                         
                 # Check rate limit before attempting quote update
-                if should_update and not await self.check_rate_limit():
-                    self.logger.warning("Rate limit would be exceeded - delaying quote update")
-                    should_update = False
-                    
-                # Update quotes if needed
-                if should_update:
-                    self.logger.info("Updating quotes now")
-                    await self.update_quotes(None, market_conditions)
-                    last_update_attempt = current_time
-                else:
-                    self.logger.debug("Skipping quote update - conditions don't warrant an update")
+                if not await self.check_rate_limit(priority="high"):
+                    self.logger.warning("Rate limit reached - delaying quote update")
+                    # Set a cooldown period to prevent hammering the API
+                    self.cooldown_active = True
+                    self.cooldown_until = current_time + 5.0  # 5 second cooldown
+                    continue
+                
+                # Update quotes
+                self.logger.info("Generating new quotes")
+                await self.update_quotes(None, market_conditions)
+                last_quote_time = current_time
+                self.logger.info("Quote update completed")
+                
+                # Add a delay after successfully updating quotes to prevent excessive updates
+                await asyncio.sleep(1.0)
                     
             except Exception as e:
                 self.logger.error(f"Error in quote task: {str(e)}", exc_info=True)
@@ -1149,6 +1105,118 @@ class AvellanedaQuoter:
             except Exception as e:
                 self.logger.error(f"Error in heartbeat task: {str(e)}")
                 await asyncio.sleep(5)  # Brief pause after error
+
+    async def place_quotes(self, bid_quotes: List[Quote], ask_quotes: List[Quote]):
+        """
+        Place new quotes on the exchange
+        
+        Args:
+            bid_quotes: List of bid quotes to place
+            ask_quotes: List of ask quotes to place
+        """
+        try:
+            start_time = time.time()
+            
+            # Enforce maximum number of quotes per side
+            max_quotes_per_side = 3  # Increased from 2 to 3, but still conservative
+            
+            if len(bid_quotes) > max_quotes_per_side:
+                self.logger.warning(f"Limiting bid quotes from {len(bid_quotes)} to {max_quotes_per_side}")
+                bid_quotes = bid_quotes[:max_quotes_per_side]
+                
+            if len(ask_quotes) > max_quotes_per_side:
+                self.logger.warning(f"Limiting ask quotes from {len(ask_quotes)} to {max_quotes_per_side}")
+                ask_quotes = ask_quotes[:max_quotes_per_side]
+                
+            # Log quote placement plan
+            self.logger.info(f"Placing {len(bid_quotes)} bids and {len(ask_quotes)} asks")
+            
+            # Store the new quotes for later reference
+            self.current_quotes = (bid_quotes, ask_quotes)
+            
+            # Increased delay between quote placements (30% slower)
+            quote_delay = 0.5  # Increased from 0.2 to 0.5 seconds
+            
+            # Place quotes in balanced pairs to maintain market presence
+            new_bids = []
+            new_asks = []
+            
+            max_pairs = max(len(bid_quotes), len(ask_quotes))
+            for i in range(max_pairs):
+                # Check rate limit before each pair
+                if not await self.check_rate_limit(priority="high"):
+                    self.logger.warning("Rate limit reached - pausing quote placement")
+                    await asyncio.sleep(1.0)  # Added pause when hitting rate limit
+                    if not await self.check_rate_limit(priority="high"):
+                        break
+                    
+                # Place bid if available
+                if i < len(bid_quotes):
+                    try:
+                        order_id = await self.order_manager.place_order(
+                            instrument=self.perp_name,
+                            direction="buy",
+                            price=bid_quotes[i].price,
+                            amount=bid_quotes[i].amount,
+                            label=MARKET_CONFIG["label"]
+                        )
+                        if order_id:
+                            new_bids.append(order_id)
+                            self.logger.debug(f"Placed bid: {bid_quotes[i].amount:.4f} @ {bid_quotes[i].price:.2f}")
+                    except Exception as e:
+                        self.logger.error(f"Error placing bid quote: {str(e)}")
+                
+                await asyncio.sleep(quote_delay)  # Increased delay between quotes
+                
+                # Check rate limit again before ask
+                if not await self.check_rate_limit(priority="high"):
+                    self.logger.warning("Rate limit reached after bid - pausing")
+                    await asyncio.sleep(1.0)
+                    if not await self.check_rate_limit(priority="high"):
+                        break
+                    
+                # Place ask if available
+                if i < len(ask_quotes):
+                    try:
+                        order_id = await self.order_manager.place_order(
+                            instrument=self.perp_name,
+                            direction="sell",
+                            price=ask_quotes[i].price,
+                            amount=ask_quotes[i].amount,
+                            label=MARKET_CONFIG["label"]
+                        )
+                        if order_id:
+                            new_asks.append(order_id)
+                            self.logger.debug(f"Placed ask: {ask_quotes[i].amount:.4f} @ {ask_quotes[i].price:.2f}")
+                    except Exception as e:
+                        self.logger.error(f"Error placing ask quote: {str(e)}")
+                
+                await asyncio.sleep(quote_delay)  # Increased delay between pairs
+                    
+            # Log placement results
+            elapsed = time.time() - start_time
+            self.logger.info(
+                f"Quote placement completed in {elapsed:.2f}s. Placed {len(new_bids)}/{len(bid_quotes)} bids and "
+                f"{len(new_asks)}/{len(ask_quotes)} asks"
+            )
+                
+        except Exception as e:
+            self.logger.error(f"Error placing quotes: {str(e)}", exc_info=True)
+
+    def get_market_conditions(self) -> Dict:
+        """Get the current market conditions from market data buffer"""
+        market_state = self.market_data.get_market_state()
+        
+        # Get volatility - prefer Yang-Zhang volatility when available
+        if "yz_volatility" in market_state and not np.isnan(market_state["yz_volatility"]):
+            volatility = market_state["yz_volatility"]
+        else:
+            volatility = market_state["volatility"] if not np.isnan(market_state["volatility"]) else TRADING_CONFIG["avellaneda"]["fixed_volatility"]
+        
+        return {
+            "volatility": volatility,
+            "market_impact": market_state.get("market_impact", 0.0)
+        }
 
 async def main():
     """Main entry point"""

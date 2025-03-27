@@ -94,54 +94,69 @@ BOT_CONFIG = {
         "label": "P",
     },
     
-    # Trading strategy parameters (merged order, quoting and Avellaneda parameters)
+    # Trading strategy parameters
     "trading_strategy": {
-        # Core order parameters
-        "spread": 2.0,                 # Base spread in ticks
-        "min_spread": 1.5,             # Minimum spread in tick size
-        "max_spread": 5.0,             # Maximum spread in tick size
-        "bid_step": 25,                # Price step between bid levels
-        "ask_step": 25,                # Price step between ask levels
-        "bid_sizes": [0.2, 0.8],       # Size for each bid level
-        "ask_sizes": [0.2, 0.8],       # Size for each ask level
-        "threshold": 0.5,              # Maximum size per quote
-        "amend_threshold": 25,         # Minimum price change to amend orders
-        "post_only": True,             # Use post-only orders
-        
-        # Quoting parameters
-        "min_quote_interval": 5.0,     # Minimum time between quotes
-        "quote_lifetime": 15,          # Maximum quote lifetime in seconds
-        "operation_interval": 0.5,     # Time between order operations
-        "max_pending_operations": 3,   # Maximum concurrent operations
-        "fast_cancel_threshold": 0.005, # Price movement for fast cancellation
-        "market_impact_threshold": 0.01, # Market impact threshold
-        "min_quote_size": 0.001,       # Minimum quote size
-        "max_quote_size": 1.0,         # Maximum quote size
-        "size_increment": 0.001,       # Size increment
-        "price_decimals": 2,           # Price decimal places
-        "size_decimals": 3,            # Size decimal places
-        "max_retries": 2,              # Maximum retry attempts
-        "quote_buffer": 5,             # Quote buffer
-        "aggressive_cancel": False,    # Whether to cancel aggressively
-        "levels": 2,                   # Number of quote levels
-        
         # Avellaneda-Stoikov model parameters
-        "gamma": 0.2,                  # Risk aversion
-        "inventory_weight": 0.7,       # Inventory skew factor
-        "position_fade_time": 300,     # Time to fade position (seconds)
-        "order_flow_intensity": 1.5,   # Order flow intensity parameter
-        "inventory_cost_factor": 0.0001, # Cost of holding inventory
-        "adverse_selection_threshold": 0.002, # Adverse selection threshold
-        "min_profit_rebalance": 0.01,  # Minimum profit to trigger rebalance
-        "gradual_exit_steps": 4,       # Number of steps for gradual position exit
-        "max_loss_threshold": 0.03,    # Maximum loss before gradual exit
-        "kappa": 0.3,                  # Inventory risk factor
-        "time_horizon": 3600,          # Time horizon in seconds (1 hour)
+        "avellaneda": {
+            # Core model parameters
+            "gamma": 0.3,                  # Risk aversion (increased from 0.2 for wider spreads)
+            "kappa": 0.5,                  # Inventory risk factor
+            "time_horizon": 3600,          # Time horizon in seconds (1 hour)
+            "order_flow_intensity": 2.0,   # Order flow intensity parameter
+            
+            # Spread management
+            "base_spread": 5.0,            # Base spread in ticks
+            "min_spread": 3.0,             # Minimum spread in ticks
+            "max_spread": 25.0,            # Maximum spread in ticks
+            "spread_multiplier": 1.0,      # Dynamic spread adjustment factor
+            
+            # Position and inventory management
+            "inventory_weight": 0.7,       # Inventory skew factor
+            "inventory_cost_factor": 0.0001, # Cost of holding inventory
+            "position_fade_time": 300,     # Time to fade position (seconds)
+            "adverse_selection_threshold": 0.002,  # Adverse selection threshold
+            "min_profit_rebalance": 0.01,  # Minimum profit to trigger rebalance
+            "max_loss_threshold": 0.03,    # Maximum loss before gradual exit
+            
+            # Quote sizing and levels
+            "base_size": 0.1,             # Base quote size
+            "size_multipliers": [1.0, 2.0, 3.0, 2.0, 1.0, 1.0],  # Size multipliers for each level
+            "max_levels": 6,              # Maximum number of quote levels
+            "level_spacing": 35,          # Base spacing between levels in ticks
+        },
         
-        # VAMP (Volume Adjusted Market Pressure) parameters
-        "vamp_window": 50,             # Number of price-volume samples to keep
-        "vamp_aggressive_window": 20,  # Number of aggressive trade samples to keep
-        "vamp_impact_window": 30,      # Number of market impact samples to keep
+        # Order execution parameters
+        "execution": {
+            "post_only": True,             # Use post-only orders
+            "min_size": 0.001,             # Minimum quote size
+            "max_size": 1.0,               # Maximum quote size
+            "size_increment": 0.001,       # Size increment
+            "price_decimals": 2,           # Price decimal places
+            "size_decimals": 3,            # Size decimal places
+            "max_retries": 2,              # Maximum retry attempts
+        },
+        
+        # Quote management
+        "quote_timing": {
+            "min_interval": 1.0,           # Minimum time between quotes
+            "max_lifetime": 10,            # Maximum quote lifetime in seconds
+            "operation_interval": 0.2,     # Time between order operations
+            "max_pending": 5,              # Maximum concurrent operations
+        },
+        
+        # Market impact and cancellation
+        "market_impact": {
+            "threshold": 0.01,             # Market impact threshold
+            "fast_cancel_threshold": 0.005, # Price movement for fast cancellation
+            "aggressive_cancel": False,     # Whether to cancel aggressively
+        },
+        
+        # VAMP (Volume Adjusted Market Pressure)
+        "vamp": {
+            "price_window": 50,            # Number of price-volume samples
+            "aggressive_window": 20,        # Number of aggressive trade samples
+            "impact_window": 30,           # Number of market impact samples
+        }
     },
     
     # Risk management
@@ -162,71 +177,15 @@ BOT_CONFIG = {
         "base_take_profit_pct": 0.02,  # Base take profit percentage
         "max_take_profit_pct": 0.05,   # Maximum take profit percentage
         "min_take_profit_pct": 0.002,  # Minimum take profit percentage (0.2%)
-        "take_profit_levels": [
-            {"percentage": 0.0023, "size": 0.6},  # Take 60% profit at 0.23%
-            {"percentage": 0.01, "size": 0.2},    # Take 20% profit at 1%
-            {"percentage": 0.02, "size": 0.1},    # Take 10% profit at 2%
-            {"percentage": 0.03, "size": 0.1},    # Take remaining 10% at 3%
-        ],
-        
-        # Trailing stop configuration
-        "trailing_stop_activation": 0.015,  # Activate trailing at 1.5% profit
-        "trailing_stop_distance": 0.01,     # 1% trailing distance
-        "trailing_stop_levels": [
-            {"activation": 0.015, "distance": 0.01},  # First trailing stop
-            {"activation": 0.03, "distance": 0.015},  # Second trailing stop
-            {"activation": 0.05, "distance": 0.02},   # Final trailing stop
-        ],
         
         # Position management
         "max_notional": 50000,  # Maximum notional value in USD
         "max_position_notional": 40000,  # Maximum notional position (80% of max_notional)
     },
     
-    # Technical analysis parameters
-    "technical": {
-        "trend": {
-            "short_period": 10,        # Short-term trend period
-            "long_period": 30,         # Long-term trend period
-            "confirmation_threshold": 0.6, # Trend confirmation threshold
-        },
-        # Additional technical analysis parameters
-        "zscore": {
-            "window": 100,
-            "threshold": 2.0,
-            "mean_reversion_factor": 0.5
-        },
-        "atr": {
-            "period": 14,
-            "multiplier": 1.0,
-            "smoothing": 0.1,
-            "threshold": 0.005
-        },
-        "volume": {
-            "ma_period": 20,
-            "threshold": 1.5
-        },
-        
-        # Signal configuration
-        "signal": {
-            "bbands_period": 20,
-            "bbands_std": 2,
-            "momentum_period": 10,
-            "volume_ma_period": 20,
-            "min_signal_strength": 0.3,
-            "signal_cooldown": 300,
-            "trend_confirmation_threshold": 0.6,
-            "max_position_increase": 0.2,  # Maximum position increase per signal
-            "notional_utilization_threshold": 0.8,  # 80% of max notional
-            "signal_size_dampening": 0.5,  # Dampen signal impact on size
-            "min_trade_interval": 5,  # Minimum seconds between trades
-            "max_trade_count": 3,  # Maximum trades per interval
-        }
-    },
-    
     # Connection parameters
     "connection": {
-        "rate_limit": 60,            # Maximum requests per minute
+        "rate_limit": 180,            # Maximum requests per minute (increased from 60)
         "retry_delay": 5,            # Delay between retries in seconds
         "heartbeat_interval": 30,    # Heartbeat interval in seconds
         "max_reconnect_attempts": 3  # Maximum reconnection attempts
@@ -296,88 +255,84 @@ New code should prefer these over the legacy configs.
 # Simple pass-through configs (direct references to BOT_CONFIG sections)
 MARKET_CONFIG = BOT_CONFIG["market"]
 CALL_IDS = BOT_CONFIG["call_ids"]
-TECHNICAL_PARAMS = BOT_CONFIG["technical"]
 
 # Consolidated trading configuration (combines order parameters, quoting, and Avellaneda model)
 TRADING_CONFIG = {
     # Core order parameters
     "order": {
-        "spread": BOT_CONFIG["trading_strategy"]["spread"],
-        "min_spread": BOT_CONFIG["trading_strategy"]["min_spread"],
-        "max_spread": BOT_CONFIG["trading_strategy"]["max_spread"],
-        "bid_step": BOT_CONFIG["trading_strategy"]["bid_step"],
-        "ask_step": BOT_CONFIG["trading_strategy"]["ask_step"],
-        "bid_sizes": BOT_CONFIG["trading_strategy"]["bid_sizes"],
-        "ask_sizes": BOT_CONFIG["trading_strategy"]["ask_sizes"],
-        "threshold": BOT_CONFIG["trading_strategy"]["threshold"],
-        "amend_threshold": BOT_CONFIG["trading_strategy"]["amend_threshold"],
-        "post_only": BOT_CONFIG["trading_strategy"]["post_only"]
+        "spread": BOT_CONFIG["trading_strategy"]["avellaneda"]["base_spread"],
+        "min_spread": BOT_CONFIG["trading_strategy"]["avellaneda"]["min_spread"],
+        "max_spread": BOT_CONFIG["trading_strategy"]["avellaneda"]["max_spread"],
+        "bid_step": BOT_CONFIG["trading_strategy"]["avellaneda"]["level_spacing"],
+        "ask_step": BOT_CONFIG["trading_strategy"]["avellaneda"]["level_spacing"],
+        "bid_sizes": BOT_CONFIG["trading_strategy"]["avellaneda"]["size_multipliers"],
+        "ask_sizes": BOT_CONFIG["trading_strategy"]["avellaneda"]["size_multipliers"],
+        "threshold": BOT_CONFIG["trading_strategy"]["avellaneda"]["adverse_selection_threshold"],
+        "amend_threshold": BOT_CONFIG["trading_strategy"]["avellaneda"]["max_loss_threshold"],
+        "post_only": BOT_CONFIG["trading_strategy"]["execution"]["post_only"]
     },
     
     # Quote management
     "quoting": {
-        "min_quote_interval": BOT_CONFIG["trading_strategy"]["min_quote_interval"],
-        "quote_lifetime": BOT_CONFIG["trading_strategy"]["quote_lifetime"],
-        "refresh_interval": BOT_CONFIG["trading_strategy"]["min_quote_interval"] / 2,
-        "max_quote_age": BOT_CONFIG["trading_strategy"]["quote_lifetime"] * 3,
-        "operation_interval": BOT_CONFIG["trading_strategy"]["operation_interval"],
-        "max_pending_operations": BOT_CONFIG["trading_strategy"]["max_pending_operations"],
-        "fast_cancel_threshold": BOT_CONFIG["trading_strategy"]["fast_cancel_threshold"],
-        "market_impact_threshold": BOT_CONFIG["trading_strategy"]["market_impact_threshold"],
-        "min_size": BOT_CONFIG["trading_strategy"]["min_quote_size"],
-        "max_size": BOT_CONFIG["trading_strategy"]["max_quote_size"],
-        "size_increment": BOT_CONFIG["trading_strategy"]["size_increment"],
-        "price_decimals": BOT_CONFIG["trading_strategy"]["price_decimals"],
-        "size_decimals": BOT_CONFIG["trading_strategy"]["size_decimals"],
-        "max_retries": BOT_CONFIG["trading_strategy"]["max_retries"],
-        "buffer": BOT_CONFIG["trading_strategy"]["quote_buffer"],
-        "aggressive_cancel": BOT_CONFIG["trading_strategy"]["aggressive_cancel"],
-        "levels": BOT_CONFIG["trading_strategy"]["levels"],
+        "min_quote_interval": BOT_CONFIG["trading_strategy"]["quote_timing"]["min_interval"],
+        "quote_lifetime": BOT_CONFIG["trading_strategy"]["quote_timing"]["max_lifetime"],
+        "refresh_interval": BOT_CONFIG["trading_strategy"]["quote_timing"]["min_interval"] / 2,
+        "max_quote_age": BOT_CONFIG["trading_strategy"]["quote_timing"]["max_lifetime"] * 3,
+        "operation_interval": BOT_CONFIG["trading_strategy"]["quote_timing"]["operation_interval"],
+        "max_pending_operations": BOT_CONFIG["trading_strategy"]["quote_timing"]["max_pending"],
+        "fast_cancel_threshold": BOT_CONFIG["trading_strategy"]["market_impact"]["fast_cancel_threshold"],
+        "market_impact_threshold": BOT_CONFIG["trading_strategy"]["market_impact"]["threshold"],
+        "min_size": BOT_CONFIG["trading_strategy"]["execution"]["min_size"],
+        "max_size": BOT_CONFIG["trading_strategy"]["execution"]["max_size"],
+        "size_increment": BOT_CONFIG["trading_strategy"]["execution"]["size_increment"],
+        "price_decimals": BOT_CONFIG["trading_strategy"]["execution"]["price_decimals"],
+        "size_decimals": BOT_CONFIG["trading_strategy"]["execution"]["size_decimals"],
+        "max_retries": BOT_CONFIG["trading_strategy"]["execution"]["max_retries"],
+        "buffer": BOT_CONFIG["trading_strategy"]["vamp"]["price_window"],
+        "aggressive_cancel": BOT_CONFIG["trading_strategy"]["market_impact"]["aggressive_cancel"],
+        "levels": BOT_CONFIG["trading_strategy"]["avellaneda"]["max_levels"],
     },
     
     # Avellaneda model parameters
     "avellaneda": {
-        "gamma": BOT_CONFIG["trading_strategy"]["gamma"],
-        "inventory_weight": BOT_CONFIG["trading_strategy"]["inventory_weight"], 
-        "inventory_skew_factor": BOT_CONFIG["trading_strategy"]["inventory_weight"] / 2,
-        "position_fade_time": BOT_CONFIG["trading_strategy"]["position_fade_time"],
-        "order_flow_intensity": BOT_CONFIG["trading_strategy"]["order_flow_intensity"],
-        "inventory_cost_factor": BOT_CONFIG["trading_strategy"]["inventory_cost_factor"],
-        "adverse_selection_threshold": BOT_CONFIG["trading_strategy"]["adverse_selection_threshold"],
-        "min_profit_rebalance": BOT_CONFIG["trading_strategy"]["min_profit_rebalance"],
-        "gradual_exit_steps": BOT_CONFIG["trading_strategy"]["gradual_exit_steps"],
-        "max_loss_threshold": BOT_CONFIG["trading_strategy"]["max_loss_threshold"],
+        "gamma": BOT_CONFIG["trading_strategy"]["avellaneda"]["gamma"],
+        "inventory_weight": BOT_CONFIG["trading_strategy"]["avellaneda"]["inventory_weight"], 
+        "inventory_skew_factor": BOT_CONFIG["trading_strategy"]["avellaneda"]["inventory_weight"] / 2,
+        "position_fade_time": BOT_CONFIG["trading_strategy"]["avellaneda"]["position_fade_time"],
+        "order_flow_intensity": BOT_CONFIG["trading_strategy"]["avellaneda"]["order_flow_intensity"],
+        "inventory_cost_factor": BOT_CONFIG["trading_strategy"]["avellaneda"]["inventory_cost_factor"],
+        "adverse_selection_threshold": BOT_CONFIG["trading_strategy"]["avellaneda"]["adverse_selection_threshold"],
+        "min_profit_rebalance": BOT_CONFIG["trading_strategy"]["avellaneda"]["min_profit_rebalance"],
+        "gradual_exit_steps": BOT_CONFIG["trading_strategy"]["avellaneda"]["max_loss_threshold"],
+        "max_loss_threshold": BOT_CONFIG["trading_strategy"]["avellaneda"]["max_loss_threshold"],
         "position_limit": BOT_CONFIG["risk"]["max_position"],  # Add position limit from risk config
-        "kappa": BOT_CONFIG["trading_strategy"]["kappa"],
-        "time_horizon": BOT_CONFIG["trading_strategy"]["time_horizon"],
+        "kappa": BOT_CONFIG["trading_strategy"]["avellaneda"]["kappa"],
+        "time_horizon": BOT_CONFIG["trading_strategy"]["avellaneda"]["time_horizon"],
         # Adding a fixed volatility value to replace dynamic calculation
-        "fixed_volatility": 0.02,  # Fixed volatility value of 2%
-        # Additional Avellaneda-specific parameters
-        "k": 1.5,               # Order flow intensity
+        "fixed_volatility": 0.03,  # Fixed volatility value of 3% (increased for wider spreads)
+        # Additional Avellaneda-specific parameters (used for dynamic spread calculation)
+        "k": 2.0,               # Order flow intensity (increased from 1.5)
         "window_size": 100,     # Window for volatility estimation
-        "reservation_spread": 0.002,  # Base spread as percentage
-        "vol_window": 20,       # Window for volatility calculation
-        "min_spread": 0.001,    # Minimum spread
-        "max_spread": 0.01,     # Maximum spread
+        # Remove the fixed spread parameters to let Avellaneda model calculate them dynamically
     },
     
     # Volatility parameters (simplified)
     "volatility": {
-        "default": 0.02,  # Default volatility (2%)
-        "floor": 0.01,    # Minimum volatility (1%)
-        "ceiling": 0.10,  # Maximum volatility (10%)
+        "default": 0.03,  # Default volatility (3%, increased from 2%)
+        "floor": 0.02,    # Minimum volatility (2%, increased from 1%)
+        "ceiling": 0.15,  # Maximum volatility (15%, increased from 10%)
         "cache_duration": 60,  # Cache duration in seconds
         "window": 100,    # Lookback window for volatility calculation
         "min_samples": 20, # Minimum samples required
-        "scaling": 1.0,   # Volatility scaling factor
+        "scaling": 1.2,   # Volatility scaling factor (increased from 1.0)
         "ewm_span": 20    # Exponential weighted moving average span
     },
     
     # VAMP parameters
     "vamp": {
-        "window": BOT_CONFIG["trading_strategy"]["vamp_window"],
-        "aggressive_window": BOT_CONFIG["trading_strategy"]["vamp_aggressive_window"],
-        "impact_window": BOT_CONFIG["trading_strategy"]["vamp_impact_window"],
+        "window": BOT_CONFIG["trading_strategy"]["vamp"]["price_window"],
+        "aggressive_window": BOT_CONFIG["trading_strategy"]["vamp"]["aggressive_window"],
+        "impact_window": BOT_CONFIG["trading_strategy"]["vamp"]["impact_window"],
     },
 }
 
@@ -396,11 +351,6 @@ RISK_CONFIG = {
         "base_take_profit_pct": BOT_CONFIG["risk"]["base_take_profit_pct"],
         "max_take_profit_pct": BOT_CONFIG["risk"]["max_take_profit_pct"],
         "min_take_profit_pct": BOT_CONFIG["risk"]["min_take_profit_pct"],
-        "take_profit_levels": BOT_CONFIG["risk"]["take_profit_levels"],
-        # Trailing stop parameters
-        "trailing_stop_activation": BOT_CONFIG["risk"]["trailing_stop_activation"],
-        "trailing_stop_distance": BOT_CONFIG["risk"]["trailing_stop_distance"],
-        "trailing_stop_levels": BOT_CONFIG["risk"]["trailing_stop_levels"],
         # Other default values
         "vol_scaling_factor": 1.0,  # Default volatility scaling factor
         "baseline_volatility": 0.02,  # Default baseline volatility of 2%
@@ -411,16 +361,16 @@ RISK_CONFIG = {
         "position_rebalance_threshold": BOT_CONFIG["risk"].get("position_rebalance_threshold", 0.8),
         "market_impact_threshold": BOT_CONFIG["risk"].get("market_impact_threshold", 0.0025),
         "rebalance_cooldown": BOT_CONFIG["risk"].get("rebalance_cooldown", 300),
-        "max_quote_size": BOT_CONFIG["trading_strategy"]["max_quote_size"]
+        "max_quote_size": BOT_CONFIG["trading_strategy"]["execution"]["max_size"]
     },
     
     # Inventory management
     "inventory": {
         "target": BOT_CONFIG["risk"]["inventory_target"],
         "max_imbalance": BOT_CONFIG["risk"]["inventory_imbalance_limit"],
-        "fade_time": BOT_CONFIG["trading_strategy"]["position_fade_time"],
-        "adverse_selection_threshold": BOT_CONFIG["trading_strategy"]["adverse_selection_threshold"],
-        "min_profit_rebalance": BOT_CONFIG["trading_strategy"]["min_profit_rebalance"]
+        "fade_time": BOT_CONFIG["trading_strategy"]["avellaneda"]["position_fade_time"],
+        "adverse_selection_threshold": BOT_CONFIG["trading_strategy"]["avellaneda"]["adverse_selection_threshold"],
+        "min_profit_rebalance": BOT_CONFIG["trading_strategy"]["avellaneda"]["min_profit_rebalance"]
     }
 }
 
@@ -458,23 +408,24 @@ Over time, code should be migrated to use the consolidated configs instead.
 
 # Core backward compatibility configs
 ORDERBOOK_CONFIG = {
-    "spread": BOT_CONFIG["trading_strategy"]["spread"],
-    "min_spread": BOT_CONFIG["trading_strategy"]["min_spread"],
-    "max_spread": BOT_CONFIG["trading_strategy"]["max_spread"],
-    "bid_step": BOT_CONFIG["trading_strategy"]["bid_step"],
-    "ask_step": BOT_CONFIG["trading_strategy"]["ask_step"],
-    "bid_sizes": BOT_CONFIG["trading_strategy"]["bid_sizes"],
-    "ask_sizes": BOT_CONFIG["trading_strategy"]["ask_sizes"],
-    "threshold": BOT_CONFIG["trading_strategy"]["threshold"],
-    "amend_threshold": BOT_CONFIG["trading_strategy"]["amend_threshold"],
-    "market_impact_threshold": BOT_CONFIG["trading_strategy"]["market_impact_threshold"],
-    "quote_lifetime": BOT_CONFIG["trading_strategy"]["quote_lifetime"],
-    "min_quote_interval": BOT_CONFIG["trading_strategy"]["min_quote_interval"],
+    "spread": BOT_CONFIG["trading_strategy"]["avellaneda"]["base_spread"],
+    "min_spread": BOT_CONFIG["trading_strategy"]["avellaneda"]["min_spread"],
+    "max_spread": BOT_CONFIG["trading_strategy"]["avellaneda"]["max_spread"],
+    "bid_step": BOT_CONFIG["trading_strategy"]["avellaneda"]["level_spacing"],
+    "ask_step": BOT_CONFIG["trading_strategy"]["avellaneda"]["level_spacing"],
+    "bid_sizes": BOT_CONFIG["trading_strategy"]["avellaneda"]["size_multipliers"],
+    "ask_sizes": BOT_CONFIG["trading_strategy"]["avellaneda"]["size_multipliers"],
+    "threshold": BOT_CONFIG["trading_strategy"]["avellaneda"]["adverse_selection_threshold"],
+    "amend_threshold": BOT_CONFIG["trading_strategy"]["avellaneda"]["max_loss_threshold"],
+    "market_impact_threshold": BOT_CONFIG["trading_strategy"]["market_impact"]["threshold"],
+    "quote_lifetime": BOT_CONFIG["trading_strategy"]["quote_timing"]["max_lifetime"],
+    "min_quote_interval": BOT_CONFIG["trading_strategy"]["quote_timing"]["min_interval"],
     "error_retry_interval": BOT_CONFIG["connection"]["retry_delay"],
-    "max_pending_operations": BOT_CONFIG["trading_strategy"]["max_pending_operations"],
-    "fast_cancel_threshold": BOT_CONFIG["trading_strategy"]["fast_cancel_threshold"],
-    "base_order_size": 0.01,  # Default base order size for quote calculations
-    "min_order_size": 0.001,  # Minimum order size
+    "max_pending_operations": BOT_CONFIG["trading_strategy"]["quote_timing"]["max_pending"],
+    "fast_cancel_threshold": BOT_CONFIG["trading_strategy"]["market_impact"]["fast_cancel_threshold"],
+    "base_order_size": BOT_CONFIG["trading_strategy"]["execution"]["min_size"],
+    "min_order_size": BOT_CONFIG["trading_strategy"]["execution"]["min_size"],
+    "levels": BOT_CONFIG["trading_strategy"]["avellaneda"]["max_levels"],
 }
 
 RISK_LIMITS = RISK_CONFIG["limits"]
@@ -526,27 +477,36 @@ INVENTORY_CONFIG = {
     "inventory_skew_factor": TRADING_CONFIG["avellaneda"]["inventory_skew_factor"],
     "max_position_notional": RISK_CONFIG["limits"]["max_position_notional"],
     "min_profit_rebalance": RISK_CONFIG["inventory"]["min_profit_rebalance"],
-    "gradual_exit_steps": TRADING_CONFIG["avellaneda"]["gradual_exit_steps"],
-    "max_loss_threshold": TRADING_CONFIG["avellaneda"]["max_loss_threshold"],
+    "gradual_exit_steps": TRADING_CONFIG["avellaneda"]["max_loss_threshold"],
     "inventory_cost_factor": TRADING_CONFIG["avellaneda"]["inventory_cost_factor"],
 }
 
 # Quoting configuration
 QUOTING_CONFIG = {
-    "min_quote_interval": BOT_CONFIG["trading_strategy"]["min_quote_interval"],
-    "quote_lifetime": BOT_CONFIG["trading_strategy"]["quote_lifetime"],
-    "order_operation_interval": BOT_CONFIG["trading_strategy"]["operation_interval"],
-    "max_pending_operations": BOT_CONFIG["trading_strategy"]["max_pending_operations"],
-    "fast_cancel_threshold": BOT_CONFIG["trading_strategy"]["fast_cancel_threshold"],
-    "market_impact_threshold": BOT_CONFIG["trading_strategy"]["market_impact_threshold"],
-    "min_quote_size": BOT_CONFIG["trading_strategy"]["min_quote_size"],
-    "max_quote_size": BOT_CONFIG["trading_strategy"]["max_quote_size"],
-    "size_increment": BOT_CONFIG["trading_strategy"]["size_increment"],
-    "price_decimals": BOT_CONFIG["trading_strategy"]["price_decimals"],
-    "size_decimals": BOT_CONFIG["trading_strategy"]["size_decimals"],
-    "max_retries": BOT_CONFIG["trading_strategy"]["max_retries"],
-    "quote_buffer": BOT_CONFIG["trading_strategy"]["quote_buffer"],
-    "aggressive_cancel": BOT_CONFIG["trading_strategy"]["aggressive_cancel"],
-    "post_only": BOT_CONFIG["trading_strategy"]["post_only"],
-    "error_retry_interval": BOT_CONFIG["connection"]["retry_delay"]
+    "min_quote_interval": BOT_CONFIG["trading_strategy"]["quote_timing"]["min_interval"],
+    "quote_lifetime": BOT_CONFIG["trading_strategy"]["quote_timing"]["max_lifetime"],
+    "order_operation_interval": BOT_CONFIG["trading_strategy"]["quote_timing"]["operation_interval"],
+    "max_pending_operations": BOT_CONFIG["trading_strategy"]["quote_timing"]["max_pending"],
+    "fast_cancel_threshold": BOT_CONFIG["trading_strategy"]["market_impact"]["fast_cancel_threshold"],
+    "market_impact_threshold": BOT_CONFIG["trading_strategy"]["market_impact"]["threshold"],
+    "min_quote_size": BOT_CONFIG["trading_strategy"]["execution"]["min_size"],
+    "max_quote_size": BOT_CONFIG["trading_strategy"]["execution"]["max_size"],
+    "size_increment": BOT_CONFIG["trading_strategy"]["execution"]["size_increment"],
+    "price_decimals": BOT_CONFIG["trading_strategy"]["execution"]["price_decimals"],
+    "size_decimals": BOT_CONFIG["trading_strategy"]["execution"]["size_decimals"],
+    "max_retries": BOT_CONFIG["trading_strategy"]["execution"]["max_retries"],
+    "quote_buffer": BOT_CONFIG["trading_strategy"]["vamp"]["price_window"],
+    "aggressive_cancel": BOT_CONFIG["trading_strategy"]["market_impact"]["aggressive_cancel"],
+    "post_only": BOT_CONFIG["trading_strategy"]["execution"]["post_only"],
+    "error_retry_interval": BOT_CONFIG["connection"]["retry_delay"],
+    "levels": BOT_CONFIG["trading_strategy"]["avellaneda"]["max_levels"],
+    # Add base_levels for compatibility with existing code
+    "base_levels": [
+        {"size": 0.1, "spread_multiplier": 1.0},  # Level 0 (closest to mid)
+        {"size": 0.2, "spread_multiplier": 1.2},  # Level 1
+        {"size": 0.3, "spread_multiplier": 1.5},  # Level 2
+        {"size": 0.2, "spread_multiplier": 1.8},  # Level 3 
+        {"size": 0.1, "spread_multiplier": 2.2},  # Level 4
+        {"size": 0.1, "spread_multiplier": 2.5},  # Level 5 (furthest from mid)
+    ]
 }
