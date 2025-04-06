@@ -220,10 +220,27 @@ class RiskManager:
             
         pnl_pct = self.calculate_pnl_percentage(current_price)
         
-        # Check stop loss percentage threshold
-        if pnl_pct <= -self.stop_loss_pct:
+        # Dynamic stop-loss adjustment - if in profit, widen the stop-loss
+        effective_stop_loss = self.stop_loss_pct
+        
+        # If we're in profit, dynamically adjust the stop loss to be wider
+        # This lets winners run while protecting capital
+        if pnl_pct > 0:
+            # Gradually widen stop loss as profit increases (up to 2x wider at take_profit level)
+            profit_ratio = min(1.0, pnl_pct / self.take_profit_pct)
+            stop_loss_multiplier = 1.0 + profit_ratio  # Ranges from 1.0 to 2.0
+            effective_stop_loss = self.stop_loss_pct * stop_loss_multiplier
+            
+            # For significant profits (>2x take_profit), use a trailing stop
+            if pnl_pct > self.take_profit_pct * 2:
+                # Trailing stop at 50% of current profit
+                trailing_stop = pnl_pct * 0.5
+                effective_stop_loss = max(effective_stop_loss, trailing_stop)
+        
+        # Check stop loss percentage threshold with dynamic adjustment
+        if pnl_pct <= -effective_stop_loss:
             self.logger.warning(
-                f"Stop loss triggered: PnL {pnl_pct:.2%} below threshold -{self.stop_loss_pct:.2%}. "
+                f"Stop loss triggered: PnL {pnl_pct:.2%} below threshold -{effective_stop_loss:.2%}. "
                 f"Position: {self.position_size:.3f} @ {self.entry_price:.2f}, current price: {current_price:.2f}"
             )
             return True
@@ -238,34 +255,60 @@ class RiskManager:
             
         return False
         
-    def check_take_profit(self, current_price: float) -> Tuple[bool, str]:
+    def check_take_profit(self, current_price: float) -> Tuple[bool, str, float]:
         """
-        Check if take profit should be triggered (simplified)
+        Check if take profit should be triggered with enhanced partial profit taking
         
         Args:
             current_price: Current market price
             
         Returns:
-            Tuple of (boolean indicating if take profit triggered, reason string)
+            Tuple of (boolean indicating if take profit triggered, reason string, portion to close)
         """
         if self.position_size == 0:
-            return False, ""
+            return False, "", 0.0
             
         pnl_pct = self.calculate_pnl_percentage(current_price)
         
-        # Basic take profit threshold
-        if pnl_pct >= self.take_profit_pct:
-            reason = f"Take profit threshold reached: {pnl_pct:.2%} >= {self.take_profit_pct:.2%}"
-            return True, reason
+        # No take profit if we're in a loss
+        if pnl_pct <= 0:
+            return False, "", 0.0
             
-        # Simple trailing take profit logic
+        # Enhanced take profit with progressive profit-taking strategy
+        # Take partial profits at different levels
+        
+        # Stage 1: Take 25% at the main take profit threshold
+        if pnl_pct >= self.take_profit_pct:
+            portion_to_close = 0.25
+            reason = f"Take profit level 1: {pnl_pct:.2%} >= {self.take_profit_pct:.2%}, closing {portion_to_close:.0%}"
+            return True, reason, portion_to_close
+        
+        # Stage 2: Take another 25% at 1.5x the take profit threshold    
+        if pnl_pct >= self.take_profit_pct * 1.5:
+            portion_to_close = 0.25
+            reason = f"Take profit level 2: {pnl_pct:.2%} >= {self.take_profit_pct*1.5:.2%}, closing {portion_to_close:.0%}"
+            return True, reason, portion_to_close
+            
+        # Stage 3: Take another 25% at 2x the take profit threshold
+        if pnl_pct >= self.take_profit_pct * 2.0:
+            portion_to_close = 0.25
+            reason = f"Take profit level 3: {pnl_pct:.2%} >= {self.take_profit_pct*2.0:.2%}, closing {portion_to_close:.0%}"
+            return True, reason, portion_to_close
+            
+        # Stage 4: Close final 25% at 3x the take profit threshold
+        if pnl_pct >= self.take_profit_pct * 3.0:
+            portion_to_close = 0.25  # Close the remainder
+            reason = f"Take profit level 4: {pnl_pct:.2%} >= {self.take_profit_pct*3.0:.2%}, closing final {portion_to_close:.0%}"
+            return True, reason, portion_to_close
+        
+        # Simple trailing take profit logic as a safety net
         if self.peak_profit > self.take_profit_pct * 0.5:  # Only apply trailing if we've seen significant profit
             profit_drawdown = (self.peak_profit - pnl_pct) / self.peak_profit if self.peak_profit > 0 else 0
             if profit_drawdown > 0.5:  # Don't give back more than 50% of peak profit
                 reason = f"Trailing take profit: Given back {profit_drawdown:.2%} of peak profit {self.peak_profit:.2%}"
-                return True, reason
+                return True, reason, 1.0  # Close the entire position to protect profit
             
-        return False, ""
+        return False, "", 0.0
 
     async def check_risk_limits(self) -> bool:
         """

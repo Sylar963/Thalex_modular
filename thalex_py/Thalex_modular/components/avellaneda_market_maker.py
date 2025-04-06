@@ -78,6 +78,11 @@ class AvellanedaMarketMaker:
         self.last_position_check = 0
         self.last_quote_update = 0
         
+        # Enhanced position tracking
+        self.position_start_time = 0  # Time when current position was opened
+        self.unrealized_pnl = 0.0     # Current unrealized PnL
+        self.position_value = 0.0     # Current position value in USD
+        
         # VAMP calculation variables
         self.vwap = 0.0
         self.total_volume = 0.0
@@ -102,11 +107,62 @@ class AvellanedaMarketMaker:
         self.logger.info(f"Tick size set to {tick_size}")
 
     def update_position(self, size: float, price: float):
-        """Update current position information"""
+        """
+        Update current position information with enhanced metrics tracking
+        
+        Args:
+            size: Current position size
+            price: Current position price/mark price
+        """
         old_position = self.position_size
+        old_position_value = getattr(self, 'position_value', 0.0)
+        
+        # Track position start time for new positions
+        if self.position_size == 0 and size != 0:
+            self.position_start_time = time.time()
+            self.logger.info(f"Starting new position tracking at {time.strftime('%H:%M:%S')}")
+        
+        # Update core position data
         self.position_size = size
-        self.entry_price = price
-        self.logger.info(f"Position updated: {old_position} -> {size} @ {price}")
+        self.entry_price = price if not hasattr(self, 'entry_price') else self.entry_price
+        
+        # Calculate position value (absolute value of position in USD)
+        self.position_value = abs(size * price)
+        
+        # Calculate unrealized PnL if we have an entry price
+        if hasattr(self, 'entry_price') and self.entry_price > 0:
+            if size > 0:  # Long position
+                self.unrealized_pnl = (price - self.entry_price) * size
+            elif size < 0:  # Short position
+                self.unrealized_pnl = (self.entry_price - price) * abs(size)
+            else:  # No position
+                self.unrealized_pnl = 0.0
+        else:
+            self.unrealized_pnl = 0.0
+        
+        # Calculate PnL as percentage for reference
+        pnl_percentage = 0.0
+        if self.position_value > 0 and self.unrealized_pnl != 0:
+            pnl_percentage = self.unrealized_pnl / self.position_value
+        
+        # If position flipped from long to short or vice versa, reset entry price and track as new position
+        if (old_position > 0 and size < 0) or (old_position < 0 and size > 0):
+            self.entry_price = price
+            self.position_start_time = time.time()
+            self.logger.info(f"Position flipped from {old_position} to {size}, resetting tracking")
+        
+        # If position closed completely, reset position tracking
+        if size == 0 and old_position != 0:
+            self.position_start_time = 0
+            self.entry_price = 0
+            self.unrealized_pnl = 0.0
+            self.position_value = 0.0
+        
+        # Extended logging with more metrics
+        self.logger.info(
+            f"Position updated: {old_position:.4f} -> {size:.4f} @ {price:.2f} | "
+            f"Value: {self.position_value:.2f} | PnL: {self.unrealized_pnl:.2f} ({pnl_percentage:.2%})"
+        )
 
     def update_market_conditions(self, volatility: float, market_impact: float):
         """Update market conditions"""
@@ -437,71 +493,108 @@ class AvellanedaMarketMaker:
             spread = self.calculate_optimal_spread(market_impact)
             
             # 3. Calculate skewed prices based on inventory
-            bid_price, ask_price = self.calculate_skewed_prices(reference_price, spread)
+            base_bid_price, base_ask_price = self.calculate_skewed_prices(reference_price, spread)
             
             # 4. Safety check: ensure bid < ask and prices are positive
-            if bid_price >= ask_price or bid_price <= 0 or ask_price <= 0:
+            if base_bid_price >= base_ask_price or base_bid_price <= 0 or base_ask_price <= 0:
                 self.logger.warning(
-                    f"Invalid prices calculated: bid={bid_price}, ask={ask_price}, " 
+                    f"Invalid prices calculated: bid={base_bid_price}, ask={base_ask_price}, " 
                     f"ref={reference_price}, spread={spread}"
                 )
                 # Recalculate with safe defaults
                 min_spread_ticks = ORDERBOOK_CONFIG.get("min_spread", 5)
                 safe_spread = min_spread_ticks * self.tick_size
-                bid_price = reference_price - (safe_spread / 2)
-                ask_price = reference_price + (safe_spread / 2)
+                base_bid_price = reference_price - (safe_spread / 2)
+                base_ask_price = reference_price + (safe_spread / 2)
             
             # 5. Align prices to tick size
-            bid_price = self.align_price_to_tick(bid_price)
-            ask_price = self.align_price_to_tick(ask_price)
+            base_bid_price = self.align_price_to_tick(base_bid_price)
+            base_ask_price = self.align_price_to_tick(base_ask_price)
             
-            # 6. Calculate quote sizes (with position limit awareness)
-            bid_size, ask_size = self.calculate_quote_sizes(reference_price)
+            # 6. Calculate base quote sizes
+            base_bid_size, base_ask_size = self.calculate_quote_sizes(reference_price)
             
             # Ensure sizes aren't too small
             min_size = ORDERBOOK_CONFIG.get("min_order_size", 0.001)
-            if bid_size < min_size or ask_size < min_size:
-                self.logger.warning(f"Quote sizes too small: bid={bid_size}, ask={ask_size}, using min size {min_size}")
-                bid_size = max(bid_size, min_size)
-                ask_size = max(ask_size, min_size)
+            if base_bid_size < min_size or base_ask_size < min_size:
+                self.logger.warning(f"Quote sizes too small: bid={base_bid_size}, ask={base_ask_size}, using min size {min_size}")
+                base_bid_size = max(base_bid_size, min_size)
+                base_ask_size = max(base_ask_size, min_size)
                 
-            # 7. Create quote objects
+            # 7. Create quote objects for multiple levels
             timestamp = datetime.now().timestamp()
+            levels = self.quote_levels
             
-            # Create bid quote if we have capacity to buy
-            if self.can_increase_position():
-                # Always create at least one bid quote
-                bid_quote = Quote(
-                    instrument=self.instrument,
-                    side="buy",
-                    price=bid_price,
-                    amount=bid_size,
-                    timestamp=timestamp
-                )
-                bid_quotes.append(bid_quote)
-            else:
-                self.logger.info("Skipping bid quote: position limit reached")
+            # Get the bid/ask step sizes for additional levels
+            bid_step = ORDERBOOK_CONFIG.get("bid_step", 25) * self.tick_size
+            ask_step = ORDERBOOK_CONFIG.get("ask_step", 25) * self.tick_size
+            
+            # Get the size multipliers for different levels
+            size_multipliers = ORDERBOOK_CONFIG.get("bid_sizes", [1.0, 0.8, 0.6, 0.4, 0.2, 0.1])
+            if len(size_multipliers) < levels:
+                # Pad with decreasing values if not enough multipliers defined
+                size_multipliers.extend([0.1] * (levels - len(size_multipliers)))
                 
-            # Create ask quote if we have position to sell
-            if self.can_decrease_position():
-                # Always create at least one ask quote
-                ask_quote = Quote(
-                    instrument=self.instrument,
-                    side="sell",
-                    price=ask_price,
-                    amount=ask_size,
-                    timestamp=timestamp
-                )
-                ask_quotes.append(ask_quote)
+            # Create bid quotes at multiple levels if we have capacity to buy
+            if self.can_increase_position():
+                for level in range(levels):
+                    # Calculate price for this level (further from mid for higher levels)
+                    level_price = self._calculate_level_price(base_bid_price, level, bid_step, is_bid=True)
+                    
+                    # Calculate size for this level (use multiplier)
+                    level_size = base_bid_size * size_multipliers[level] if level < len(size_multipliers) else base_bid_size * 0.1
+                    
+                    # Ensure minimum size
+                    if level_size < min_size:
+                        level_size = min_size
+                    
+                    # Create quote
+                    bid_quote = Quote(
+                        instrument=self.instrument,
+                        side="buy",
+                        price=level_price,
+                        amount=level_size,
+                        timestamp=timestamp
+                    )
+                    bid_quotes.append(bid_quote)
+                    
+                    self.logger.debug(f"Created level {level} bid: {level_size:.4f} @ {level_price:.2f}")
             else:
-                self.logger.info("Skipping ask quote: no position to sell")
+                self.logger.info("Skipping bid quotes: position limit reached")
+                
+            # Create ask quotes at multiple levels if we have position to sell
+            if self.can_decrease_position():
+                for level in range(levels):
+                    # Calculate price for this level (further from mid for higher levels)
+                    level_price = self._calculate_level_price(base_ask_price, level, ask_step, is_bid=False)
+                    
+                    # Calculate size for this level (use multiplier)
+                    level_size = base_ask_size * size_multipliers[level] if level < len(size_multipliers) else base_ask_size * 0.1
+                    
+                    # Ensure minimum size
+                    if level_size < min_size:
+                        level_size = min_size
+                    
+                    # Create quote
+                    ask_quote = Quote(
+                        instrument=self.instrument,
+                        side="sell",
+                        price=level_price,
+                        amount=level_size,
+                        timestamp=timestamp
+                    )
+                    ask_quotes.append(ask_quote)
+                    
+                    self.logger.debug(f"Created level {level} ask: {level_size:.4f} @ {level_price:.2f}")
+            else:
+                self.logger.info("Skipping ask quotes: no position to sell")
                 
             # Log generated quotes
-            realized_spread = ask_price - bid_price if bid_quotes and ask_quotes else None
+            realized_spread = base_ask_price - base_bid_price if bid_quotes and ask_quotes else None
             spread_display = f"{realized_spread:.2f}" if realized_spread is not None else "N/A"
             self.logger.info(
-                f"Generated quotes: bid={bid_price:.2f} x {bid_size:.4f}, "
-                f"ask={ask_price:.2f} x {ask_size:.4f}, "
+                f"Generated quotes: {len(bid_quotes)} bids and {len(ask_quotes)} asks, "
+                f"base bid={base_bid_price:.2f}, base ask={base_ask_price:.2f}, "
                 f"ref={reference_price:.2f}, spread={spread_display}"
             )
             
@@ -510,6 +603,28 @@ class AvellanedaMarketMaker:
         except Exception as e:
             self.logger.error(f"Error generating quotes: {str(e)}")
             return [], []
+
+    def _calculate_level_price(self, base_price: float, level: int, step: float, is_bid: bool) -> float:
+        """
+        Calculate price for a specific quote level
+        
+        Args:
+            base_price: Base price for level 0
+            level: Level number (0 = closest to mid)
+            step: Step size between levels
+            is_bid: True if calculating for bid, False for ask
+            
+        Returns:
+            float: Price for this level
+        """
+        if level == 0:
+            return base_price
+            
+        # Bids get lower as level increases, asks get higher
+        if is_bid:
+            return self.align_price_to_tick(base_price - (level * step))
+        else:
+            return self.align_price_to_tick(base_price + (level * step))
 
     def should_update_quotes(self, current_quotes: Tuple[List[Quote], List[Quote]], mid_price: float) -> bool:
         """Enhanced quote update decision logic with comprehensive checks"""
@@ -730,3 +845,113 @@ class AvellanedaMarketMaker:
         """Set the instrument name"""
         self.instrument = instrument
         self.logger.info(f"Instrument set to {instrument}") 
+
+    def calculate_dynamic_gamma(self, volatility: float, market_impact: float) -> float:
+        """
+        Calculate optimal gamma value dynamically based on market conditions
+        
+        Args:
+            volatility: Current market volatility
+            market_impact: Current market impact estimate
+            
+        Returns:
+            Optimized gamma value
+        """
+        try:
+            self.logger.info(f"Starting dynamic gamma calculation with: volatility={volatility}, impact={market_impact}")
+            
+            # Base gamma from config
+            base_gamma = TRADING_CONFIG["avellaneda"]["gamma"]
+            
+            # Higher volatility = higher gamma (wider spreads to compensate for risk)
+            # Lower volatility = lower gamma (tighter spreads to capture more flow)
+            volatility_factor = volatility / TRADING_CONFIG["volatility"]["default"]
+            volatility_factor = min(2.0, max(0.5, volatility_factor))
+            
+            # Higher market impact = higher gamma (wider spreads to compensate for market impact)
+            impact_factor = 1.0
+            if market_impact > 0:
+                impact_factor = market_impact / TRADING_CONFIG["avellaneda"]["order_flow_intensity"]
+                impact_factor = min(2.0, max(0.5, impact_factor))
+            
+            # Enhanced position risk management
+            position_factor = 1.0
+            profitability_factor = 1.0
+            
+            if hasattr(self, 'position_limit') and self.position_limit > 0:
+                # Calculate position utilization ratio (how much of our limit we're using)
+                position_utilization = min(1.0, abs(self.position_size) / self.position_limit)
+                
+                # Progressive scaling as position grows (more aggressive scaling)
+                # This creates a non-linear increase in gamma as we approach position limits
+                if position_utilization <= 0.2:  # Small position
+                    position_factor = 1.0
+                elif position_utilization <= 0.5:  # Medium position
+                    position_factor = 1.0 + (position_utilization - 0.2) * 1.5  # Scales from 1.0 to 1.45
+                elif position_utilization <= 0.8:  # Large position
+                    position_factor = 1.45 + (position_utilization - 0.5) * 2.0  # Scales from 1.45 to 2.05
+                else:  # Very large position (near limit)
+                    position_factor = 2.05 + (position_utilization - 0.8) * 3.0  # Scales from 2.05 to 2.95
+                
+                # Additional profitability-based adjustment
+                # If we have a profitable position, we can be more aggressive (lower gamma)
+                # If we have a losing position, we need to be more conservative (higher gamma)
+                if hasattr(self, 'unrealized_pnl') and hasattr(self, 'position_value') and self.position_value > 0:
+                    pnl_percentage = self.unrealized_pnl / self.position_value
+                    
+                    # Adjust gamma based on profitability
+                    if pnl_percentage >= 0.01:  # >= 1% profit
+                        # Profitable position - can be more aggressive (lower gamma)
+                        profitability_factor = max(0.8, 1.0 - pnl_percentage * 5.0)  # Can reduce gamma up to 20%
+                    elif pnl_percentage <= -0.005:  # >= 0.5% loss
+                        # Losing position - be more conservative (higher gamma)
+                        profitability_factor = min(1.5, 1.0 + abs(pnl_percentage) * 10.0)  # Can increase gamma up to 50%
+                    
+                    self.logger.info(f"Position profitability factor: {profitability_factor:.2f} (PnL %: {pnl_percentage:.2%})")
+            
+            # Add time-based risk ramp-up for positions held too long
+            time_factor = 1.0
+            if hasattr(self, 'position_start_time') and self.position_size != 0:
+                position_duration = time.time() - self.position_start_time
+                # If position held more than 30 minutes, start increasing gamma
+                if position_duration > 1800:  # 30 minutes
+                    time_multiplier = min(2.0, 1.0 + (position_duration - 1800) / 7200)  # Increase up to 2x over 2 hours
+                    time_factor = time_multiplier
+                    self.logger.info(f"Position duration factor: {time_factor:.2f} (duration: {position_duration/60:.1f} min)")
+            
+            # Calculate dynamic gamma with all factors
+            dynamic_gamma = base_gamma * volatility_factor * impact_factor * position_factor * profitability_factor * time_factor
+            
+            # Clamp to reasonable range to avoid extreme values
+            min_gamma = 0.1
+            max_gamma = 0.5
+            dynamic_gamma = min(max_gamma, max(min_gamma, dynamic_gamma))
+            
+            self.logger.info(
+                f"Dynamic gamma calculation details:\n"
+                f"  - Base gamma:          {base_gamma:.3f}\n"
+                f"  - Volatility:          {volatility:.5f} (factor: {volatility_factor:.2f})\n"
+                f"  - Market impact:       {market_impact:.5f} (factor: {impact_factor:.2f})\n"
+                f"  - Position:            {self.position_size if hasattr(self, 'position_size') else 0} (factor: {position_factor:.2f})\n"
+                f"  - Profitability:       factor: {profitability_factor:.2f}\n"
+                f"  - Time-based risk:     factor: {time_factor:.2f}\n"
+                f"  - Result (unclamped):  {base_gamma * volatility_factor * impact_factor * position_factor * profitability_factor * time_factor:.3f}\n"
+                f"  - Final gamma:         {dynamic_gamma:.3f} (after min/max clamping)"
+            )
+            
+            return dynamic_gamma
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating dynamic gamma: {str(e)}", exc_info=True)
+            return TRADING_CONFIG["avellaneda"]["gamma"]  # Fallback to config value
+            
+    def update_gamma(self, gamma: float):
+        """
+        Update the gamma value used by the market maker
+        
+        Args:
+            gamma: New gamma value to use
+        """
+        old_gamma = self.gamma
+        self.gamma = gamma
+        self.logger.info(f"Updated gamma: {old_gamma:.3f} -> {self.gamma:.3f}") 

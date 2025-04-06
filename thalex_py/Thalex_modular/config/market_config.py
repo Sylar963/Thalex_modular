@@ -99,7 +99,7 @@ BOT_CONFIG = {
         # Avellaneda-Stoikov model parameters
         "avellaneda": {
             # Core model parameters
-            "gamma": 0.3,                  # Risk aversion (increased from 0.2 for wider spreads)
+            "gamma": 0.2,                  # Risk aversion (reduced from 0.3 for more frequent executions)
             "kappa": 0.5,                  # Inventory risk factor
             "time_horizon": 3600,          # Time horizon in seconds (1 hour)
             "order_flow_intensity": 2.0,   # Order flow intensity parameter
@@ -111,7 +111,7 @@ BOT_CONFIG = {
             "spread_multiplier": 1.0,      # Dynamic spread adjustment factor
             
             # Position and inventory management
-            "inventory_weight": 0.7,       # Inventory skew factor
+            "inventory_weight": 0.8,       # Inventory skew factor (increased from 0.7 for better skewing)
             "inventory_cost_factor": 0.0001, # Cost of holding inventory
             "position_fade_time": 300,     # Time to fade position (seconds)
             "adverse_selection_threshold": 0.002,  # Adverse selection threshold
@@ -120,9 +120,9 @@ BOT_CONFIG = {
             
             # Quote sizing and levels
             "base_size": 0.1,             # Base quote size
-            "size_multipliers": [1.0, 2.0, 3.0, 2.0, 1.0, 1.0],  # Size multipliers for each level
+            "size_multipliers": [1.0, 2.5, 3.5, 2.5, 0.8, 0.5],  # Size multipliers optimized for better fill probability
             "max_levels": 6,              # Maximum number of quote levels
-            "level_spacing": 35,          # Base spacing between levels in ticks
+            "level_spacing": 30,          # Base spacing between levels in ticks (reduced from 35)
         },
         
         # Order execution parameters
@@ -139,7 +139,7 @@ BOT_CONFIG = {
         # Quote management
         "quote_timing": {
             "min_interval": 1.0,           # Minimum time between quotes
-            "max_lifetime": 10,            # Maximum quote lifetime in seconds
+            "max_lifetime": 5,             # Maximum quote lifetime in seconds (reduced from 10 to 5)
             "operation_interval": 0.2,     # Time between order operations
             "max_pending": 5,              # Maximum concurrent operations
         },
@@ -163,7 +163,7 @@ BOT_CONFIG = {
     "risk": {
         "max_position": 1.0,           # Maximum position size
         "stop_loss_pct": 0.06,         # Stop loss percentage
-        "take_profit_pct": 0.0023,     # Take profit percentage (set to 0.23%)
+        "take_profit_pct": 0.0018,     # Take profit percentage (reduced from 0.23% to 0.18% for faster profit capture)
         "max_drawdown": 0.10,          # Maximum drawdown
         "max_consecutive_losses": 5,   # Maximum consecutive losses
         "inventory_target": 0.0,       # Target inventory level
@@ -318,14 +318,14 @@ TRADING_CONFIG = {
     
     # Volatility parameters (simplified)
     "volatility": {
-        "default": 0.03,  # Default volatility (3%, increased from 2%)
-        "floor": 0.02,    # Minimum volatility (2%, increased from 1%)
-        "ceiling": 0.15,  # Maximum volatility (15%, increased from 10%)
-        "cache_duration": 60,  # Cache duration in seconds
-        "window": 100,    # Lookback window for volatility calculation
-        "min_samples": 20, # Minimum samples required
-        "scaling": 1.2,   # Volatility scaling factor (increased from 1.0)
-        "ewm_span": 20    # Exponential weighted moving average span
+        "default": 0.025,  # Default volatility (2.5%, optimized from 3%)
+        "floor": 0.015,    # Minimum volatility (1.5%, reduced from 2%)
+        "ceiling": 0.18,   # Maximum volatility (18%, increased from 15%)
+        "cache_duration": 30,  # Cache duration in seconds (reduced from 60 for faster response)
+        "window": 75,     # Lookback window for volatility calculation (reduced from 100)
+        "min_samples": 5, # Minimum samples required (reduced from 20)
+        "scaling": 1.3,   # Volatility scaling factor (increased from 1.2)
+        "ewm_span": 15    # Exponential weighted moving average span (reduced from 20)
     },
     
     # VAMP parameters
@@ -446,7 +446,7 @@ TRADING_PARAMS = {
     "volatility": {
         "default": TRADING_CONFIG["volatility"]["default"],
         "window": TRADING_CONFIG["volatility"]["window"],
-        "min_samples": TRADING_CONFIG["volatility"]["min_samples"],
+        "min_samples": 5,  # Reduced from original value to start quoting more quickly
         "scaling": TRADING_CONFIG["volatility"]["scaling"], 
         "floor": TRADING_CONFIG["volatility"]["floor"],
         "ceiling": TRADING_CONFIG["volatility"]["ceiling"],
