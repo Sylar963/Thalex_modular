@@ -60,6 +60,7 @@ class AvellanedaQuoter:
         self.request_counter_reset_time = time.time()
         self.rate_limit_window = 60
         self.rate_limit_warning_sent = False
+        self.volatile_market_warning_sent = False  # Flag for tracking volatile market warnings
         
         # For coordination
         self.quote_cv = asyncio.Condition()
@@ -104,6 +105,7 @@ class AvellanedaQuoter:
             self.request_counter = 0
             self.request_counter_reset_time = time.time()
             self.rate_limit_warning_sent = False
+            self.volatile_market_warning_sent = False
             self.cooldown_active = False
             self.cooldown_until = 0
             self.last_ticker_time = 0
@@ -148,7 +150,8 @@ class AvellanedaQuoter:
                 asyncio.create_task(self.listen_task()),
                 asyncio.create_task(self.quote_task()),
                 asyncio.create_task(self.heartbeat_task()),
-                asyncio.create_task(self.performance_monitor.start_recording(self))
+                asyncio.create_task(self.performance_monitor.start_recording(self)),
+                asyncio.create_task(self.gamma_update_task())
             ]
             
             self.logger.info("Tasks created, waiting for completion...")
@@ -217,12 +220,48 @@ class AvellanedaQuoter:
             # Calculate current usage percentage
             usage_percentage = (self.request_counter / rate_limit) * 100 if rate_limit > 0 else 0
             
+            # Get current market conditions to adjust rate limiting
+            market_conditions = {}
+            if hasattr(self, 'market_data') and self.market_data:
+                market_conditions = self.market_data.get_market_state()
+            
+            # Detect high volatility or market impact for adaptive rate limiting
+            high_volatility = False
+            high_market_impact = False
+            
+            if market_conditions:
+                # Check volatility (if available)
+                volatility = market_conditions.get('volatility', 0)
+                if volatility > TRADING_CONFIG["volatility"]["ceiling"] * 0.7:  # 70% of ceiling
+                    high_volatility = True
+                    self.logger.debug(f"High volatility detected: {volatility:.5f}")
+                
+                # Check market impact (if available)
+                market_impact = market_conditions.get('market_impact', 0)
+                if market_impact > TRADING_CONFIG["avellaneda"]["adverse_selection_threshold"]:
+                    high_market_impact = True
+                    self.logger.debug(f"High market impact detected: {market_impact:.5f}")
+            
             # Add minimum time between requests based on priority with longer minimum times
             min_request_interval = 0.5  # Base 500ms minimum between requests (increased from 300ms)
-            if priority == "normal":
-                min_request_interval = 0.8  # 800ms for normal priority (increased from 500ms)
-            elif priority == "low":
-                min_request_interval = 1.5  # 1500ms for low priority (increased from 1000ms)
+            
+            # Adjust minimum intervals based on market conditions
+            if high_volatility or high_market_impact:
+                # In high volatility or high market impact, prioritize critical operations
+                if priority == "critical":
+                    min_request_interval = 0.3  # Allow faster critical operations (300ms)
+                elif priority == "high":
+                    min_request_interval = 0.8  # Slightly slow down high priority (800ms)
+                elif priority == "normal":
+                    min_request_interval = 1.2  # Significantly slow down normal priority (1200ms)
+                else:  # "low"
+                    min_request_interval = 2.0  # Dramatically slow down low priority (2000ms)
+            else:
+                # Normal market conditions
+                if priority == "normal":
+                    min_request_interval = 0.8  # 800ms for normal priority (increased from 500ms)
+                elif priority == "low":
+                    min_request_interval = 1.5  # 1500ms for low priority (increased from 1000ms)
             
             # Check if we're requesting too quickly
             if hasattr(self, 'last_request_time'):
@@ -231,20 +270,36 @@ class AvellanedaQuoter:
                     return False
             
             # Stricter progressive throttling based on usage
-            if usage_percentage >= 70:  # Lowered from 80% to 70%
+            usage_threshold_critical = 70  # Lowered from 80% to 70%
+            usage_threshold_high = 50      # Lowered from 60% to 50%
+            usage_threshold_normal = 30    # Lowered from 40% to 30%
+            
+            # Further restrict in high volatility/market impact conditions
+            if high_volatility or high_market_impact:
+                usage_threshold_critical = 60  # Even lower threshold during volatile markets
+                usage_threshold_high = 40
+                usage_threshold_normal = 20
+                
+                if not self.volatile_market_warning_sent:
+                    self.logger.warning(f"Volatile market detected - applying stricter rate limiting (high_vol={high_volatility}, high_impact={high_market_impact})")
+                    self.volatile_market_warning_sent = True
+            else:
+                self.volatile_market_warning_sent = False
+            
+            if usage_percentage >= usage_threshold_critical:
                 if not self.rate_limit_warning_sent:
                     self.logger.warning(f"Rate limit high: {usage_percentage:.1f}% used")
                     self.rate_limit_warning_sent = True
                 
-                # Only critical operations above 70%
+                # Only critical operations above threshold
                 if priority != "critical":
                     return False
-            elif usage_percentage >= 50:  # Lowered from 60% to 50%
-                # Above 50%, only allow critical and high priority
+            elif usage_percentage >= usage_threshold_high:
+                # Above high threshold, only allow critical and high priority
                 if priority not in ["critical", "high"]:
                     return False
-            elif usage_percentage >= 30:  # Lowered from 40% to 30%
-                # Random throttling for normal operations at 30-50% usage
+            elif usage_percentage >= usage_threshold_normal:
+                # Random throttling for normal operations at normal-high usage
                 if priority == "low" or (priority == "normal" and random.random() < 0.7):  # Increased throttling probability
                     return False
             
@@ -955,26 +1010,58 @@ class AvellanedaQuoter:
             # Validate quotes before sending
             bid_quotes, ask_quotes = self.market_maker.validate_quotes(bid_quotes, ask_quotes)
             
-            # Don't cancel existing quotes too aggressively
-            # Only cancel if necessary (e.g., price moved significantly, quotes expired, etc.)
-            should_cancel = True
+            # Always update quotes if it's been too long since the last update
+            max_update_interval = 60.0  # Force update every 60 seconds 
+            if hasattr(self, 'last_quote_update_time') and current_time - self.last_quote_update_time >= max_update_interval:
+                self.logger.info(f"Forcing quote update - {current_time - self.last_quote_update_time:.1f}s elapsed since last update")
+                # Cancel existing quotes
+                await self.cancel_all_quotes()
+                # Brief pause to allow cancellations to process
+                await asyncio.sleep(0.5)
+                # Place new quotes
+                await self.place_quotes(bid_quotes, ask_quotes)
+                # Update last quote time
+                self.last_quote_time = current_time
+                self.last_quote_update_time = current_time
+                return
             
             # Check if cancellation is really needed
+            should_cancel = True
+            
+            # Only do price comparison check if there are enough quotes on both sides
             bid_prices = [q.price for q in bid_quotes]
             ask_prices = [q.price for q in ask_quotes]
             current_bid_prices = [q.price for q in self.current_quotes[0]]  
             current_ask_prices = [q.price for q in self.current_quotes[1]]
             
-            if current_bid_prices and current_ask_prices:
-                # We already have quotes - check if they're close enough to the new ones
-                price_tolerance = 10.0  # Allow up to $10 difference before cancelling
+            if (len(current_bid_prices) >= 3 and len(current_ask_prices) >= 3 and 
+                len(bid_prices) >= 3 and len(ask_prices) >= 3):
+                # Compare all quotes (not just the first level)
+                # Check first 3 levels which are most important
+                price_tolerance = 1.0  # Reduced from 2.0 to 1.0 - even more sensitive to changes
                 
-                if all(any(abs(new_p - old_p) <= price_tolerance for old_p in current_bid_prices) for new_p in bid_prices[:1]) and \
-                   all(any(abs(new_p - old_p) <= price_tolerance for old_p in current_ask_prices) for new_p in ask_prices[:1]):
-                    # Our current quotes are close enough to the new ones - just skip
-                    self.logger.info("Current quotes are close to desired prices - skipping update")
+                # Count how many levels have significant changes
+                changed_levels = 0
+                
+                # Check the first 3 levels of bids
+                for i in range(min(3, len(bid_prices))):
+                    if i < len(current_bid_prices):
+                        if abs(bid_prices[i] - current_bid_prices[i]) > price_tolerance:
+                            changed_levels += 1
+                
+                # Check the first 3 levels of asks
+                for i in range(min(3, len(ask_prices))):
+                    if i < len(current_ask_prices):
+                        if abs(ask_prices[i] - current_ask_prices[i]) > price_tolerance:
+                            changed_levels += 1
+                
+                # Only skip update if less than 2 levels have significant changes
+                if changed_levels < 2:
+                    self.logger.info(f"Current quotes are close to desired prices (only {changed_levels} levels changed) - skipping update")
                     self.last_quote_update_time = current_time
                     return
+                else:
+                    self.logger.info(f"Updating quotes - {changed_levels} levels have significant price changes")
             
             # Cancel existing quotes if needed
             if should_cancel:
@@ -1022,7 +1109,7 @@ class AvellanedaQuoter:
         self.logger.info("Quote task started - waiting for updates")
         
         last_quote_time = 0
-        min_quote_interval = 3.0  # Increase minimum interval to 3 seconds (up from 1 second)
+        min_quote_interval = 1.0  # Reduced from 3.0 to 1.0 seconds for more frequent updates
         
         while True:
             try:
@@ -1217,6 +1304,104 @@ class AvellanedaQuoter:
             "volatility": volatility,
             "market_impact": market_state.get("market_impact", 0.0)
         }
+
+    async def gamma_update_task(self):
+        """Periodically updates the gamma value based on market conditions"""
+        self.logger.info("Gamma update task started - will update gamma dynamically based on market conditions")
+        
+        # Wait for initial data availability
+        while not self.ticker or len(self.price_history) < TRADING_PARAMS["volatility"]["min_samples"]:
+            self.logger.info("Waiting for market data before starting gamma updates")
+            await asyncio.sleep(10)
+        
+        self.logger.info("Gamma update task is now active - market data sufficient")
+        
+        # Main update loop
+        counter = 0
+        # Default update interval is 60 seconds
+        update_interval = 60
+        # Flags for tracking market conditions
+        high_volatility = False
+        high_market_impact = False
+        
+        while True:
+            try:
+                # Determine the appropriate update interval based on market conditions
+                if high_volatility or high_market_impact:
+                    # More frequent updates during volatile conditions (15 seconds)
+                    update_interval = 15
+                    self.logger.info(f"Gamma update task: using accelerated update interval of {update_interval}s due to market conditions")
+                else:
+                    # Standard update interval during normal conditions (60 seconds)
+                    update_interval = 60
+                
+                # Log that we're about to sleep
+                self.logger.info(f"Gamma update task: waiting for next update cycle ({counter}) - interval: {update_interval}s")
+                
+                # Sleep for the determined interval between updates
+                await asyncio.sleep(update_interval)
+                
+                counter += 1
+                self.logger.info(f"Gamma update task: woke up for update cycle {counter}")
+                
+                # Skip if no ticker data or insufficient price history
+                if not self.ticker or len(self.price_history) < TRADING_PARAMS["volatility"]["min_samples"]:
+                    self.logger.warning("Cannot update gamma - insufficient market data")
+                    continue
+                
+                # Get current market conditions
+                market_state = self.market_data.get_market_state()
+                self.logger.info(f"Gamma update task: retrieved market state: {market_state.keys()}")
+                
+                # Get volatility from market data buffer
+                if "yz_volatility" in market_state and not np.isnan(market_state["yz_volatility"]):
+                    volatility = market_state["yz_volatility"]
+                else:
+                    volatility = market_state["volatility"] if not np.isnan(market_state["volatility"]) else TRADING_CONFIG["avellaneda"]["fixed_volatility"]
+                
+                # Get market impact
+                market_impact = market_state.get("market_impact", 0.0)
+                
+                # Check if we're in high volatility or high market impact conditions
+                high_volatility = volatility > TRADING_CONFIG["volatility"]["ceiling"] * 0.7
+                high_market_impact = market_impact > TRADING_CONFIG["avellaneda"]["adverse_selection_threshold"]
+                
+                # Log market condition assessment
+                if high_volatility or high_market_impact:
+                    self.logger.warning(
+                        f"Gamma update task: Detected volatile market conditions - "
+                        f"volatility: {volatility:.5f} (threshold: {TRADING_CONFIG['volatility']['ceiling'] * 0.7:.5f}), "
+                        f"impact: {market_impact:.5f} (threshold: {TRADING_CONFIG['avellaneda']['adverse_selection_threshold']:.5f})"
+                    )
+                
+                self.logger.info(f"Gamma update task: using volatility={volatility:.5f}, impact={market_impact:.5f}")
+                
+                # Calculate new optimal gamma value
+                new_gamma = self.market_maker.calculate_dynamic_gamma(volatility, market_impact)
+                
+                # Update gamma in market maker
+                old_gamma = self.market_maker.gamma
+                self.market_maker.gamma = new_gamma
+                
+                # Calculate percentage change in gamma
+                gamma_pct_change = ((new_gamma - old_gamma) / old_gamma) * 100 if old_gamma > 0 else 0
+                
+                # Log the gamma update with percentage change
+                self.logger.info(f"Updated gamma: {old_gamma:.3f} -> {new_gamma:.3f} ({gamma_pct_change:+.1f}%) based on volatility={volatility:.5f}, impact={market_impact:.5f}")
+                
+                # Trigger immediate quote update if gamma changed significantly
+                if abs(gamma_pct_change) > 10:  # More than 10% change
+                    self.logger.info("Significant gamma change detected - triggering immediate quote update")
+                    async with self.quote_cv:
+                        self.quote_cv.notify()
+                else:
+                    self.logger.info("Notifying quote task to generate new quotes with updated gamma")
+                    async with self.quote_cv:
+                        self.quote_cv.notify()
+                
+            except Exception as e:
+                self.logger.error(f"Error updating gamma: {str(e)}", exc_info=True)
+                await asyncio.sleep(5)  # Brief pause after errors
 
 async def main():
     """Main entry point"""
