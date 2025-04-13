@@ -104,7 +104,7 @@ class OrderManager:
                         # For market making, only apply full cooldown for critical issues
                         # For normal rate limiting, we prioritize quote levels based on how close they are to market
                         # Level 1 (closest to market) quotes still go through
-                        if price <= 0.0001 or self.is_level_one_quote(price, direction):
+                        if price is None or price <= 0.0001 or self.is_level_one_quote(price, direction):
                             remaining_time = int(quoter.cooldown_until - current_time)
                             self.logger.info(f"Allowing level 1 quote despite cooldown period ({remaining_time}s remaining)")
                         else:
@@ -128,13 +128,25 @@ class OrderManager:
                 self.logger.warning(f"Order amount {amount} is below minimum. Rounding to 0.001")
                 amount = 0.001
             
-            # Validate price is above zero
-            if price <= 0:
+            # Check for market order (price is None)
+            is_market_order = price is None
+            
+            # Validate price is above zero for limit orders
+            if not is_market_order and price <= 0:
                 self.logger.warning(f"Invalid price {price}. Skipping order")
                 return None
             
+            # For market orders, set a placeholder price for tracking
+            if is_market_order:
+                # Use different placeholders for tracking based on direction
+                if direction == "buy":
+                    price = 999999.0  # High price for buy
+                else:
+                    price = 0.01      # Low price for sell
+                post_only = False     # Market orders can't be post-only
+            
             # Align price and amount to tick size
-            aligned_price = self.round_to_tick(price)
+            aligned_price = self.round_to_tick(price) if not is_market_order else price
             aligned_amount = round(amount / 0.001) * 0.001  # Align to 0.001 tick size
             
             # Create order object
@@ -158,22 +170,40 @@ class OrderManager:
             
             # Actually place the order via Thalex API
             try:
-                self.logger.info(
-                    f"Placing order: {direction} {aligned_amount:.3f} @ {aligned_price:.2f} "
-                    f"(ID: {order_id}, post_only: {post_only}, label: {label})"
-                )
-                
-                await self.thalex.insert(
-                    direction=th.Direction.BUY if direction == "buy" else th.Direction.SELL,
-                    instrument_name=instrument,
-                    amount=aligned_amount,
-                    price=aligned_price,
-                    client_order_id=order_id,
-                    id=order_id,
-                    label=label,
-                    post_only=post_only,
-                    collar="clamp"
-                )
+                if is_market_order:
+                    self.logger.info(
+                        f"Placing MARKET order: {direction} {aligned_amount:.3f} @ market "
+                        f"(ID: {order_id}, label: {label})"
+                    )
+                    
+                    await self.thalex.insert(
+                        direction=th.Direction.BUY if direction == "buy" else th.Direction.SELL,
+                        instrument_name=instrument,
+                        amount=aligned_amount,
+                        # Use default market handling
+                        client_order_id=order_id,
+                        id=order_id,
+                        label=label,
+                        post_only=False,  # Can't be post-only
+                        collar="none"     # No price protection for market orders
+                    )
+                else:
+                    self.logger.info(
+                        f"Placing order: {direction} {aligned_amount:.3f} @ {aligned_price:.2f} "
+                        f"(ID: {order_id}, post_only: {post_only}, label: {label})"
+                    )
+                    
+                    await self.thalex.insert(
+                        direction=th.Direction.BUY if direction == "buy" else th.Direction.SELL,
+                        instrument_name=instrument,
+                        amount=aligned_amount,
+                        price=aligned_price,
+                        client_order_id=order_id,
+                        id=order_id,
+                        label=label,
+                        post_only=post_only,
+                        collar="clamp"
+                    )
                 
                 return order_id
             except Exception as api_error:

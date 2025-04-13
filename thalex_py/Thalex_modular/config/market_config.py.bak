@@ -111,7 +111,7 @@ BOT_CONFIG = {
     
     # Hedging configuration
     "hedging": {
-        "enabled": True,  # Whether to enable cross-asset hedging
+        "enabled": False,  # Whether to enable cross-asset hedging
         "strategy": "notional",  # Hedging strategy (notional or delta_neutral)
         "config_path": None,  # Custom config file path (optional)
         

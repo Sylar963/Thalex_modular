@@ -58,6 +58,13 @@ class AvellanedaQuoter:
         # Portfolio data
         self.portfolio = {}
         
+        # Take profit tracking - advanced implementation
+        self.take_profit_levels_executed = set()
+        self.highest_profit_levels = {}
+        self.last_take_profit_check = 0
+        self.take_profit_cooldown = 60  # 60 seconds between take profit checks
+        self.take_profit_orders = {}  # Track take profit orders
+        
         # Rate limiting parameters - now managed by circuit breaker in Thalex client
         self.max_requests_per_minute = BOT_CONFIG["connection"]["rate_limit"]
         self.rate_limit_warning_sent = False
@@ -834,6 +841,10 @@ class AvellanedaQuoter:
             if not ticker or not ticker.mark_price or ticker.mark_price <= 0:
                 self.logger.warning("Cannot update quotes: Invalid ticker data")
                 return
+            
+            # Check and execute take profit if needed - do this before quoting
+            if ticker.mark_price > 0:
+                await self.manage_take_profit(ticker.mark_price)
                 
             # Rate limiting - check time since last update
             current_time = time.time()
@@ -1477,6 +1488,214 @@ class AvellanedaQuoter:
                 
             # Wait before next update
             await asyncio.sleep(60)  # Log every minute
+
+    async def manage_take_profit(self, current_price: float) -> bool:
+        """
+        Advanced take profit management with layered take profits and trailing stops
+        
+        Args:
+            current_price: Current mark price
+            
+        Returns:
+            Boolean indicating if any take profit action was taken
+        """
+        # Only check take profit occasionally to avoid too frequent checks
+        current_time = time.time()
+        if current_time - self.last_take_profit_check < self.take_profit_cooldown:
+            return False
+            
+        self.last_take_profit_check = current_time
+        
+        # Skip if no position
+        if not hasattr(self.risk_manager, 'position_size') or self.risk_manager.position_size == 0:
+            # Reset tracking variables for new positions
+            self.take_profit_levels_executed.clear()
+            self.highest_profit_levels.clear()
+            return False
+            
+        try:
+            # Calculate current P&L percentage
+            current_pnl_pct = self.calculate_position_pnl(current_price)
+            
+            # Skip if not profitable
+            if current_pnl_pct <= 0:
+                return False
+                
+            # Track peak profit for trailing stops
+            if hasattr(self.risk_manager, 'peak_profit'):
+                if current_pnl_pct > self.risk_manager.peak_profit:
+                    self.risk_manager.peak_profit = current_pnl_pct
+            
+            # Check both strategies
+            executed_basic = await self.execute_basic_take_profit(current_price, current_pnl_pct)
+            executed_trailing = await self.execute_trailing_take_profit(current_price, current_pnl_pct)
+            
+            return executed_basic or executed_trailing
+            
+        except Exception as e:
+            self.logger.error(f"Error in advanced take profit management: {str(e)}")
+            return False
+    
+    def calculate_position_pnl(self, current_price: float) -> float:
+        """Calculate current position P&L percentage"""
+        if not hasattr(self.risk_manager, 'position_size') or self.risk_manager.position_size == 0:
+            return 0.0
+            
+        if not hasattr(self.risk_manager, 'entry_price') or self.risk_manager.entry_price <= 0:
+            return 0.0
+            
+        # Calculate P&L percentage
+        if self.risk_manager.position_size > 0:  # Long position
+            return (current_price - self.risk_manager.entry_price) / self.risk_manager.entry_price
+        else:  # Short position
+            return (self.risk_manager.entry_price - current_price) / self.risk_manager.entry_price
+    
+    async def execute_basic_take_profit(self, current_price: float, current_pnl_pct: float) -> bool:
+        """Execute basic take profit strategy based on fixed percentage levels"""
+        try:
+            # Define take profit levels - we'll implement a 4-stage take profit strategy
+            # Each level will close 25% of the position
+            take_profit_levels = [
+                {"level": self.risk_manager.take_profit_pct, "portion": 0.25},
+                {"level": self.risk_manager.take_profit_pct * 1.5, "portion": 0.25},
+                {"level": self.risk_manager.take_profit_pct * 2.0, "portion": 0.25},
+                {"level": self.risk_manager.take_profit_pct * 3.0, "portion": 0.25}
+            ]
+            
+            # Check each level
+            for i, level_data in enumerate(take_profit_levels):
+                level = level_data["level"]
+                portion = level_data["portion"]
+                level_id = f"basic_{i+1}"
+                
+                # Skip if this level was already executed
+                if level_id in self.take_profit_levels_executed:
+                    continue
+                    
+                # Check if P&L exceeds this level
+                if current_pnl_pct >= level:
+                    # Calculate amount to close
+                    amount_to_close = abs(self.risk_manager.position_size * portion)
+                    
+                    # Ensure minimum order size
+                    min_order_size = 0.001
+                    amount_to_close = max(min_order_size, round(amount_to_close, 8))
+                    
+                    # Skip if amount too small
+                    if amount_to_close < min_order_size:
+                        continue
+                        
+                    # Determine direction - sell if long, buy if short
+                    direction = "sell" if self.risk_manager.position_size > 0 else "buy"
+                    
+                    # Log the take profit decision
+                    reason = f"Take profit level {i+1}: {current_pnl_pct:.2%} >= {level:.2%}, closing {portion:.0%}"
+                    self.logger.info(f"EXECUTING TAKE PROFIT: {reason} - {direction} {amount_to_close:.8f} @ market")
+                    
+                    # Execute market order
+                    await self.order_manager.place_order(
+                        instrument=self.perp_name,
+                        direction=direction,
+                        price=None,  # Market order
+                        amount=amount_to_close,
+                        label=f"TakeProfit-L{i+1}",
+                        post_only=False
+                    )
+                    
+                    # Mark level as executed
+                    self.take_profit_levels_executed.add(level_id)
+                    
+                    # Add cooldown
+                    self.last_take_profit_check = time.time() + 120  # 2 minute cooldown
+                    
+                    # Cancel existing quotes to refresh
+                    await self.cancel_quotes("Take profit execution")
+                    
+                    return True
+            
+            return False
+            
+        except Exception as e:
+            self.logger.error(f"Error executing basic take profit: {str(e)}")
+            return False
+    
+    async def execute_trailing_take_profit(self, current_price: float, current_pnl_pct: float) -> bool:
+        """Execute trailing take profit strategy based on peak profit drawdown"""
+        try:
+            # Define trailing stop levels - each with activation threshold and drawdown percentage
+            trailing_levels = [
+                {"activation": self.risk_manager.take_profit_pct * 2.0, "drawdown": 0.3},  # 30% drawdown from peak after 2x TP
+                {"activation": self.risk_manager.take_profit_pct * 3.0, "drawdown": 0.2}   # 20% drawdown from peak after 3x TP
+            ]
+            
+            # Update peak profit for each level
+            for i, level in enumerate(trailing_levels):
+                activation = level["activation"]
+                drawdown = level["drawdown"]
+                level_id = f"trailing_{i+1}"
+                
+                # Skip if already triggered
+                if level_id in self.take_profit_levels_executed:
+                    continue
+                
+                # Check if P&L exceeds activation level
+                if current_pnl_pct >= activation:
+                    # Update peak profit for this level
+                    if level_id not in self.highest_profit_levels:
+                        self.highest_profit_levels[level_id] = current_pnl_pct
+                    elif current_pnl_pct > self.highest_profit_levels[level_id]:
+                        self.highest_profit_levels[level_id] = current_pnl_pct
+                    
+                    # Calculate drawdown from peak
+                    peak_profit = self.highest_profit_levels[level_id]
+                    profit_drawdown = (peak_profit - current_pnl_pct) / peak_profit if peak_profit > 0 else 0
+                    
+                    # Check if drawdown exceeds threshold
+                    if profit_drawdown >= drawdown:
+                        # Calculate amount to close - close entire position for trailing stop
+                        amount_to_close = abs(self.risk_manager.position_size)
+                        
+                        # Ensure minimum order size
+                        min_order_size = 0.001
+                        amount_to_close = max(min_order_size, round(amount_to_close, 8))
+                        
+                        # Skip if amount too small
+                        if amount_to_close < min_order_size:
+                            continue
+                            
+                        # Determine direction - sell if long, buy if short
+                        direction = "sell" if self.risk_manager.position_size > 0 else "buy"
+                        
+                        # Log the trailing take profit decision
+                        reason = f"Trailing stop: {profit_drawdown:.2%} drawdown from peak profit {peak_profit:.2%}"
+                        self.logger.info(f"EXECUTING TRAILING STOP: {reason} - {direction} {amount_to_close:.8f} @ market")
+                        
+                        # Execute market order
+                        await self.order_manager.place_order(
+                            instrument=self.perp_name,
+                            direction=direction,
+                            price=None,  # Market order
+                            amount=amount_to_close,
+                            label="TrailingStop",
+                            post_only=False
+                        )
+                        
+                        # Mark level as executed
+                        self.take_profit_levels_executed.add(level_id)
+                        
+                        # Add cooldown
+                        self.last_take_profit_check = time.time() + 120  # 2 minute cooldown
+                        
+                        # Cancel existing quotes to refresh
+                        await self.cancel_quotes("Trailing stop execution")
+                        
+                        return True
+            
+            return False
+            
+        except Exception as e:
+            self.logger.error(f"Error executing trailing take profit: {str(e)}")
+            return False
 
 async def main():
     """Main entry point"""

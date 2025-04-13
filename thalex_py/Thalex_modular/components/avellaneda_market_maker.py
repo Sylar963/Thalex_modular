@@ -30,6 +30,7 @@ class AvellanedaMarketMaker:
         
         # Position tracking
         self.position_tracker = PositionTracker()
+        self.monetary_position = 0.0  # Monetary value of position (USD)
         
         # Market parameters
         self.volatility = TRADING_CONFIG["volatility"]["default"]
@@ -117,6 +118,22 @@ class AvellanedaMarketMaker:
         self.active_quotes: Dict[str, Quote] = {}
         self.current_bid_quotes: List[Quote] = []
         self.current_ask_quotes: List[Quote] = []
+
+        # Hedge manager integration
+        self.hedge_manager = None
+        self.use_hedging = TRADING_CONFIG.get("hedging", {}).get("enabled", False)
+        if self.use_hedging:
+            from .hedge import create_hedge_manager
+            # Create hedge manager with default settings
+            self.hedge_manager = create_hedge_manager(
+                config_path=TRADING_CONFIG.get("hedging", {}).get("config_path"),
+                strategy_type=TRADING_CONFIG.get("hedging", {}).get("strategy", "notional")
+            )
+            # Start the hedge manager's background thread for rebalancing
+            self.hedge_manager.start()
+            self.logger.info("Hedge manager initialized and started")
+        else:
+            self.logger.info("Hedging is disabled in configuration")
 
     def set_tick_size(self, tick_size: float):
         """Set the tick size for the instrument"""
@@ -500,19 +517,24 @@ class AvellanedaMarketMaker:
 
     def generate_quotes(self, ticker: Ticker, market_conditions: Dict) -> Tuple[List[Quote], List[Quote]]:
         """
-        Generate optimized quotes using the Avellaneda-Stoikov model
+        Generate quotes based on current market conditions and inventory
         
         Args:
-            ticker: Current market ticker data
-            market_conditions: Dictionary of current market conditions (volatility, trend, etc.)
+            ticker: Current ticker data
+            market_conditions: Dictionary containing market conditions
             
         Returns:
             Tuple of (bid_quotes, ask_quotes)
         """
-        bid_quotes = []
-        ask_quotes = []
-        
         try:
+            bid_quotes = []
+            ask_quotes = []
+            
+            # Skip if invalid ticker
+            if not ticker or not hasattr(ticker, 'mark_price') or ticker.mark_price <= 0:
+                self.logger.warning("Cannot generate quotes: Invalid ticker")
+                return [], []
+            
             # 1. Extract price data with fallbacks
             # Determine valid mark price (with safety checks)
             mark_price = getattr(ticker, "mark_price", None)
@@ -606,12 +628,9 @@ class AvellanedaMarketMaker:
             bid_step = ORDERBOOK_CONFIG.get("bid_step", 25) * self.tick_size
             ask_step = ORDERBOOK_CONFIG.get("ask_step", 25) * self.tick_size
             
-            # Get the size multipliers for different levels
-            size_multipliers = ORDERBOOK_CONFIG.get("bid_sizes", [1.0, 0.8, 0.6, 0.4, 0.2, 0.1])
-            if len(size_multipliers) < levels:
-                # Pad with decreasing values if not enough multipliers defined
-                size_multipliers.extend([0.1] * (levels - len(size_multipliers)))
-                
+            # Get the size multipliers for different levels - using Fibonacci-based sizing
+            size_multipliers = self._calculate_fibonacci_size_multipliers(levels)
+            
             # Create bid quotes at multiple levels if we have capacity to buy
             if self.can_increase_position():
                 for level in range(levels):
@@ -683,7 +702,7 @@ class AvellanedaMarketMaker:
 
     def _calculate_level_price(self, base_price: float, level: int, step: float, is_bid: bool) -> float:
         """
-        Calculate price for a specific quote level
+        Calculate price for a specific quote level using Fibonacci grid spacing
         
         Args:
             base_price: Base price for level 0
@@ -697,11 +716,22 @@ class AvellanedaMarketMaker:
         if level == 0:
             return base_price
             
+        # Fibonacci sequence: 1, 1, 2, 3, 5, 8, 13, 21, 34, ...
+        # We'll use a simplified approach with pre-computed Fibonacci multipliers
+        fib_multipliers = [1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89]
+        
+        # Use the appropriate multiplier based on level
+        # For levels beyond our pre-computed list, use the last multiplier
+        fib_multiplier = fib_multipliers[level] if level < len(fib_multipliers) else fib_multipliers[-1]
+        
+        # Adjust step size with Fibonacci multiplier
+        fib_step = step * fib_multiplier
+        
         # Bids get lower as level increases, asks get higher
         if is_bid:
-            return self.align_price_to_tick(base_price - (level * step))
+            return self.align_price_to_tick(base_price - fib_step)
         else:
-            return self.align_price_to_tick(base_price + (level * step))
+            return self.align_price_to_tick(base_price + fib_step)
 
     def should_update_quotes(self, current_quotes: Tuple[List[Quote], List[Quote]], mid_price: float) -> bool:
         """Enhanced quote update decision logic with comprehensive checks"""
@@ -913,6 +943,13 @@ class AvellanedaMarketMaker:
             # NEW: Update volume candle buffer with fill data
             self.volume_buffer.update(fill_price, fill_size, is_buy, int(time.time() * 1000))
             
+            # Update monetary position (which will trigger hedge updates if needed)
+            self.update_monetary_position()
+            
+            # Check if we're using the hedge manager
+            if self.use_hedging and self.hedge_manager is not None:
+                self._process_fill_for_hedging(order_id, fill_price, fill_size, is_buy)
+            
             self.logger.info(
                 f"Order filled: {fill_size} @ {fill_price} ({'BUY' if is_buy else 'SELL'})"
                 f" - New position: {self.position_size:.4f}, Avg entry: {self.entry_price:.2f}"
@@ -920,6 +957,50 @@ class AvellanedaMarketMaker:
             
         except Exception as e:
             self.logger.error(f"Error handling order fill: {str(e)}")
+
+    def _process_fill_for_hedging(self, order_id: str, fill_price: float, fill_size: float, is_buy: bool):
+        """
+        Process a fill through the hedge manager
+        
+        Args:
+            order_id: Order ID
+            fill_price: Fill price
+            fill_size: Fill size
+            is_buy: Whether it was a buy (True) or sell (False)
+        """
+        try:
+            # Create a fill object suitable for the hedge manager
+            class HedgeFill:
+                def __init__(self, instrument, price, size, is_buy, order_id):
+                    self.instrument = instrument
+                    self.price = price
+                    self.size = size
+                    self.is_buy = is_buy
+                    self.fill_id = order_id
+            
+            # Create the fill object
+            instrument = self.instrument or "unknown"
+            fill = HedgeFill(
+                instrument=instrument,
+                price=fill_price,
+                size=fill_size,
+                is_buy=is_buy,
+                order_id=order_id
+            )
+            
+            # Process the fill through hedge manager
+            self.hedge_manager.on_fill(fill)
+            self.logger.info(f"Processed fill for hedging: {instrument} {'BUY' if is_buy else 'SELL'} {fill_size} @ {fill_price}")
+            
+            # Get current position status for logging
+            hedge_position = self.hedge_manager.get_hedged_position(instrument)
+            if hedge_position:
+                self.logger.info(
+                    f"Current hedge: {hedge_position.primary_position} {instrument} hedged with "
+                    f"{hedge_position.hedge_position} {hedge_position.hedge_asset} (ratio: {hedge_position.hedge_ratio:.2f})"
+                )
+        except Exception as e:
+            self.logger.error(f"Error processing fill for hedging: {e}", exc_info=True)
 
     def get_position_metrics(self) -> Dict:
         """Get position and performance metrics"""
@@ -1197,3 +1278,119 @@ class AvellanedaMarketMaker:
                     
         except Exception as e:
             self.logger.error(f"Error updating predictive parameters: {str(e)}") 
+
+    def _calculate_fibonacci_size_multipliers(self, levels: int) -> List[float]:
+        """
+        Calculate size multipliers based on Fibonacci ratios
+        
+        Args:
+            levels: Number of quote levels to generate
+            
+        Returns:
+            List of size multipliers for each level
+        """
+        # Start with default config multipliers
+        default_multipliers = ORDERBOOK_CONFIG.get("bid_sizes", [1.0, 0.8, 0.6, 0.4, 0.2, 0.1])
+        
+        # If we don't need many levels, just return the defaults
+        if levels <= len(default_multipliers):
+            return default_multipliers[:levels]
+            
+        # For Fibonacci-based sizing, we use the inverse of the Fibonacci ratios
+        # This makes orders closer to the mid price larger, and orders further away smaller
+        fib_sequence = [1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89]
+        
+        # Calculate multipliers based on inverse Fibonacci ratios
+        fib_multipliers = []
+        max_fib = max(fib_sequence[:levels]) if levels < len(fib_sequence) else max(fib_sequence)
+        
+        for i in range(levels):
+            # Use actual Fibonacci number if available, otherwise use the last one
+            fib_value = fib_sequence[i] if i < len(fib_sequence) else fib_sequence[-1]
+            # Invert and normalize to get multiplier (higher for lower levels)
+            multiplier = 1.0 - (fib_value / max_fib * 0.9)  # Allow minimum of 0.1
+            fib_multipliers.append(round(multiplier, 2))
+            
+        # Ensure the first level is always 1.0
+        if fib_multipliers:
+            fib_multipliers[0] = 1.0
+            
+        return fib_multipliers 
+
+    def cleanup(self):
+        """Clean up resources when shutting down"""
+        # Stop hedge manager if it's running
+        if self.use_hedging and self.hedge_manager is not None:
+            self.hedge_manager.stop()
+            self.logger.info("Hedge manager stopped")
+        
+        # Add other cleanup tasks as needed 
+
+    def update_monetary_position(self):
+        """Update and log the monetary position value"""
+        if self.last_mid_price > 0:
+            old_monetary = self.monetary_position
+            self.monetary_position = self.position_size * self.last_mid_price
+            
+            # Log the monetary position
+            self.logger.info(f"Monetary position: ${self.monetary_position:.2f} from {self.position_size} {self.instrument} @ {self.last_mid_price}")
+            
+            # Check if monetary position changed significantly
+            if abs(self.monetary_position - old_monetary) > 100:  # $100 change threshold
+                # Update hedge if enabled
+                if self.use_hedging and self.hedge_manager is not None:
+                    self.hedge_manager.update_position(
+                        self.instrument,
+                        self.position_size,
+                        self.last_mid_price
+                    )
+                    # Report hedge status after update
+                    self.report_hedge_status()
+    
+    def report_hedge_status(self):
+        """Report on monetary position and hedge status"""
+        if not self.use_hedging or self.hedge_manager is None:
+            return
+        
+        # Calculate and log monetary position
+        monetary_position = self.position_size * self.last_mid_price
+        
+        # Get hedge position
+        hedge_position = self.hedge_manager.get_hedged_position(self.instrument)
+        if hedge_position:
+            hedge_monetary = hedge_position.hedge_position * hedge_position.hedge_price
+            net_monetary = monetary_position + hedge_monetary
+            
+            self.logger.info(f"=== HEDGE STATUS ===")
+            self.logger.info(f"Primary: {self.position_size} {self.instrument} @ {self.last_mid_price:.2f} = ${monetary_position:.2f}")
+            self.logger.info(f"Hedge: {hedge_position.hedge_position} {hedge_position.hedge_asset} @ {hedge_position.hedge_price:.2f} = ${hedge_monetary:.2f}")
+            self.logger.info(f"Net monetary exposure: ${net_monetary:.2f}")
+            if monetary_position != 0:
+                self.logger.info(f"Hedge ratio: {abs(hedge_monetary/monetary_position):.2f} (target: {hedge_position.hedge_ratio:.2f})")
+            self.logger.info(f"Current P&L: ${hedge_position.pnl:.2f}")
+        else:
+            self.logger.info(f"No active hedge for {self.instrument} position (${monetary_position:.2f})")
+    
+    def force_hedge_rebalance(self):
+        """Force an immediate rebalance of all hedges"""
+        if self.use_hedging and self.hedge_manager is not None:
+            # Get current position information
+            current_position = self.position_size
+            current_price = self.last_mid_price
+            
+            # Update the position to force hedge calculation
+            result = self.hedge_manager.update_position(
+                self.instrument, 
+                current_position,
+                current_price
+            )
+            
+            self.logger.info(f"Forced hedge rebalance for {self.instrument} position: {current_position} @ {current_price}")
+            
+            # Report on hedge operations
+            if result["hedges"]:
+                for hedge in result["hedges"]:
+                    self.logger.info(f"Hedge operation: {hedge['side']} {hedge['size']} {hedge['hedge_asset']} @ {hedge['price']}")
+            
+            # Report hedge status
+            self.report_hedge_status() 
