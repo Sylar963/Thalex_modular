@@ -1,0 +1,3 @@
+symbol,base,price,volatility_pct,budget_allocation,allocation_pct,position_size,min_required_size,profit_to_drawdown
+BTC/USDT,BTC,85298.0,27.74932096912374,270.0,27.0,0.0031653731623250254,5.86180215245375e-05,0.05
+BTC/USDT:USDT,BTC,85249.8,27.818474738171204,630.0,63.0,0.007390046662866071,0.0011730232798200112,0.05

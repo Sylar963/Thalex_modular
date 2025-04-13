@@ -10,6 +10,7 @@ from ..config.market_config import TRADING_CONFIG, RISK_LIMITS, ORDERBOOK_CONFIG
 from ..models.data_models import Ticker, Quote
 from ..models.position_tracker import PositionTracker, Fill
 from ..thalex_logging import LoggerFactory
+from ..ringbuffer.volume_candle_buffer import VolumeBasedCandleBuffer
 
 class AvellanedaMarketMaker:
     """Avellaneda-Stoikov market making strategy implementation"""
@@ -54,6 +55,23 @@ class AvellanedaMarketMaker:
         self.vamp_value = 0.0
         self.vamp_impact = 0.0
         self.vamp_impact_window = deque(maxlen=TRADING_CONFIG["vamp"]["impact_window"])
+        
+        # NEW: Volume candle buffer for predictive analysis
+        self.volume_buffer = VolumeBasedCandleBuffer(
+            volume_threshold=TRADING_CONFIG.get("volume_candle", {}).get("threshold", 1.0),
+            max_candles=TRADING_CONFIG.get("volume_candle", {}).get("max_candles", 100),
+            max_time_seconds=TRADING_CONFIG.get("volume_candle", {}).get("max_time_seconds", 300)
+        )
+        
+        # NEW: Predictive state tracking
+        self.predictive_adjustments = {
+            "gamma_adjustment": 0.0,
+            "kappa_adjustment": 0.0,
+            "reservation_price_offset": 0.0,
+            "trend_direction": 0,
+            "volatility_adjustment": 0.0,
+            "last_update_time": 0
+        }
         
         self.logger.info("Avellaneda market maker initialized")
         
@@ -239,9 +257,31 @@ class AvellanedaMarketMaker:
             # Get volatility with safety fallback, ensure minimum is reasonable
             volatility = max(self.volatility, 0.01)  # At least 1% volatility
             
+            # Apply predictive volatility adjustment
+            prediction_age = time.time() - self.predictive_adjustments.get("last_update_time", 0)
+            
+            # Original volatility for logging
+            original_volatility = volatility
+            
+            if prediction_age < 300:  # Only use predictions less than 5 minutes old
+                volatility_adjustment = self.predictive_adjustments.get("volatility_adjustment", 0)
+                if abs(volatility_adjustment) > 0.05:  # Only apply if significant
+                    volatility *= (1 + volatility_adjustment)
+                    self.logger.debug(f"Adjusted volatility: {original_volatility:.4f} -> {volatility:.4f} (factor: {1 + volatility_adjustment:.2f})")
+            
             # Base Avellaneda-Stoikov spread calculation components
             # 1. Gamma/risk aversion component
-            gamma_component = 1.0 + self.gamma
+            base_gamma = self.gamma
+            
+            # Apply predictive gamma adjustment
+            original_gamma = base_gamma
+            if prediction_age < 300:
+                gamma_adjustment = self.predictive_adjustments.get("gamma_adjustment", 0)
+                if abs(gamma_adjustment) > 0.05:  # Only apply if significant
+                    base_gamma = max(0.1, base_gamma * (1 + gamma_adjustment))
+                    self.logger.debug(f"Adjusted gamma: {original_gamma:.3f} -> {base_gamma:.3f} (factor: {1 + gamma_adjustment:.2f})")
+            
+            gamma_component = 1.0 + base_gamma
             
             # 2. Volatility-based component (more volatile = wider spread)
             volatility_term = volatility * self.volatility_multiplier
@@ -257,6 +297,21 @@ class AvellanedaMarketMaker:
             
             # 5. Market state component (trending/ranging adjustment)
             market_state_factor = 1.0
+            
+            # Use predictive trend direction if available
+            if prediction_age < 300:
+                trend_direction = self.predictive_adjustments.get("trend_direction", 0)
+                if trend_direction != 0:
+                    # Only update market state if different from current
+                    if self.market_state != "trending":
+                        self.market_state = "trending"
+                        self.logger.info(f"Market state changed to trending due to predicted trend direction: {trend_direction}")
+                    market_state_factor = 1.5  # Wider spreads in trending markets
+                elif self.market_state == "trending":
+                    # Only reset if we were previously trending
+                    self.market_state = "normal"
+                    self.logger.info("Market state reset to normal as no trend detected")
+            
             if self.market_state == "trending":
                 # Wider spreads in trending markets to avoid getting run over
                 market_state_factor = 1.5
@@ -301,6 +356,23 @@ class AvellanedaMarketMaker:
             if position_limit > 0:
                 inventory_skew = (self.position_size / position_limit) * spread * inventory_skew_factor
             
+            # Apply predictive reservation price offset (store original for logging)
+            original_mid_price = mid_price
+            prediction_age = time.time() - self.predictive_adjustments.get("last_update_time", 0)
+            reservation_offset = 0.0
+            
+            if prediction_age < 300:  # Only use predictions less than 5 minutes old
+                reservation_offset = self.predictive_adjustments.get("reservation_price_offset", 0.0)
+                
+                # Apply offset to mid price directly if significant
+                if abs(reservation_offset) > 0.00005:
+                    adjusted_mid = mid_price + reservation_offset * mid_price
+                    self.logger.debug(
+                        f"Adjusted reservation price: {original_mid_price:.2f} -> {adjusted_mid:.2f} "
+                        f"(offset: {reservation_offset:.6f}, value: {reservation_offset * mid_price:.2f})"
+                    )
+                    mid_price = adjusted_mid
+            
             # Calculate half spread
             half_spread = spread / 2
             
@@ -322,7 +394,12 @@ class AvellanedaMarketMaker:
                 bid_price = self.round_to_tick(center - half_min)
                 ask_price = self.round_to_tick(center + half_min)
             
-            self.logger.info(f"Skewed prices: bid={bid_price:.2f}, ask={ask_price:.2f}, skew={inventory_skew:.4f}")
+            # Add more detail to skew logging
+            self.logger.info(
+                f"Skewed prices: bid={bid_price:.2f}, ask={ask_price:.2f}, "
+                f"skew={inventory_skew:.4f}, reservation_offset={reservation_offset:.6f}"
+            )
+            
             return bid_price, ask_price
             
         except Exception as e:
@@ -833,6 +910,9 @@ class AvellanedaMarketMaker:
             # Update VAMP calculations
             self.update_vamp(fill_price, fill_size, is_buy, False)
             
+            # NEW: Update volume candle buffer with fill data
+            self.volume_buffer.update(fill_price, fill_size, is_buy, int(time.time() * 1000))
+            
             self.logger.info(
                 f"Order filled: {fill_size} @ {fill_price} ({'BUY' if is_buy else 'SELL'})"
                 f" - New position: {self.position_size:.4f}, Avg entry: {self.entry_price:.2f}"
@@ -843,7 +923,7 @@ class AvellanedaMarketMaker:
 
     def get_position_metrics(self) -> Dict:
         """Get position and performance metrics"""
-        return {
+        metrics = {
             'position': self.position_size,
             'entry_price': self.entry_price,
             'realized_pnl': self.position_tracker.realized_pnl,
@@ -852,6 +932,19 @@ class AvellanedaMarketMaker:
             'vwap': self.vwap,
             'vamp': self.calculate_vamp()
         }
+        
+        # NEW: Add predictive signals to metrics
+        try:
+            if hasattr(self, 'volume_buffer'):
+                metrics['predictive_signals'] = self.volume_buffer.get_signal_metrics()['signals']
+                
+                # Add prediction accuracy if available
+                if hasattr(self, 'last_mid_price') and self.last_mid_price > 0:
+                    metrics['prediction_accuracy'] = self.volume_buffer.evaluate_prediction_accuracy(self.last_mid_price)
+        except Exception as e:
+            self.logger.error(f"Error getting predictive metrics: {str(e)}")
+            
+        return metrics
 
     def align_price_to_tick(self, price: float) -> float:
         """
@@ -990,3 +1083,117 @@ class AvellanedaMarketMaker:
         old_gamma = self.gamma
         self.gamma = gamma
         self.logger.info(f"Updated gamma: {old_gamma:.3f} -> {self.gamma:.3f}") 
+
+    def update_market_data(self, price: float, volume: float = 0, is_buy: Optional[bool] = None, is_trade: bool = False) -> None:
+        """
+        Update market data with new information
+        
+        Args:
+            price: Current price
+            volume: Volume of trade or order
+            is_buy: Whether it's a buy (True) or sell (False)
+            is_trade: Whether this is a trade (True) or other market data (False)
+        """
+        try:
+            # Update last price
+            if price > 0:
+                self.last_mid_price = price
+                
+            # Update VAMP if this is a trade
+            if is_trade and volume > 0 and is_buy is not None:
+                self.update_vamp(price, volume, is_buy, False)
+                
+                # Update volume candles for predictive analysis
+                completed_candle = self.volume_buffer.update(price, volume, is_buy, int(time.time() * 1000))
+                if completed_candle:
+                    # Get updated predictions when a candle completes
+                    self._update_predictive_parameters()
+                    
+                    # Log completion of new candle with its delta ratio
+                    self.logger.debug(
+                        f"Volume candle completed: V={completed_candle.volume:.3f}, "
+                        f"Δ={completed_candle.delta_ratio:.2f}, "
+                        f"P={completed_candle.close_price:.2f}"
+                    )
+            
+            # Update last update time
+            self.last_update_time = time.time()
+            
+        except Exception as e:
+            self.logger.error(f"Error updating market data: {str(e)}")
+
+    def _update_predictive_parameters(self) -> None:
+        """Update predictive parameters based on volume candle analysis"""
+        try:
+            # Get predictions from volume candle buffer
+            predictions = self.volume_buffer.get_predicted_parameters()
+            
+            # Save old values for logging changes
+            old_predictions = self.predictive_adjustments.copy()
+            
+            # Apply sensitivity multipliers from config
+            sensitivity = TRADING_CONFIG.get("volume_candle", {}).get("sensitivity", {})
+            
+            # Apply sensitivity multipliers to each adjustment
+            if sensitivity:
+                if "momentum" in sensitivity and "reservation_price" in sensitivity:
+                    momentum_factor = sensitivity.get("momentum", 1.0)
+                    price_factor = sensitivity.get("reservation_price", 1.0)
+                    predictions["reservation_price_offset"] *= momentum_factor * price_factor
+                
+                if "volatility" in sensitivity:
+                    volatility_factor = sensitivity.get("volatility", 1.0)
+                    predictions["volatility_adjustment"] *= volatility_factor
+                    
+                if "reversal" in sensitivity:
+                    reversal_factor = sensitivity.get("reversal", 1.0)
+                    predictions["gamma_adjustment"] *= reversal_factor
+            
+            # Set minimum thresholds for adjustments to prevent noise
+            if abs(predictions["gamma_adjustment"]) < 0.05:
+                predictions["gamma_adjustment"] = 0.0
+                
+            if abs(predictions["kappa_adjustment"]) < 0.05:
+                predictions["kappa_adjustment"] = 0.0
+                
+            if abs(predictions["reservation_price_offset"]) < 0.00005:
+                predictions["reservation_price_offset"] = 0.0
+                
+            if abs(predictions["volatility_adjustment"]) < 0.05:
+                predictions["volatility_adjustment"] = 0.0
+            
+            # Update predictive adjustments
+            self.predictive_adjustments = predictions
+            self.predictive_adjustments["last_update_time"] = time.time()
+            
+            # Log all significant parameter changes
+            changes = []
+            if old_predictions.get("gamma_adjustment", 0) != predictions["gamma_adjustment"]:
+                changes.append(f"γ_adj: {old_predictions.get('gamma_adjustment', 0):.3f}->{predictions['gamma_adjustment']:.3f}")
+                
+            if old_predictions.get("kappa_adjustment", 0) != predictions["kappa_adjustment"]:
+                changes.append(f"κ_adj: {old_predictions.get('kappa_adjustment', 0):.3f}->{predictions['kappa_adjustment']:.3f}")
+                
+            if old_predictions.get("reservation_price_offset", 0) != predictions["reservation_price_offset"]:
+                changes.append(f"r_offset: {old_predictions.get('reservation_price_offset', 0):.6f}->{predictions['reservation_price_offset']:.6f}")
+                
+            if old_predictions.get("trend_direction", 0) != predictions["trend_direction"]:
+                changes.append(f"trend: {old_predictions.get('trend_direction', 0)}->{predictions['trend_direction']}")
+                
+            if old_predictions.get("volatility_adjustment", 0) != predictions["volatility_adjustment"]:
+                changes.append(f"vol_adj: {old_predictions.get('volatility_adjustment', 0):.3f}->{predictions['volatility_adjustment']:.3f}")
+            
+            # Log changes if any adjustments were made
+            if changes:
+                self.logger.info(f"Applied predictive adjustments: {', '.join(changes)}")
+                
+                # If significant changes were made, log the signals that led to them
+                if len(changes) > 1 or abs(predictions["gamma_adjustment"]) > 0.2 or abs(predictions["reservation_price_offset"]) > 0.0002:
+                    signals = self.volume_buffer.signals
+                    self.logger.info(
+                        f"Signal basis: momentum={signals['momentum']:.2f}, reversal={signals['reversal']:.2f}, "
+                        f"volatility={signals['volatility']:.2f}, exhaustion={signals['exhaustion']:.2f}"
+                    )
+                    
+        except Exception as e:
+            self.logger.error(f"Error updating predictive parameters: {str(e)}") 

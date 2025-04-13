@@ -170,7 +170,8 @@ class AvellanedaQuoter:
                 asyncio.create_task(self.quote_task()),
                 asyncio.create_task(self.heartbeat_task()),
                 asyncio.create_task(self.performance_monitor.start_recording(self)),
-                asyncio.create_task(self.gamma_update_task())
+                asyncio.create_task(self.gamma_update_task()),
+                asyncio.create_task(self.log_status_task())
             ]
             
             self.logger.info("Tasks created, waiting for completion...")
@@ -690,58 +691,68 @@ class AvellanedaQuoter:
             self.quote_cv.notify()
 
     async def handle_trade_update(self, trade_data: Dict):
-        """
-        Process trade updates
-        
-        Args:
-            trade_data: Trade data from the exchange
-        """
+        """Handle a trade update notification"""
         try:
-            # Check if trade_data is a list and handle accordingly
-            if isinstance(trade_data, list):
-                for trade in trade_data:
-                    await self._process_single_trade(trade)
-            else:
-                await self._process_single_trade(trade_data)
+            # Skip trades not related to our instrument
+            if 'symbol' not in trade_data or trade_data['symbol'] != self.perp_name:
+                return
                 
-        except Exception as e:
-            self.logger.error(f"Error handling trade update: {str(e)}", exc_info=True)
+            price = float(trade_data.get('price', 0))
+            volume = float(trade_data.get('amount', 0))
+            side = trade_data.get('side', '').lower()
+            is_buyer_maker = trade_data.get('is_buyer_maker', False)
+            ts = trade_data.get('ts', time.time())
             
-    async def _process_single_trade(self, trade: Dict):
-        """Process a single trade update"""
-        try:
-            # Extract trade details
-            order_id = trade.get("order_id", "")
-            instrument = trade.get("instrument_name", "")
-            direction = trade.get("direction", "")
-            price = float(trade.get("price", 0))
-            amount = float(trade.get("amount", 0))
-            timestamp = trade.get("timestamp", 0)
+            # Determine if buy
+            is_buy = side == 'buy'
             
-            # Log the trade
-            self.logger.info(
-                f"Trade executed: {direction.upper()} {amount:.4f} @ {price:.2f} "
-                f"(Order ID: {order_id})"
+            # Skip invalid trades
+            if price <= 0 or volume <= 0:
+                return
+                
+            # Update market data with trade
+            self.market_data.update(
+                price=price,
+                volume=volume,
+                timestamp=ts,
+                is_buy=is_buy
             )
             
-            # Update market maker with fill information
-            if self.market_maker:
-                is_buy = direction.lower() == "buy"
-                self.market_maker.on_order_filled(
-                    order_id=order_id,
-                    fill_price=price,
-                    fill_size=amount,
-                    is_buy=is_buy
+            # NEW: Update market maker's volume candle buffer
+            self.market_maker.update_market_data(
+                price=price,
+                volume=volume,
+                is_buy=is_buy,
+                is_trade=True
+            )
+            
+            # Update market_impact - this is expensive, so do it less frequently
+            if random.random() < 0.25:  # ~25% of trades
+                market_impact = self.market_data.get_market_impact() 
+                self.market_maker.market_impact = market_impact
+            
+            # Log significant trades (approximately 5% of trades or large sizes)
+            significant_trade = (
+                volume > 0.1 or  # Large trade
+                random.random() < 0.05  # ~5% sample
+            )
+            
+            if significant_trade:
+                # NEW: Get predictive signals if available
+                pred_signals = ""
+                if hasattr(self.market_maker, 'volume_buffer'):
+                    signals = self.market_maker.volume_buffer.get_signal_metrics().get('signals', {})
+                    if signals:
+                        pred_signals = f" | Pred[M:{signals.get('momentum', 0):.2f} R:{signals.get('reversal', 0):.2f}]"
+                
+                # Log trade with optional signal info
+                self.logger.info(
+                    f"Trade: {volume:.4f} @ {price:.2f} ({'BUY' if is_buy else 'SELL'}) "
+                    f"[{'Aggressive' if not is_buyer_maker else 'Passive'}]{pred_signals}"
                 )
-                
-            # Force a quote update after significant fills
-            # This ensures we react quickly to executed trades
-            if self.ticker and amount >= 0.01:  # Only for fills >= 0.01 BTC
-                self.logger.info(f"Scheduling quote update after trade of {amount:.4f}")
-                asyncio.create_task(self.update_quotes(None, self.get_market_conditions()))
-                
+            
         except Exception as e:
-            self.logger.error(f"Error processing trade: {str(e)}", exc_info=True)
+            self.logger.error(f"Error handling trade update: {str(e)}")
 
     async def handle_result(self, result: Dict, cid: Optional[int]):
         """Handle API call results"""
@@ -1347,102 +1358,125 @@ class AvellanedaQuoter:
         }
 
     async def gamma_update_task(self):
-        """Periodically updates the gamma value based on market conditions"""
-        self.logger.info("Gamma update task started - will update gamma dynamically based on market conditions")
-        
-        # Wait for initial data availability
-        while not self.ticker or len(self.price_history) < TRADING_PARAMS["volatility"]["min_samples"]:
-            self.logger.info("Waiting for market data before starting gamma updates")
-            await asyncio.sleep(10)
-        
-        self.logger.info("Gamma update task is now active - market data sufficient")
-        
-        # Main update loop
-        counter = 0
-        # Default update interval is 60 seconds
-        update_interval = 60
-        # Flags for tracking market conditions
-        high_volatility = False
-        high_market_impact = False
+        """Periodically update gamma based on market conditions"""
+        await self.setup_complete.wait()  # Wait for setup to complete
         
         while True:
             try:
-                # Determine the appropriate update interval based on market conditions
-                if high_volatility or high_market_impact:
-                    # More frequent updates during volatile conditions (15 seconds)
-                    update_interval = 15
-                    self.logger.info(f"Gamma update task: using accelerated update interval of {update_interval}s due to market conditions")
-                else:
-                    # Standard update interval during normal conditions (60 seconds)
-                    update_interval = 60
-                
-                # Log that we're about to sleep
-                self.logger.info(f"Gamma update task: waiting for next update cycle ({counter}) - interval: {update_interval}s")
-                
-                # Sleep for the determined interval between updates
-                await asyncio.sleep(update_interval)
-                
-                counter += 1
-                self.logger.info(f"Gamma update task: woke up for update cycle {counter}")
-                
-                # Skip if no ticker data or insufficient price history
-                if not self.ticker or len(self.price_history) < TRADING_PARAMS["volatility"]["min_samples"]:
-                    self.logger.warning("Cannot update gamma - insufficient market data")
-                    continue
-                
                 # Get current market conditions
-                market_state = self.market_data.get_market_state()
-                self.logger.info(f"Gamma update task: retrieved market state: {market_state.keys()}")
+                market_impact = self.market_data.get_market_impact()
                 
                 # Get volatility from market data buffer
-                if "yz_volatility" in market_state and not np.isnan(market_state["yz_volatility"]):
-                    volatility = market_state["yz_volatility"]
-                else:
-                    volatility = market_state["volatility"] if not np.isnan(market_state["volatility"]) else TRADING_CONFIG["avellaneda"]["fixed_volatility"]
+                if len(self.market_data.volatility) > 0:
+                    volatility = self.market_data.volatility[-1]
+                    if not np.isnan(volatility) and volatility > 0:
+                        # New: Get volatility adjustment from volume candle predictions
+                        vol_adj = 0.0
+                        if hasattr(self.market_maker, 'predictive_adjustments'):
+                            vol_adj = self.market_maker.predictive_adjustments.get('volatility_adjustment', 0.0)
+                            prediction_age = time.time() - self.market_maker.predictive_adjustments.get('last_update_time', 0)
+                            if prediction_age > 300:  # Predictions older than 5 minutes
+                                vol_adj = 0.0
+                                
+                        # Apply volatility adjustment
+                        adjusted_volatility = volatility * (1 + vol_adj)
+                        
+                        # Update market maker volatility
+                        self.market_maker.volatility = adjusted_volatility
+                        
+                        # Log volatility update with prediction info
+                        if abs(vol_adj) > 0.05:
+                            self.logger.info(
+                                f"Volatility updated: {volatility:.4f} -> {adjusted_volatility:.4f} "
+                                f"(adj: {vol_adj:+.2f})"
+                            )
                 
-                # Get market impact
-                market_impact = market_state.get("market_impact", 0.0)
+                # Calculate dynamic gamma
+                new_gamma = self.market_maker.calculate_dynamic_gamma(
+                    self.market_maker.volatility, 
+                    market_impact
+                )
                 
-                # Check if we're in high volatility or high market impact conditions
-                high_volatility = volatility > TRADING_CONFIG["volatility"]["ceiling"] * 0.7
-                high_market_impact = market_impact > TRADING_CONFIG["avellaneda"]["adverse_selection_threshold"]
+                # NEW: Apply gamma adjustment from volume candle predictions
+                gamma_adj = 0.0
+                if hasattr(self.market_maker, 'predictive_adjustments'):
+                    gamma_adj = self.market_maker.predictive_adjustments.get('gamma_adjustment', 0.0)
+                    prediction_age = time.time() - self.market_maker.predictive_adjustments.get('last_update_time', 0)
+                    if prediction_age <= 300 and abs(gamma_adj) > 0.1:  # Recent significant adjustment
+                        new_gamma *= (1 + gamma_adj)
+                        self.logger.info(f"Applying predictive gamma adjustment: {gamma_adj:+.3f}")
                 
-                # Log market condition assessment
-                if high_volatility or high_market_impact:
-                    self.logger.warning(
-                        f"Gamma update task: Detected volatile market conditions - "
-                        f"volatility: {volatility:.5f} (threshold: {TRADING_CONFIG['volatility']['ceiling'] * 0.7:.5f}), "
-                        f"impact: {market_impact:.5f} (threshold: {TRADING_CONFIG['avellaneda']['adverse_selection_threshold']:.5f})"
+                # Update the gamma parameter
+                self.market_maker.update_gamma(new_gamma)
+                
+                # Gather and log prediction accuracy metrics periodically 
+                if random.random() < 0.2 and hasattr(self.market_maker, 'volume_buffer'):
+                    accuracy = self.market_maker.volume_buffer.evaluate_prediction_accuracy(
+                        self.ticker.mark_price if self.ticker else 0
                     )
-                
-                self.logger.info(f"Gamma update task: using volatility={volatility:.5f}, impact={market_impact:.5f}")
-                
-                # Calculate new optimal gamma value
-                new_gamma = self.market_maker.calculate_dynamic_gamma(volatility, market_impact)
-                
-                # Update gamma in market maker
-                old_gamma = self.market_maker.gamma
-                self.market_maker.gamma = new_gamma
-                
-                # Calculate percentage change in gamma
-                gamma_pct_change = ((new_gamma - old_gamma) / old_gamma) * 100 if old_gamma > 0 else 0
-                
-                # Log the gamma update with percentage change
-                self.logger.info(f"Updated gamma: {old_gamma:.3f} -> {new_gamma:.3f} ({gamma_pct_change:+.1f}%) based on volatility={volatility:.5f}, impact={market_impact:.5f}")
-                
-                # Trigger immediate quote update if gamma changed significantly
-                if abs(gamma_pct_change) > 10:  # More than 10% change
-                    self.logger.info("Significant gamma change detected - triggering immediate quote update")
-                    async with self.quote_cv:
-                        self.quote_cv.notify()
-                else:
-                    self.logger.info("Notifying quote task to generate new quotes with updated gamma")
-                    async with self.quote_cv:
-                        self.quote_cv.notify()
+                    if accuracy > 0:
+                        self.logger.info(f"Prediction accuracy: {accuracy:.2f}")
                 
             except Exception as e:
-                self.logger.error(f"Error updating gamma: {str(e)}", exc_info=True)
-                await asyncio.sleep(5)  # Brief pause after errors
+                self.logger.error(f"Error in gamma update task: {str(e)}")
+                
+            # Wait before next update
+            await asyncio.sleep(30)  # Update every 30 seconds
+
+    async def log_status_task(self):
+        """Periodically log bot status"""
+        await self.setup_complete.wait()
+        
+        while True:
+            try:
+                # Get market maker metrics
+                metrics = self.market_maker.get_position_metrics()
+                position = metrics.get('position', 0)
+                realized = metrics.get('realized_pnl', 0)
+                unrealized = metrics.get('unrealized_pnl', 0)
+                entry = metrics.get('entry_price', 0)
+                
+                # Get current mark price
+                mark_price = self.ticker.mark_price if self.ticker else 0
+                
+                # Calculate basic PnL
+                if position != 0 and mark_price > 0 and entry > 0:
+                    unrealized = position * (mark_price - entry)
+                total_pnl = realized + unrealized
+                
+                # Get VAMP value
+                vamp = metrics.get('vamp', 0)
+                
+                # NEW: Get volume candle prediction signals if available
+                pred_info = ""
+                if 'predictive_signals' in metrics:
+                    signals = metrics['predictive_signals']
+                    momentum = signals.get('momentum', 0)
+                    reversal = signals.get('reversal', 0)
+                    exhaustion = signals.get('exhaustion', 0)
+                    
+                    # Format predictive signals info
+                    pred_info = f" | Signals[M:{momentum:.2f} R:{reversal:.2f} E:{exhaustion:.2f}]"
+                    
+                    # Add prediction accuracy if available
+                    if 'prediction_accuracy' in metrics and metrics['prediction_accuracy'] > 0:
+                        pred_info += f" Acc:{metrics['prediction_accuracy']:.2f}"
+                
+                # Log complete status with predictions
+                self.logger.info(
+                    f"Status: Pos={position:.4f} @ {entry:.2f} | "
+                    f"Mark={mark_price:.2f} | PnL=[R:{realized:.2f} U:{unrealized:.2f} T:{total_pnl:.2f}] | "
+                    f"VAMP={vamp:.4f}{pred_info}"
+                )
+                
+                # Monitor rate limit usage
+                self.rate_limit_warning_sent = False
+                
+            except Exception as e:
+                self.logger.error(f"Error in status task: {str(e)}")
+                
+            # Wait before next update
+            await asyncio.sleep(60)  # Log every minute
 
 async def main():
     """Main entry point"""

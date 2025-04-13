@@ -1,0 +1,14 @@
+Cryptocurrency Scanner Report
+Generated on: 2025-04-12 20:00:18
+
+Total budget: $1000.00
+Total assets analyzed: 14
+Viable assets: 12
+
+Recommended allocations:
+- BTC/USDT: $86.70 (0.001016 BTC)
+- BTC/USDT:USDT: $107.10 (0.001256 BTC)
+- ETH/USDT: $45.90 (0.028237 ETH)
+- ETH/USDT:USDT: $45.90 (0.028249 ETH)
+- ETH/USDT:USDT-250627: $45.90 (0.028034 ETH)
+- ETH/USDT:USDT-250926: $30.60 (0.018401 ETH)

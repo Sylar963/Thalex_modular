@@ -61,11 +61,63 @@ new_gamma = self.market_maker.calculate_dynamic_gamma(volatility, market_impact)
 self.market_maker.gamma = new_gamma
 ```
 
+### Predictive Volume Candle System (DEVELOPERS ONLY)
+The system includes a volume-based predictive component to enhance the Avellaneda-Stoikov model:
+
+```python
+# Volume-based candle completion triggers predictive signals
+def _calculate_signals(self):
+    # Generate momentum, reversal, volatility, and exhaustion signals
+    self.signals["momentum"] = price_momentum * delta_momentum_factor
+    # These signals drive parameter adjustments
+```
+
+#### Implementation Details
+- **Volume Candle Buffer**: Creates candles based on accumulated volume rather than time
+- **Delta Ratio Analysis**: Tracks buy/sell volume imbalance to detect market pressure
+- **Predictive Signals**: Generates four key signals:
+  - Momentum (direction and strength, -1 to 1)
+  - Reversal probability (0 to 1)
+  - Volatility prediction (0 to 1)
+  - Exhaustion detection (0 to 1)
+- **Parameter Adaptation**: Dynamically adjusts Avellaneda parameters:
+  - γ (gamma) adjustment based on predicted volatility
+  - Reservation price offsets based on momentum signals
+  - κ (kappa) adjustment for market depth
+  
+#### Configuration
+Volume candle system is configured in `TRADING_CONFIG["volume_candle"]`:
+```python
+"volume_candle": {
+    "threshold": 0.1,               # Volume required to complete a candle (BTC)
+    "max_candles": 200,             # Maximum candles to store
+    "max_time_seconds": 180,        # Max time before forcing completion
+    "enable_predictions": True,     # Enable predictive features
+    "sensitivity": {                # Signal sensitivity parameters
+        "momentum": 1.5,            # Momentum signal multiplier
+        "reversal": 1.2,            # Reversal signal sensitivity
+        "volatility": 1.3,          # Volatility prediction sensitivity
+        "reservation_price": 1.5    # Reservation price adjustment factor
+    }
+}
+```
+
+#### Logging and Monitoring
+- Volume candle completions and predictions are logged to `volume_candles.log`
+- Parameter adjustments are logged to `market_maker.log`
+- Debug logging is enabled for both components by default
+
+#### Integration Points
+- `AvellanedaMarketMaker._update_predictive_parameters()`: Applies prediction adjustments
+- Volume candle buffer is updated on each trade via `update_vamp()` method
+- Predictions are generated after accumulating 5+ candles
+
 ### Extending the System
 You can customize the system in several ways:
 1. **Alternative Quote Strategies**: Implement different pricing models by modifying `AvellanedaMarketMaker`
 2. **Enhanced Risk Controls**: Add features to `RiskManager` like portfolio VaR
 3. **Custom Analytics**: Extend `MarketDataBuffer` with additional metrics
+4. **Predictive Signals**: Enhance `VolumeBasedCandleBuffer` with custom signals
 
 ### Optimizing for Production
 For live trading environments:
@@ -73,6 +125,7 @@ For live trading environments:
 - Adjust log levels for production in `LoggerFactory`
 - Fine-tune rate limiting parameters in `BOT_CONFIG`
 - Consider deploying on low-latency infrastructure close to Thalex servers
+- Monitor `volume_candles.log` for prediction efficacy
 
 ## ⚠️ Risk Warning
 
