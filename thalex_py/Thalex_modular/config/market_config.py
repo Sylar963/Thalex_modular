@@ -239,26 +239,58 @@ BOT_CONFIG = {
         "subscribe_index": 1020,
         "subscribe_orders": 1021,
         "subscribe_portfolio": 1022,
-        "subscribe_trades": 1023
+        "subscribe_trades": 1023,
+        "mass_quote": 1024
     }
 }
 
 # =============================================================================
-# CONSOLIDATED CONFIGURATIONS
+# ESSENTIAL CONFIGS - DIRECT REFERENCES TO PRIMARY CONFIG
 # =============================================================================
-"""
-These configs provide a more logical organization of parameters while
-maintaining references to BOT_CONFIG as the single source of truth.
-New code should prefer these over the legacy configs.
-"""
 
-# Simple pass-through configs (direct references to BOT_CONFIG sections)
+# Essential commonly-used configs
 MARKET_CONFIG = BOT_CONFIG["market"]
 CALL_IDS = BOT_CONFIG["call_ids"]
 
-# Consolidated trading configuration (combines order parameters, quoting, and Avellaneda model)
+# Risk limits - accessed directly by multiple components
+RISK_LIMITS = {
+    "max_position": BOT_CONFIG["risk"]["max_position"],
+    "max_notional": BOT_CONFIG["risk"]["max_notional"],
+    "max_position_notional": BOT_CONFIG["risk"]["max_position_notional"],
+    "stop_loss_pct": BOT_CONFIG["risk"]["stop_loss_pct"],
+    "take_profit_pct": BOT_CONFIG["risk"]["take_profit_pct"],
+    "max_drawdown": BOT_CONFIG["risk"]["max_drawdown"],
+    "max_consecutive_losses": BOT_CONFIG["risk"]["max_consecutive_losses"],
+    "volatility_threshold": 0.05  # 5% volatility threshold
+}
+
+# Trading parameters referenced by position management and risk modules
+TRADING_PARAMS = {
+    "position_management": {
+        "gamma": BOT_CONFIG["trading_strategy"]["avellaneda"]["gamma"],
+        "inventory_weight": BOT_CONFIG["trading_strategy"]["avellaneda"]["inventory_weight"],
+        "position_fade_time": BOT_CONFIG["trading_strategy"]["avellaneda"]["position_fade_time"],
+        "order_flow_intensity": BOT_CONFIG["trading_strategy"]["avellaneda"]["order_flow_intensity"],
+        "inventory_cost_factor": BOT_CONFIG["trading_strategy"]["avellaneda"]["inventory_cost_factor"],
+        "max_inventory_imbalance": BOT_CONFIG["risk"]["inventory_imbalance_limit"],
+        "adverse_selection_threshold": BOT_CONFIG["trading_strategy"]["avellaneda"]["adverse_selection_threshold"],
+        "kappa": BOT_CONFIG["trading_strategy"]["avellaneda"]["kappa"],
+    },
+    "volatility": {
+        "default": 0.025,    # Default volatility (2.5%)
+        "window": 75,        # Lookback window for volatility calculation
+        "min_samples": 5,    # Minimum samples required
+        "scaling": 1.3,      # Volatility scaling factor
+        "floor": 0.015,      # Minimum volatility (1.5%)
+        "ceiling": 0.18,     # Maximum volatility (18%)
+        "ewm_span": 15,      # Exponential weighted moving average span
+        "cache_duration": 30 # Cache duration in seconds
+    },
+    "position_limit": BOT_CONFIG["risk"]["max_position"],  # Moved to top level
+}
+
+# Trading configuration - contains core Avellaneda parameters
 TRADING_CONFIG = {
-    # Core order parameters
     "order": {
         "spread": BOT_CONFIG["trading_strategy"]["avellaneda"]["base_spread"],
         "min_spread": BOT_CONFIG["trading_strategy"]["avellaneda"]["min_spread"],
@@ -271,8 +303,6 @@ TRADING_CONFIG = {
         "amend_threshold": BOT_CONFIG["trading_strategy"]["avellaneda"]["max_loss_threshold"],
         "post_only": BOT_CONFIG["trading_strategy"]["execution"]["post_only"]
     },
-    
-    # Quote management
     "quoting": {
         "min_quote_interval": BOT_CONFIG["trading_strategy"]["quote_timing"]["min_interval"],
         "quote_lifetime": BOT_CONFIG["trading_strategy"]["quote_timing"]["max_lifetime"],
@@ -292,43 +322,25 @@ TRADING_CONFIG = {
         "aggressive_cancel": BOT_CONFIG["trading_strategy"]["market_impact"]["aggressive_cancel"],
         "levels": BOT_CONFIG["trading_strategy"]["avellaneda"]["max_levels"],
     },
-    
-    # Avellaneda model parameters
     "avellaneda": {
         "gamma": BOT_CONFIG["trading_strategy"]["avellaneda"]["gamma"],
-        "inventory_weight": BOT_CONFIG["trading_strategy"]["avellaneda"]["inventory_weight"], 
-        "inventory_skew_factor": BOT_CONFIG["trading_strategy"]["avellaneda"]["inventory_weight"] / 2,
-        "position_fade_time": BOT_CONFIG["trading_strategy"]["avellaneda"]["position_fade_time"],
-        "order_flow_intensity": BOT_CONFIG["trading_strategy"]["avellaneda"]["order_flow_intensity"],
-        "inventory_cost_factor": BOT_CONFIG["trading_strategy"]["avellaneda"]["inventory_cost_factor"],
-        "adverse_selection_threshold": BOT_CONFIG["trading_strategy"]["avellaneda"]["adverse_selection_threshold"],
-        "min_profit_rebalance": BOT_CONFIG["trading_strategy"]["avellaneda"]["min_profit_rebalance"],
-        "gradual_exit_steps": BOT_CONFIG["trading_strategy"]["avellaneda"]["max_loss_threshold"],
-        "max_loss_threshold": BOT_CONFIG["trading_strategy"]["avellaneda"]["max_loss_threshold"],
-        "position_limit": BOT_CONFIG["risk"]["max_position"],  # Add position limit from risk config
         "kappa": BOT_CONFIG["trading_strategy"]["avellaneda"]["kappa"],
         "time_horizon": BOT_CONFIG["trading_strategy"]["avellaneda"]["time_horizon"],
-        # Adding a fixed volatility value to replace dynamic calculation
-        "fixed_volatility": 0.03,  # Fixed volatility value of 3% (increased for wider spreads)
-        # Additional Avellaneda-specific parameters (used for dynamic spread calculation)
-        "k": 2.0,               # Order flow intensity (increased from 1.5)
-        "window_size": 100,     # Window for volatility estimation
-        # Remove the fixed spread parameters to let Avellaneda model calculate them dynamically
+        "min_spread": BOT_CONFIG["trading_strategy"]["avellaneda"]["min_spread"],
+        "max_spread": BOT_CONFIG["trading_strategy"]["avellaneda"]["max_spread"],
+        "inventory_weight": BOT_CONFIG["trading_strategy"]["avellaneda"]["inventory_weight"],
+        "inventory_skew_factor": BOT_CONFIG["trading_strategy"]["avellaneda"]["inventory_weight"], 
+        "inventory_cost_factor": BOT_CONFIG["trading_strategy"]["avellaneda"]["inventory_cost_factor"],
+        "max_loss_threshold": BOT_CONFIG["trading_strategy"]["avellaneda"]["max_loss_threshold"],
+        "min_profit_rebalance": BOT_CONFIG["trading_strategy"]["avellaneda"]["min_profit_rebalance"],
+        "fixed_volatility": 0.01,
+        "volatility_threshold": 0.02,  
+        "position_fade_time": BOT_CONFIG["trading_strategy"]["avellaneda"]["position_fade_time"],
+        "order_flow_intensity": BOT_CONFIG["trading_strategy"]["avellaneda"]["order_flow_intensity"],
+        "adverse_selection_threshold": BOT_CONFIG["trading_strategy"]["avellaneda"]["adverse_selection_threshold"],
+        "position_limit": BOT_CONFIG["risk"]["max_position"]
     },
-    
-    # Volatility parameters (simplified)
-    "volatility": {
-        "default": 0.025,  # Default volatility (2.5%, optimized from 3%)
-        "floor": 0.015,    # Minimum volatility (1.5%, reduced from 2%)
-        "ceiling": 0.18,   # Maximum volatility (18%, increased from 15%)
-        "cache_duration": 30,  # Cache duration in seconds (reduced from 60 for faster response)
-        "window": 75,     # Lookback window for volatility calculation (reduced from 100)
-        "min_samples": 5, # Minimum samples required (reduced from 20)
-        "scaling": 1.3,   # Volatility scaling factor (increased from 1.2)
-        "ewm_span": 15    # Exponential weighted moving average span (reduced from 20)
-    },
-    
-    # VAMP parameters
+    "volatility": TRADING_PARAMS["volatility"],
     "vamp": {
         "window": BOT_CONFIG["trading_strategy"]["vamp"]["price_window"],
         "aggressive_window": BOT_CONFIG["trading_strategy"]["vamp"]["aggressive_window"],
@@ -336,33 +348,10 @@ TRADING_CONFIG = {
     },
 }
 
-# Consolidated risk configuration (combines risk limits and inventory management)
+# Add RISK_CONFIG back for backward compatibility
 RISK_CONFIG = {
     # Position limits
-    "limits": {
-        "max_position": BOT_CONFIG["risk"]["max_position"],
-        "max_notional": BOT_CONFIG["risk"]["max_notional"],  # Now coming from BOT_CONFIG
-        "max_position_notional": BOT_CONFIG["risk"]["max_position_notional"],  # Now coming from BOT_CONFIG
-        "stop_loss_pct": BOT_CONFIG["risk"]["stop_loss_pct"],
-        "take_profit_pct": BOT_CONFIG["risk"]["take_profit_pct"],
-        "max_drawdown": BOT_CONFIG["risk"]["max_drawdown"],
-        "max_consecutive_losses": BOT_CONFIG["risk"]["max_consecutive_losses"],
-        # Take profit parameters
-        "base_take_profit_pct": BOT_CONFIG["risk"]["base_take_profit_pct"],
-        "max_take_profit_pct": BOT_CONFIG["risk"]["max_take_profit_pct"],
-        "min_take_profit_pct": BOT_CONFIG["risk"]["min_take_profit_pct"],
-        # Other default values
-        "vol_scaling_factor": 1.0,  # Default volatility scaling factor
-        "baseline_volatility": 0.02,  # Default baseline volatility of 2%
-        "min_position_limit_factor": 0.5,  # Default minimum position limit factor
-        "hard_vol_limit_factor": 2.0,  # Default hard volatility limit factor
-        "max_position_duration": 24 * 60 * 60,  # Default 24 hours (in seconds)
-        "max_profit_position_duration": 12 * 60 * 60,  # Default 12 hours (in seconds)
-        "position_rebalance_threshold": BOT_CONFIG["risk"].get("position_rebalance_threshold", 0.8),
-        "market_impact_threshold": BOT_CONFIG["risk"].get("market_impact_threshold", 0.0025),
-        "rebalance_cooldown": BOT_CONFIG["risk"].get("rebalance_cooldown", 300),
-        "max_quote_size": BOT_CONFIG["trading_strategy"]["execution"]["max_size"]
-    },
+    "limits": RISK_LIMITS,
     
     # Inventory management
     "inventory": {
@@ -374,7 +363,20 @@ RISK_CONFIG = {
     }
 }
 
-# Consolidated performance monitoring configuration
+# Add INVENTORY_CONFIG for backward compatibility
+INVENTORY_CONFIG = {
+    "max_inventory_imbalance": RISK_CONFIG["inventory"]["max_imbalance"],
+    "target_inventory": RISK_CONFIG["inventory"]["target"],
+    "inventory_fade_time": RISK_CONFIG["inventory"]["fade_time"],
+    "adverse_selection_threshold": RISK_CONFIG["inventory"]["adverse_selection_threshold"],
+    "inventory_skew_factor": TRADING_CONFIG["avellaneda"]["inventory_skew_factor"],
+    "max_position_notional": RISK_LIMITS["max_position_notional"],
+    "min_profit_rebalance": RISK_CONFIG["inventory"]["min_profit_rebalance"],
+    "gradual_exit_steps": TRADING_CONFIG["avellaneda"]["max_loss_threshold"],
+    "inventory_cost_factor": TRADING_CONFIG["avellaneda"]["inventory_cost_factor"],
+}
+
+# Add PERFORMANCE_CONFIG and PERFORMANCE_METRICS for backward compatibility
 PERFORMANCE_CONFIG = {
     "metrics": {
         "window_size": BOT_CONFIG["performance"]["window_size"],
@@ -382,7 +384,6 @@ PERFORMANCE_CONFIG = {
         "update_interval": BOT_CONFIG["performance"]["metrics_update_interval"],
         "max_position_time": BOT_CONFIG["performance"]["max_position_time"]
     },
-    
     "thresholds": {
         "profit_factor": BOT_CONFIG["performance"]["profit_factor_threshold"],
         "win_rate": BOT_CONFIG["performance"]["win_rate_threshold"],
@@ -392,67 +393,6 @@ PERFORMANCE_CONFIG = {
         "max_consecutive_losses": BOT_CONFIG["risk"]["max_consecutive_losses"],
         "drawdown_recovery_factor": BOT_CONFIG["performance"]["drawdown_recovery_factor"]
     }
-}
-
-# Connection configuration
-CONNECTION_CONFIG = BOT_CONFIG["connection"]
-
-# =============================================================================
-# LEGACY CONFIGURATIONS (BACKWARD COMPATIBILITY)
-# =============================================================================
-"""
-These configurations maintain the original variable names used throughout the codebase.
-They now reference the consolidated configs rather than BOT_CONFIG directly.
-Over time, code should be migrated to use the consolidated configs instead.
-"""
-
-# Core backward compatibility configs
-ORDERBOOK_CONFIG = {
-    "spread": BOT_CONFIG["trading_strategy"]["avellaneda"]["base_spread"],
-    "min_spread": BOT_CONFIG["trading_strategy"]["avellaneda"]["min_spread"],
-    "max_spread": BOT_CONFIG["trading_strategy"]["avellaneda"]["max_spread"],
-    "bid_step": BOT_CONFIG["trading_strategy"]["avellaneda"]["level_spacing"],
-    "ask_step": BOT_CONFIG["trading_strategy"]["avellaneda"]["level_spacing"],
-    "bid_sizes": BOT_CONFIG["trading_strategy"]["avellaneda"]["size_multipliers"],
-    "ask_sizes": BOT_CONFIG["trading_strategy"]["avellaneda"]["size_multipliers"],
-    "threshold": BOT_CONFIG["trading_strategy"]["avellaneda"]["adverse_selection_threshold"],
-    "amend_threshold": BOT_CONFIG["trading_strategy"]["avellaneda"]["max_loss_threshold"],
-    "market_impact_threshold": BOT_CONFIG["trading_strategy"]["market_impact"]["threshold"],
-    "quote_lifetime": BOT_CONFIG["trading_strategy"]["quote_timing"]["max_lifetime"],
-    "min_quote_interval": BOT_CONFIG["trading_strategy"]["quote_timing"]["min_interval"],
-    "error_retry_interval": BOT_CONFIG["connection"]["retry_delay"],
-    "max_pending_operations": BOT_CONFIG["trading_strategy"]["quote_timing"]["max_pending"],
-    "fast_cancel_threshold": BOT_CONFIG["trading_strategy"]["market_impact"]["fast_cancel_threshold"],
-    "base_order_size": BOT_CONFIG["trading_strategy"]["execution"]["min_size"],
-    "min_order_size": BOT_CONFIG["trading_strategy"]["execution"]["min_size"],
-    "levels": BOT_CONFIG["trading_strategy"]["avellaneda"]["max_levels"],
-}
-
-RISK_LIMITS = RISK_CONFIG["limits"]
-
-TRADING_PARAMS = {
-    "position_management": {
-        "gamma": TRADING_CONFIG["avellaneda"]["gamma"],
-        "inventory_weight": TRADING_CONFIG["avellaneda"]["inventory_weight"],
-        "position_fade_time": TRADING_CONFIG["avellaneda"]["position_fade_time"],
-        "order_flow_intensity": TRADING_CONFIG["avellaneda"]["order_flow_intensity"],
-        "inventory_cost_factor": TRADING_CONFIG["avellaneda"]["inventory_cost_factor"],
-        "max_inventory_imbalance": RISK_CONFIG["inventory"]["max_imbalance"],
-        "adverse_selection_threshold": TRADING_CONFIG["avellaneda"]["adverse_selection_threshold"],
-        "position_limit": RISK_CONFIG["limits"]["max_notional"],  # Using hardcoded value from RISK_CONFIG
-        "kappa": TRADING_CONFIG["avellaneda"]["kappa"],
-    },
-    # Use values from the volatility section in TRADING_CONFIG
-    "volatility": {
-        "default": TRADING_CONFIG["volatility"]["default"],
-        "window": TRADING_CONFIG["volatility"]["window"],
-        "min_samples": 5,  # Reduced from original value to start quoting more quickly
-        "scaling": TRADING_CONFIG["volatility"]["scaling"], 
-        "floor": TRADING_CONFIG["volatility"]["floor"],
-        "ceiling": TRADING_CONFIG["volatility"]["ceiling"],
-        "ewm_span": TRADING_CONFIG["volatility"]["ewm_span"],
-        "cache_duration": TRADING_CONFIG["volatility"]["cache_duration"]
-    },
 }
 
 PERFORMANCE_METRICS = {
@@ -469,37 +409,15 @@ PERFORMANCE_METRICS = {
     "drawdown_recovery_factor": PERFORMANCE_CONFIG["thresholds"]["drawdown_recovery_factor"]
 }
 
-INVENTORY_CONFIG = {
-    "max_inventory_imbalance": RISK_CONFIG["inventory"]["max_imbalance"],
-    "target_inventory": RISK_CONFIG["inventory"]["target"],
-    "inventory_fade_time": RISK_CONFIG["inventory"]["fade_time"],
-    "adverse_selection_threshold": RISK_CONFIG["inventory"]["adverse_selection_threshold"],
-    "inventory_skew_factor": TRADING_CONFIG["avellaneda"]["inventory_skew_factor"],
-    "max_position_notional": RISK_CONFIG["limits"]["max_position_notional"],
-    "min_profit_rebalance": RISK_CONFIG["inventory"]["min_profit_rebalance"],
-    "gradual_exit_steps": TRADING_CONFIG["avellaneda"]["max_loss_threshold"],
-    "inventory_cost_factor": TRADING_CONFIG["avellaneda"]["inventory_cost_factor"],
-}
+# Add CONNECTION_CONFIG for backward compatibility
+CONNECTION_CONFIG = BOT_CONFIG["connection"]
 
-# Quoting configuration
+# For backward compatibility with existing code
+ORDERBOOK_CONFIG = TRADING_CONFIG["order"]
 QUOTING_CONFIG = {
-    "min_quote_interval": BOT_CONFIG["trading_strategy"]["quote_timing"]["min_interval"],
-    "quote_lifetime": BOT_CONFIG["trading_strategy"]["quote_timing"]["max_lifetime"],
-    "order_operation_interval": BOT_CONFIG["trading_strategy"]["quote_timing"]["operation_interval"],
-    "max_pending_operations": BOT_CONFIG["trading_strategy"]["quote_timing"]["max_pending"],
-    "fast_cancel_threshold": BOT_CONFIG["trading_strategy"]["market_impact"]["fast_cancel_threshold"],
-    "market_impact_threshold": BOT_CONFIG["trading_strategy"]["market_impact"]["threshold"],
-    "min_quote_size": BOT_CONFIG["trading_strategy"]["execution"]["min_size"],
-    "max_quote_size": BOT_CONFIG["trading_strategy"]["execution"]["max_size"],
-    "size_increment": BOT_CONFIG["trading_strategy"]["execution"]["size_increment"],
-    "price_decimals": BOT_CONFIG["trading_strategy"]["execution"]["price_decimals"],
-    "size_decimals": BOT_CONFIG["trading_strategy"]["execution"]["size_decimals"],
-    "max_retries": BOT_CONFIG["trading_strategy"]["execution"]["max_retries"],
-    "quote_buffer": BOT_CONFIG["trading_strategy"]["vamp"]["price_window"],
-    "aggressive_cancel": BOT_CONFIG["trading_strategy"]["market_impact"]["aggressive_cancel"],
+    **TRADING_CONFIG["quoting"],
     "post_only": BOT_CONFIG["trading_strategy"]["execution"]["post_only"],
     "error_retry_interval": BOT_CONFIG["connection"]["retry_delay"],
-    "levels": BOT_CONFIG["trading_strategy"]["avellaneda"]["max_levels"],
     # Add base_levels for compatibility with existing code
     "base_levels": [
         {"size": 0.1, "spread_multiplier": 1.0},  # Level 0 (closest to mid)

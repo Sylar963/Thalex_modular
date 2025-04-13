@@ -11,6 +11,7 @@ import random
 
 import numpy as np
 import websockets
+import orjson  # Fast JSON parsing
 
 import thalex as th
 from thalex import Network
@@ -28,7 +29,7 @@ from thalex_py.Thalex_modular.components.order_manager import OrderManager
 from thalex_py.Thalex_modular.components.avellaneda_market_maker import AvellanedaMarketMaker
 from thalex_py.Thalex_modular.models.keys import key_ids, private_keys
 from thalex_py.Thalex_modular.performance_monitor import PerformanceMonitor
-from thalex_py.Thalex_modular.logging import LoggerFactory
+from thalex_py.Thalex_modular.thalex_logging import LoggerFactory
 from thalex_py.Thalex_modular.ringbuffer.market_data_buffer import MarketDataBuffer
 
 class AvellanedaQuoter:
@@ -54,11 +55,11 @@ class AvellanedaQuoter:
         self.perp_name = None
         self.market_data = MarketDataBuffer()
         
-        # Rate limiting parameters
+        # Portfolio data
+        self.portfolio = {}
+        
+        # Rate limiting parameters - now managed by circuit breaker in Thalex client
         self.max_requests_per_minute = BOT_CONFIG["connection"]["rate_limit"]
-        self.request_counter = 0
-        self.request_counter_reset_time = time.time()
-        self.rate_limit_window = 60
         self.rate_limit_warning_sent = False
         self.volatile_market_warning_sent = False  # Flag for tracking volatile market warnings
         
@@ -67,7 +68,7 @@ class AvellanedaQuoter:
         self.condition_met = False
         self.setup_complete = asyncio.Event()
         
-        # Connection parameters
+        # Connection parameters - now using improved connection management
         self.heartbeat_interval = BOT_CONFIG["connection"]["heartbeat_interval"]
         self.last_heartbeat = time.time()
         
@@ -76,8 +77,10 @@ class AvellanedaQuoter:
         self.cooldown_active = False
         self.cooldown_until = 0
         
-        # Quote storage and metrics
-        self.price_history = deque(maxlen=100)  # Store last 100 prices
+        # Quote storage and metrics - use NumPy arrays for better performance
+        self.price_history = np.zeros(100)  # Store last 100 prices
+        self.price_history_idx = 0
+        self.price_history_full = False
         self.current_quotes = ([], [])  # (bid_quotes, ask_quotes)
         
         # Order management
@@ -92,6 +95,13 @@ class AvellanedaQuoter:
         self.last_quote_time = 0
         self.last_quote_update_time = 0
         
+        # Instrument data cache to avoid frequent lookups
+        self.instrument_data_cache = {}
+        
+        # Message processing statistics
+        self.message_processing_times = np.zeros(1000)  # Last 1000 processing times
+        self.message_processing_idx = 0
+        
         self.logger.info("Avellaneda quoter initialized")
 
     async def start(self):
@@ -102,19 +112,25 @@ class AvellanedaQuoter:
         
         try:
             # Initialize required attributes
-            self.request_counter = 0
-            self.request_counter_reset_time = time.time()
             self.rate_limit_warning_sent = False
             self.volatile_market_warning_sent = False
             self.cooldown_active = False
             self.cooldown_until = 0
             self.last_ticker_time = 0
             self.last_quote_time = 0
-            self.max_requests_per_minute = BOT_CONFIG["connection"]["rate_limit"]
             
-            # Connect to WebSocket
-            self.logger.info("Connecting to WebSocket...")
+            # Set the rate limit in the Thalex client
+            self.thalex.rate_limit = BOT_CONFIG["connection"]["rate_limit"]
+            
+            # Explicitly connect to the Thalex API
+            self.logger.info("Connecting to Thalex API...")
             await self.thalex.connect()
+            
+            # Check if connection was successful
+            if not self.thalex.connected():
+                raise ConnectionError("Failed to establish WebSocket connection")
+            
+            self.logger.info("Successfully connected to Thalex API")
             
             # Initialize instrument details
             self.logger.info("Initializing instrument details...")
@@ -129,6 +145,9 @@ class AvellanedaQuoter:
             
             # Set cancel on disconnect
             await self.thalex.set_cancel_on_disconnect(6, id=CALL_IDS["set_cod"])
+            
+            # Note: We're not setting up market maker protection since we're using individual limit orders instead of mass quotes
+            self.logger.info("Using individual limit orders instead of mass quotes - no market maker protection needed")
             
             # Subscribe to channels
             self.logger.info("Subscribing to channels...")
@@ -169,6 +188,10 @@ class AvellanedaQuoter:
             # Cancel all orders
             await self.order_manager.cancel_all_orders()
             
+            # Shutdown thalex client if connected
+            if self.thalex and self.thalex.connected():
+                await self.thalex.disconnect()
+            
             # Shutdown logging
             await LoggerFactory.shutdown()
             
@@ -178,380 +201,177 @@ class AvellanedaQuoter:
 
     async def await_instruments(self):
         """Initialize instrument details"""
-        await self.thalex.instruments(CALL_IDS["instruments"])
-        msg = await self.thalex.receive()
-        msg = json.loads(msg)
-        assert msg["id"] == CALL_IDS["instruments"]
-        
-        for i in msg["result"]:
-            if i["type"] == "perpetual" and i["underlying"] == MARKET_CONFIG["underlying"]:
-                tick_size = i["tick_size"]
-                self.perp_name = i["instrument_name"]
+        try:
+            await self.thalex.instruments(CALL_IDS["instruments"])
+            msg = await self.thalex.receive()
+            
+            # Use faster JSON parsing
+            try:
+                msg = orjson.loads(msg)
+            except Exception:
+                msg = json.loads(msg)
                 
-                # Set tick size for all components
-                self.order_manager.set_tick_size(tick_size)
-                self.market_maker.set_tick_size(tick_size)
-                self.logger.info(f"Found perpetual {self.perp_name} with tick size {tick_size}")
-                return
+            # Verify the response matches our request ID
+            if "id" not in msg or msg["id"] != CALL_IDS["instruments"]:
+                raise ValueError(f"Unexpected response ID: got {msg.get('id')}, expected {CALL_IDS['instruments']}")
+            
+            if "result" not in msg or not isinstance(msg["result"], list):
+                raise ValueError(f"Invalid instrument response format: missing or invalid 'result' field")
                 
-        raise ValueError(f"Perpetual {MARKET_CONFIG['underlying']} not found")
+            # Cache all instruments for faster lookup
+            for instrument in msg["result"]:
+                self.instrument_data_cache[instrument["instrument_name"]] = instrument
+            
+            # Find our target perpetual instrument
+            perpetual_found = False
+            for i in msg["result"]:
+                if i["type"] == "perpetual" and i["underlying"] == MARKET_CONFIG["underlying"]:
+                    perpetual_found = True
+                    tick_size = i["tick_size"]
+                    self.perp_name = i["instrument_name"]
+                    
+                    # Set tick size for all components AND for the quoter itself
+                    self.tick_size = tick_size
+                    self.order_manager.set_tick_size(tick_size)
+                    self.market_maker.set_tick_size(tick_size)
+                    self.logger.info(f"Found perpetual {self.perp_name} with tick size {tick_size} - setting for all components")
+                    return
+                    
+            if not perpetual_found:
+                self.logger.error(f"Could not find perpetual with underlying {MARKET_CONFIG['underlying']}")
+                raise ValueError(f"Perpetual {MARKET_CONFIG['underlying']} not found")
+                
+        except ValueError as e:
+            # Re-raise value errors with the original message
+            self.logger.error(f"Error processing instruments: {str(e)}")
+            raise
+        except Exception as e:
+            # Convert other exceptions to a more specific type with context
+            self.logger.error(f"Unexpected error initializing instruments: {str(e)}", exc_info=True)
+            raise RuntimeError(f"Failed to initialize instruments: {str(e)}") from e
 
     async def check_rate_limit(self, priority: str = "normal") -> bool:
-        """Check if we're under the rate limit and increment counter if we are"""
+        """
+        Check if we're under the rate limit - now delegated to Thalex client
+        
+        This is kept for backward compatibility but uses the client's circuit breaker
+        """
         try:
-            # Get current rate limit from config but reduce by 30%
-            rate_limit = int(self.max_requests_per_minute * 0.7)  # Reduced by 30%
+            # For high priority operations, we'll attempt even if near limits
+            if priority == "high":
+                # Check if the client has a circuit breaker
+                if hasattr(self.thalex, 'circuit_breaker') and hasattr(self.thalex, 'CircuitState'):
+                    if self.thalex.circuit_breaker.state != self.thalex.CircuitState.OPEN:
+                        return True
+                else:
+                    # Fall back to simple check if circuit breaker not available
+                    return True
             
-            # Check if we need to reset the counter (new time window)
-            current_time = time.time()
-            window_elapsed = current_time - self.request_counter_reset_time
-            
-            if window_elapsed >= self.rate_limit_window:
-                # Log previous window's stats before resetting
-                if self.request_counter > 0:
-                    request_rate = self.request_counter / min(window_elapsed, self.rate_limit_window)
-                    self.logger.debug(f"Previous window stats: {self.request_counter} requests, {request_rate:.1f} req/s")
-                
-                # Reset for new window
-                self.request_counter = 0
-                self.request_counter_reset_time = current_time
-                self.rate_limit_warning_sent = False
-            
-            # Calculate current usage percentage
-            usage_percentage = (self.request_counter / rate_limit) * 100 if rate_limit > 0 else 0
-            
-            # Get current market conditions to adjust rate limiting
-            market_conditions = {}
-            if hasattr(self, 'market_data') and self.market_data:
-                market_conditions = self.market_data.get_market_state()
-            
-            # Detect high volatility or market impact for adaptive rate limiting
-            high_volatility = False
-            high_market_impact = False
-            
-            if market_conditions:
-                # Check volatility (if available)
-                volatility = market_conditions.get('volatility', 0)
-                if volatility > TRADING_CONFIG["volatility"]["ceiling"] * 0.7:  # 70% of ceiling
-                    high_volatility = True
-                    self.logger.debug(f"High volatility detected: {volatility:.5f}")
-                
-                # Check market impact (if available)
-                market_impact = market_conditions.get('market_impact', 0)
-                if market_impact > TRADING_CONFIG["avellaneda"]["adverse_selection_threshold"]:
-                    high_market_impact = True
-                    self.logger.debug(f"High market impact detected: {market_impact:.5f}")
-            
-            # Add minimum time between requests based on priority with longer minimum times
-            min_request_interval = 0.5  # Base 500ms minimum between requests (increased from 300ms)
-            
-            # Adjust minimum intervals based on market conditions
-            if high_volatility or high_market_impact:
-                # In high volatility or high market impact, prioritize critical operations
-                if priority == "critical":
-                    min_request_interval = 0.3  # Allow faster critical operations (300ms)
-                elif priority == "high":
-                    min_request_interval = 0.8  # Slightly slow down high priority (800ms)
-                elif priority == "normal":
-                    min_request_interval = 1.2  # Significantly slow down normal priority (1200ms)
-                else:  # "low"
-                    min_request_interval = 2.0  # Dramatically slow down low priority (2000ms)
+            # Try to use the client's rate limit checking if available
+            if hasattr(self.thalex, '_check_rate_limit') and callable(self.thalex._check_rate_limit):
+                return await self.thalex._check_rate_limit()
             else:
-                # Normal market conditions
-                if priority == "normal":
-                    min_request_interval = 0.8  # 800ms for normal priority (increased from 500ms)
-                elif priority == "low":
-                    min_request_interval = 1.5  # 1500ms for low priority (increased from 1000ms)
-            
-            # Check if we're requesting too quickly
-            if hasattr(self, 'last_request_time'):
-                time_since_last = current_time - self.last_request_time
-                if time_since_last < min_request_interval:
-                    return False
-            
-            # Stricter progressive throttling based on usage
-            usage_threshold_critical = 70  # Lowered from 80% to 70%
-            usage_threshold_high = 50      # Lowered from 60% to 50%
-            usage_threshold_normal = 30    # Lowered from 40% to 30%
-            
-            # Further restrict in high volatility/market impact conditions
-            if high_volatility or high_market_impact:
-                usage_threshold_critical = 60  # Even lower threshold during volatile markets
-                usage_threshold_high = 40
-                usage_threshold_normal = 20
-                
-                if not self.volatile_market_warning_sent:
-                    self.logger.warning(f"Volatile market detected - applying stricter rate limiting (high_vol={high_volatility}, high_impact={high_market_impact})")
-                    self.volatile_market_warning_sent = True
-            else:
-                self.volatile_market_warning_sent = False
-            
-            if usage_percentage >= usage_threshold_critical:
-                if not self.rate_limit_warning_sent:
-                    self.logger.warning(f"Rate limit high: {usage_percentage:.1f}% used")
-                    self.rate_limit_warning_sent = True
-                
-                # Only critical operations above threshold
-                if priority != "critical":
-                    return False
-            elif usage_percentage >= usage_threshold_high:
-                # Above high threshold, only allow critical and high priority
-                if priority not in ["critical", "high"]:
-                    return False
-            elif usage_percentage >= usage_threshold_normal:
-                # Random throttling for normal operations at normal-high usage
-                if priority == "low" or (priority == "normal" and random.random() < 0.7):  # Increased throttling probability
-                    return False
-            
-            # Update tracking
-            self.request_counter += 1
-            self.last_request_time = current_time
-            
-            return True
-            
+                # Fall back to assuming we're under limit if no check method exists
+                self.logger.debug("No rate limit check method available, assuming under limit")
+                return True
         except Exception as e:
             self.logger.error(f"Error in rate limit check: {str(e)}")
-            return False  # Fail safe - deny request on error
-
-    async def send_heartbeat(self):
-        """Send a heartbeat to keep the connection alive"""
-        if not await self.check_rate_limit():
-            return
-            
-        try:
-            # Use a lightweight ping when available
-            if hasattr(self.thalex, "ping") and callable(self.thalex.ping):
-                is_alive = await self.thalex.ping()
-                if is_alive:
-                    self.logger.debug("Ping successful - connection is alive")
-                    self.last_heartbeat = time.time()
-                else:
-                    self.logger.warning("Ping failed - connection may be dead")
-                    raise ConnectionError("WebSocket ping failed")
-            # Fallback to connection check
-            elif self.thalex.connected():
-                self.logger.debug("Connection is still alive - heartbeat check successful")
-                self.last_heartbeat = time.time()
-            else:
-                self.logger.warning("Connection appears closed during heartbeat check")
-                raise ConnectionError("WebSocket connection is closed")
-        except Exception as e:
-            self.logger.error(f"Error during heartbeat check: {str(e)}")
-            # We don't raise here to avoid crashing the heartbeat task
-            # The main listen task will detect the connection issue
+            # On error, be conservative and act as if we're rate limited
+            return False
 
     async def listen_task(self):
-        """Main websocket listener task"""
-        self.logger.info("Starting listen task")
+        """Listen for websocket messages"""
+        self.logger.info("Starting listen task...")
         
-        cooldown_active = False
-        cooldown_until = 0
-        consecutive_errors = 0  # Track consecutive errors for exponential backoff
-        max_consecutive_errors = 3  # Allow 3 consecutive errors before longer cooldown
-
+        consecutive_errors = 0
+        max_consecutive_errors = 10
+        base_error_delay = 0.1  # 100ms
+        max_error_delay = 5.0   # 5 seconds
+        
         while True:
             try:
-                # Check if we are in cooldown mode
-                if cooldown_active:
-                    current_time = time.time()
-                    if current_time >= cooldown_until:
-                        cooldown_active = False
-                        self.logger.info("Connection cooldown completed, resuming normal operation")
-                    else:
-                        cooldown_remaining = int(cooldown_until - current_time)
-                        self.logger.warning(f"In connection cooldown, {cooldown_remaining}s remaining")
-                        await asyncio.sleep(min(cooldown_remaining, 9))  # Reduced from 30s to 9s
-                        continue
-
-                # Attempt to establish connection
-                self.logger.info("Connecting to Thalex websocket (attempt 1/5)...")
-                retry_count = 1
-                retry_delay = 1  # Initial retry delay in seconds
-                
-                self.logger.info(f"Debug: Network config - {BOT_CONFIG['market']['network']}")
-                
-                # Connection loop with retry
-                while True:
+                # Check if connection is alive before attempting to receive
+                if hasattr(self.thalex, 'connected') and callable(self.thalex.connected) and not self.thalex.connected():
+                    self.logger.warning("WebSocket connection lost, attempting to reconnect...")
                     try:
-                        # Connect to WebSocket
                         await self.thalex.connect()
-                        self.logger.info("Connection established")
-                        
-                        # Reset consecutive errors on successful connection
+                        self.logger.info("Successfully reconnected WebSocket")
+                        # Reset error counter on successful reconnection
                         consecutive_errors = 0
-                        break
-                    except Exception as e:
-                        if retry_count >= 5:
-                            if consecutive_errors >= max_consecutive_errors:
-                                # Reduce cooldown duration - high frequency trading needs shorter recovery
-                                cooldown_duration = min(60, 9 * (2 ** min(consecutive_errors - max_consecutive_errors, 2)))  # Modified to use 9s as base unit instead of 60s
-                                self.logger.warning(f"Too many consecutive errors ({consecutive_errors}). Entering connection cooldown for {cooldown_duration}s")
-                                cooldown_active = True
-                                cooldown_until = time.time() + cooldown_duration
-                            
-                            raise
-                        retry_count += 1
-                        self.logger.warning(f"Connection attempt {retry_count} failed: {str(e)}. Retrying in {retry_delay}s...")
-                        await asyncio.sleep(retry_delay)
-                        retry_delay = min(9, retry_delay * 2)  # Exponential backoff capped at 9 seconds instead of 5 minutes
-                
-                # Initialize connection
-                # Wait for instruments
-                await asyncio.wait_for(self.await_instruments(), timeout=30)
-                
-                # Login with proper network keys
-                network = MARKET_CONFIG["network"]
-                if network == Network.TEST:
-                    key_id = key_ids[Network.TEST]
-                    private_key = private_keys[Network.TEST]
-                else:
-                    key_id = key_ids[Network.PROD]
-                    private_key = private_keys[Network.PROD]
-                    
-                self.logger.info(f"Logging in with network: {network}")
-                await self.thalex.login(
-                    key_id,
-                    private_key,
-                    id=CALL_IDS["login"]
-                )
-                
-                # Set cancel on disconnect
-                await self.thalex.set_cancel_on_disconnect(6, id=CALL_IDS["set_cod"])
-                
-                # Tell the market maker which instrument we're trading
-                if self.perp_name:
-                    self.market_maker.set_instrument(self.perp_name)
-                    self.logger.info(f"Set instrument for market maker to {self.perp_name}")
-                
-                # Subscribe to channels - allow multiple attempts with backoff
-                subscription_success = False
-                subscription_attempts = 0
-                subscription_retry_delay = 1
-                
-                while not subscription_success and subscription_attempts < 3:
-                    try:
-                        await self.thalex.public_subscribe(
-                            channels=[f"ticker.{self.perp_name}.raw", f"price_index.{BOT_CONFIG['market']['underlying']}"],
-                            id=CALL_IDS["subscribe"]
-                        )
-                        
-                        # Also subscribe to index and order channels
-                        await self.thalex.private_subscribe(
-                            channels=["session.orders", "account.portfolio", "account.trade_history"],
-                            id=CALL_IDS["subscribe"] + 1
-                        )
-                        
-                        subscription_success = True
-                        self.logger.info("Successfully subscribed to channels")
-                        
-                    except Exception as e:
-                        subscription_attempts += 1
-                        self.logger.warning(f"Failed to subscribe (attempt {subscription_attempts}/3): {str(e)}")
-                        if subscription_attempts >= 3:
-                            raise
-                        await asyncio.sleep(subscription_retry_delay)
-                        subscription_retry_delay *= 2
-                
-                # Main message loop
-                message_timeout = 30  # Timeout for receiving messages
-                while True:
-                    try:
-                        # Add a timeout to detect stalled connections
-                        message = await asyncio.wait_for(self.thalex.receive(), timeout=message_timeout)
-                        # Parse and process message
-                        self.logger.info(f"Received message: {message[:200]}...")
-                        data = json.loads(message)
-                        
-                        # Process message based on type - Fixed to better handle the current message format
-                        if "channel_name" in data:
-                            # New format with channel_name at the top level
-                            channel_name = data["channel_name"]
-                            if "notification" in data:
-                                self.logger.info(f"Processing notification from {channel_name}")
-                                await self.handle_notification(channel_name, data["notification"])
-                        elif "notification" in data:
-                            # Legacy format with notification containing channel
-                            notification = data["notification"]
-                            if "channel" in notification:
-                                channel = notification["channel"]
-                                await self.handle_notification(channel, notification["data"])
-                            else:
-                                self.logger.warning(f"Notification missing channel: {notification}")
-                        elif "result" in data:
-                            result = data["result"]
-                            cid = data.get("id")
-                            await self.handle_result(result, cid)
-                        elif "error" in data:
-                            error = data["error"]
-                            cid = data.get("id")
-                            await self.handle_error(error, cid)
-                        else:
-                            self.logger.warning(f"Unknown message format: {message[:100]}...")
-                            
-                    except asyncio.TimeoutError:
-                        # No message received within timeout, check connection
-                        self.logger.warning(f"No message received for {message_timeout} seconds, checking connection...")
-                        # Send a heartbeat to check connection
-                        try:
-                            if hasattr(self.thalex, "ping") and callable(self.thalex.ping):
-                                is_alive = await self.thalex.ping()
-                                if not is_alive:
-                                    self.logger.error("Connection ping failed, reconnecting...")
-                                    raise ConnectionError("WebSocket ping failed")
-                            elif not self.thalex.connected():
-                                self.logger.error("Connection appears closed, reconnecting...")
-                                raise ConnectionError("WebSocket connection is closed")
-                            else:
-                                self.logger.info("Connection still alive after timeout check")
-                        except Exception as e:
-                            self.logger.error(f"Connection check failed: {str(e)}")
-                            raise ConnectionError("Connection check failed after message timeout")
-                                
-                    except websockets.exceptions.ConnectionClosed as e:
-                        self.logger.warning(f"WebSocket connection closed: {str(e)}")
-                        # Cancel all orders on disconnect
-                        await self.order_manager.cancel_all_orders()
+                    except Exception as conn_err:
+                        self.logger.error(f"Failed to reconnect: {str(conn_err)}")
+                        # Use exponential backoff for reconnection attempts
+                        await asyncio.sleep(min(2 ** consecutive_errors, 30))
                         consecutive_errors += 1
-                        raise  # Re-raise to trigger reconnection
-                            
-                    except Exception as e:
-                        self.logger.error(f"Error in listen loop: {str(e)}")
-                        if "no close frame received" in str(e).lower() or "too many request" in str(e).lower():
-                            self.logger.info("WebSocket connection lost or rate limited, attempting to reconnect...")
-                            # Cancel all orders before reconnecting
-                            await self.order_manager.cancel_all_orders()
-                            consecutive_errors += 1
-                            raise  # Re-raise to trigger reconnection
-                        
-                        # For other errors, log but continue processing
-                        self.logger.exception("Unexpected error in message processing:")
-                        await asyncio.sleep(1)
-
-            # Handle different types of exceptions at the outermost level
-            except (websockets.ConnectionClosed, ConnectionRefusedError, socket.gaierror) as e:
-                # Connection level errors - retry with backoff
-                self.logger.error(f"Connection error: {str(e)}")
+                        continue
                 
-                # Wait with exponential backoff
-                retry_delay = 1 * (2 ** min(consecutive_errors, 8))  # Cap at 2^8 = 256 seconds
-                retry_delay = min(retry_delay, 300)  # But never more than 5 minutes
+                # Using the optimized receive method that handles reconnections
+                message = await self.thalex.receive()
                 
-                self.logger.info(f"Reconnecting in {retry_delay} seconds (consecutive errors: {consecutive_errors})...")
-                await asyncio.sleep(retry_delay)
+                # Reset consecutive errors counter on successful message
+                consecutive_errors = 0
                 
-            except Exception as e:
-                # Other unexpected errors
-                self.logger.error(f"Error in connection initialization: {str(e)}")
+                start_time = time.time()
+                
+                # Use faster JSON parsing if message is still a string
+                if isinstance(message, str):
+                    try:
+                        data = orjson.loads(message)
+                    except Exception:
+                        data = json.loads(message)
+                else:
+                    data = message
+                
+                # Process notification - handle both old and new API formats
+                # New format uses 'channel_name' instead of 'channel'
+                if "notification" in data:
+                    if "channel" in data:
+                        await self.handle_notification(data["channel"], data["notification"])
+                    elif "channel_name" in data:
+                        # New API format with channel_name
+                        await self.handle_notification(data["channel_name"], data["notification"])
+                    else:
+                        self.logger.warning(f"Received notification with unknown channel format: {data.keys()}")
+                # Process response to API call
+                elif "id" in data:
+                    cid = data["id"]
+                    if "result" in data:
+                        await self.handle_result(data["result"], cid)
+                    elif "error" in data:
+                        await self.handle_error(data["error"], cid)
+                else:
+                    self.logger.warning(f"Received unrecognized message format: {data.keys()}")
+                
+                # Track message processing time
+                processing_time = time.time() - start_time
+                self.message_processing_times[self.message_processing_idx] = processing_time
+                self.message_processing_idx = (self.message_processing_idx + 1) % 1000
+                
+                # Log if processing took too long
+                if processing_time > 0.1:  # More than 100ms
+                    self.logger.warning(f"Message processing took {processing_time*1000:.2f}ms")
+                
+            except asyncio.CancelledError:
+                self.logger.info("Listen task cancelled, exiting...")
+                break
+            except (ConnectionError, websockets.exceptions.ConnectionClosed) as conn_err:
                 consecutive_errors += 1
-                # Cancel any outstanding orders
-                try:
-                    await self.order_manager.cancel_all_orders()
-                except Exception as cancel_error:
-                    self.logger.error(f"Error cancelling orders during reconnection: {str(cancel_error)}")
+                self.logger.error(f"Connection error in listen task (attempt {consecutive_errors}): {str(conn_err)}")
+                # Use exponential backoff for connection errors
+                delay = min(base_error_delay * (2 ** consecutive_errors), max_error_delay)
+                self.logger.info(f"Waiting {delay:.2f}s before reconnection attempt")
+                await asyncio.sleep(delay)
+            except Exception as e:
+                consecutive_errors += 1
+                self.logger.error(f"Error in listen task (attempt {consecutive_errors}): {str(e)}", exc_info=True)
                 
-                # Log and continue with brief pause
-                self.logger.exception(f"Unexpected error in listen task: {str(e)}")
-                await asyncio.sleep(5)  # Brief pause before retrying
+                # If too many consecutive errors, implement exponential backoff
+                if consecutive_errors > max_consecutive_errors:
+                    delay = min(base_error_delay * (2 ** (consecutive_errors - max_consecutive_errors)), max_error_delay)
+                    self.logger.warning(f"Too many consecutive errors ({consecutive_errors}), backing off for {delay:.2f}s")
+                    await asyncio.sleep(delay)
+                else:
+                    await asyncio.sleep(base_error_delay)  # Basic delay on occasional errors
 
     async def handle_notification(self, channel: str, notification: Union[Dict, List[Dict]]):
         """Handle incoming notifications from different channels.
@@ -593,95 +413,105 @@ class AvellanedaQuoter:
             self.logger.error(f"Error processing notification: {str(e)}", exc_info=True)
 
     async def handle_ticker_update(self, ticker_data: Dict):
-        """Process ticker updates and generate quotes if conditions are met"""
+        """Handle a ticker update notification"""
         try:
-            current_time = time.time()
+            # Extract needed values
+            instrument_name = ticker_data.get("instrument_name", "")
+            mark_price = ticker_data.get("mark_price", 0.0)
+            index_price = ticker_data.get("index_price", 0.0)
+            bid_price = ticker_data.get("best_bid_price", 0.0)
+            ask_price = ticker_data.get("best_ask_price", 0.0)
+            timestamp = ticker_data.get("timestamp", 0) / 1e6  # Convert to seconds
             
-            # Add rate limiting check - Increase to 500ms to reduce ticker processing frequency
-            min_ticker_interval = 0.5  # Minimum 500ms between ticker processing (increased from 200ms)
-            if hasattr(self, 'last_ticker_time') and current_time - self.last_ticker_time < min_ticker_interval:
-                self.logger.debug("Skipping ticker update - too frequent")
-                return
-            self.last_ticker_time = current_time
-            
-            # Create or update ticker object
-            self.ticker = Ticker(ticker_data)
-            
-            # Log ticker data with improved format
-            bid_display = f"{self.ticker.best_bid_price:.2f}" if self.ticker.best_bid_price else "None"
-            ask_display = f"{self.ticker.best_ask_price:.2f}" if self.ticker.best_ask_price else "None"
-            self.logger.info(
-                f"Ticker update received: mark={self.ticker.mark_price:.2f}, "
-                f"bid={bid_display}, "
-                f"ask={ask_display}"
-            )
-            
-            # Validate ticker data
-            if not self.ticker.mark_price or self.ticker.mark_price <= 0:
-                self.logger.warning(f"Invalid mark price: {self.ticker.mark_price}")
+            # Validate prices - critical for quote generation
+            if mark_price <= 0:
+                self.logger.warning(f"Invalid mark price received: {mark_price}, skipping update")
                 return
                 
-            # Update the market data buffer
-            start_time = time.time()
-            is_buy = None
-            if "direction" in ticker_data:
-                is_buy = ticker_data["direction"] == "buy"
-                
+            if bid_price <= 0 or ask_price <= 0 or bid_price >= ask_price:
+                self.logger.warning(f"Invalid bid/ask prices: bid={bid_price}, ask={ask_price}")
+                # If bid/ask are invalid but mark price is valid, we can still continue
+                # Just log the warning and proceed
+            
+            # Make sure prices are aligned to tick size if tick size is available
+            if hasattr(self, 'tick_size') and self.tick_size > 0:
+                # Round prices to tick size
+                if mark_price > 0:
+                    mark_price = round(mark_price / self.tick_size) * self.tick_size
+                if bid_price > 0:
+                    bid_price = round(bid_price / self.tick_size) * self.tick_size
+                if ask_price > 0:
+                    ask_price = round(ask_price / self.tick_size) * self.tick_size
+                if index_price > 0:
+                    index_price = round(index_price / self.tick_size) * self.tick_size
+                    
+                self.logger.debug(f"Aligned prices to tick size {self.tick_size}: mark={mark_price}, bid={bid_price}, ask={ask_price}")
+            
+            # Update market data buffer using the proper update method
             self.market_data.update(
-                price=self.ticker.mark_price,
-                volume=ticker_data.get("volume", 0.0),
-                timestamp=int(time.time() * 1000),
-                is_buy=is_buy
+                price=mark_price,
+                volume=0.0,  # Ticker updates don't have volume data
+                timestamp=int(timestamp * 1000),  # Convert back to milliseconds for buffer
+                is_buy=None  # No buy/sell direction in ticker data
             )
             
-            # Get market state from the buffer
-            market_state = self.market_data.get_market_state()
+            self.last_ticker_time = timestamp
             
-            # Update price history for metrics
-            self.price_history.append(self.ticker.mark_price)
-            self.logger.debug(f"Price history samples: {len(self.price_history)}/{TRADING_PARAMS['volatility']['min_samples']}")
-            
-            # Get volatility from market data buffer
-            if "yz_volatility" in market_state and not np.isnan(market_state["yz_volatility"]):
-                volatility = market_state["yz_volatility"]
+            # Check if we have a ticker to update
+            if self.ticker is None:
+                # Create a new ticker with the expected dictionary format
+                self.ticker = Ticker({
+                    "mark_price": mark_price,
+                    "best_bid_price": bid_price,
+                    "best_ask_price": ask_price,
+                    "index": index_price,
+                    "mark_timestamp": timestamp,
+                    "funding_rate": 0.0  # Default value
+                })
+                self.logger.info(f"Created initial ticker: mark={mark_price}, bid={bid_price}, ask={ask_price}")
             else:
-                volatility = market_state["volatility"] if not np.isnan(market_state["volatility"]) else TRADING_CONFIG["avellaneda"]["fixed_volatility"]
-            
-            # Calculate market conditions using the buffer
-            market_conditions = {
-                "volatility": volatility,
-                "market_impact": market_state.get("market_impact", 0.0)
-            }
-            
-            # Update market maker with latest conditions
-            self.market_maker.update_market_conditions(
-                volatility=market_conditions["volatility"],
-                market_impact=market_conditions["market_impact"]
-                )
-            
-            # Check if we now have enough price history and signal the quote task
-            min_samples = TRADING_PARAMS["volatility"]["min_samples"]
-            
-            # Only notify if we have enough samples and should update quotes
-            if len(self.price_history) >= min_samples:
-                current_quotes = self.current_quotes
-                should_update = self.market_maker.should_update_quotes(current_quotes, self.ticker.mark_price)
+                # Update existing ticker (more efficient)
+                old_mark = self.ticker.mark_price
+                self.ticker.mark_price = mark_price
+                self.ticker.best_bid_price = bid_price
+                self.ticker.best_ask_price = ask_price
+                self.ticker.index = index_price
+                self.ticker.mark_ts = timestamp
                 
-                # Only notify if we need to update quotes and enough time has passed
-                if should_update and (not hasattr(self, 'last_quote_time') or current_time - self.last_quote_time >= 2.0):
-                    self.logger.info("Notifying quote task to update quotes")
-                    async with self.quote_cv:
-                        self.quote_cv.notify()
-                        self.logger.debug("Quote task notified")
-                else:
-                    self.logger.debug(f"Waiting for more price history: {len(self.price_history)}/{min_samples}")
+                # Log significant price changes
+                if abs(old_mark - mark_price) > (self.tick_size * 10):  # If price moved more than 10 ticks
+                    self.logger.info(f"Significant price change: {old_mark} -> {mark_price} (Δ: {mark_price - old_mark})")
+            
+            # Add to price history using NumPy array for better performance
+            self.price_history[self.price_history_idx] = mark_price
+            self.price_history_idx = (self.price_history_idx + 1) % 100
+            if self.price_history_idx == 0:
+                self.price_history_full = True
+            
+            # Check for volatile market conditions
+            if len(self.price_history) >= 5:
+                mean_price = np.mean(self.price_history[max(0, self.price_history_idx - 5):self.price_history_idx])
+                std_dev = np.std(self.price_history[max(0, self.price_history_idx - 5):self.price_history_idx])
+                volatility = std_dev / mean_price if mean_price > 0 else 0.0
+                volatility_pct = volatility * 100  # Convert to percentage
                 
-            # Calculate execution time for performance monitoring
-            execution_time = time.time() - start_time
-            self.logger.debug(f"Ticker processing time: {execution_time*1000:.2f}ms")
+                # Use volatility threshold with fallback to default value
+                volatility_threshold = RISK_LIMITS.get("volatility_threshold", 0.05)
+                is_volatile = volatility_pct > volatility_threshold
                 
+                if is_volatile and not self.volatile_market_warning_sent:
+                    self.logger.warning(f"Volatile market detected: {volatility_pct:.2f}% > {volatility_threshold:.2f}%")
+                    self.volatile_market_warning_sent = True
+                elif not is_volatile:
+                    self.volatile_market_warning_sent = False
+            
+            # Notify quote task of price update
+            async with self.quote_cv:
+                self.condition_met = True
+                self.quote_cv.notify()
+            
         except Exception as e:
-            self.logger.error(f"Error handling ticker update: {str(e)}", exc_info=True)
+            self.logger.error(f"Error processing ticker update: {str(e)}", exc_info=True)
 
     async def handle_index_update(self, index_data: Dict):
         """Process index price updates"""
@@ -697,6 +527,10 @@ class AvellanedaQuoter:
         try:
             # Extract order info
             order = self.create_order_from_data(order_data)
+            
+            # Update order manager with the new order info
+            if hasattr(self, 'order_manager') and self.order_manager is not None:
+                await self.order_manager.update_order(order)
             
             # Handle fills
             if order_data.get("status") == "filled":
@@ -724,25 +558,31 @@ class AvellanedaQuoter:
                 
                 # Force quote update after fills based on size threshold
                 significant_fill_threshold = TRADING_CONFIG["avellaneda"].get("significant_fill_threshold", 0.1)
-                if order.amount >= significant_fill_threshold:
-                    self.logger.info(f"Triggering quote update after significant fill of {order.amount:.4f}")
-                    
-                    # Create comprehensive market conditions
-                    market_state = self.market_data.get_market_state()
-                    market_conditions = {
-                        "volatility": market_state["yz_volatility"] if "yz_volatility" in market_state and not np.isnan(market_state["yz_volatility"]) else 
-                                     (market_state["volatility"] if not np.isnan(market_state["volatility"]) else TRADING_CONFIG["avellaneda"]["fixed_volatility"]),
-                        "market_impact": market_state.get("market_impact", 0.0),
-                        # Add higher impact for a recent fill
-                        "fill_impact": 0.5  # Increase market impact after fills
-                    }
-                    
-                    # Queue quote update with ticker object
-                    if self.ticker:
-                        # Create task for immediate update
+                
+                # Create comprehensive market conditions
+                market_state = self.market_data.get_market_state()
+                market_conditions = {
+                    "volatility": market_state["yz_volatility"] if "yz_volatility" in market_state and not np.isnan(market_state["yz_volatility"]) else 
+                                 (market_state["volatility"] if not np.isnan(market_state["volatility"]) else TRADING_CONFIG["avellaneda"]["fixed_volatility"]),
+                    "market_impact": market_state.get("market_impact", 0.0),
+                    # Add higher impact for a recent fill
+                    "fill_impact": 0.5 if order.amount >= significant_fill_threshold else 0.2  # Higher impact for significant fills
+                }
+                
+                if self.ticker:
+                    if order.amount >= significant_fill_threshold:
+                        # Create task with high priority for immediate update for significant fills
+                        self.logger.info(f"Scheduling immediate quote update after significant fill of {order.amount:.4f}")
                         asyncio.create_task(self.update_quotes(None, market_conditions))
                     else:
-                        self.logger.warning("Cannot update quotes after fill: No ticker data available")
+                        # Still update quotes for smaller fills, but with less urgency
+                        self.logger.info(f"Scheduling quote update after fill of {order.amount:.4f}")
+                        # Notify quote task instead of creating a separate task
+                        async with self.quote_cv:
+                            self.condition_met = True
+                            self.quote_cv.notify()
+                else:
+                    self.logger.warning("Cannot update quotes after fill: No ticker data available")
                 
         except Exception as e:
             self.logger.error(f"Error handling order update: {str(e)}", exc_info=True)
@@ -778,58 +618,76 @@ class AvellanedaQuoter:
             return Order(id=0, price=0, amount=0)
 
     async def handle_portfolio_update(self, portfolio_data: List[Dict]):
-        """Process portfolio updates"""
+        """Handle a portfolio update notification"""
         try:
-            self.portfolio = portfolio_data
+            self.logger.info(f"Processing portfolio update")
             
-            # Update position tracking
+            # Default position size
             position_size = 0.0
-            mark_price = 0.0
             
-            # Extract account balance and margin information
-            account_balance = 0.0
-            margin_used = 0.0
-            margin_utilization = 0.0
-            
+            # Iterate through portfolio items
             for item in portfolio_data:
-                # Find position for our instrument
-                if item["instrument_name"] == self.perp_name:
-                    position_size = item["position"]
-                    mark_price = item["mark_price"]
+                # Extract asset data - ensure it's a dictionary before using .get()
+                asset = item.get("asset", {})
+                if asset and isinstance(asset, dict):  # Check if asset is a dictionary
+                    asset_name = asset.get("asset_name", "")
+                    amount = asset.get("amount", 0.0)
+                    
+                    # Store in portfolio
+                    self.portfolio[asset_name] = float(amount)
+                    
+                    self.logger.debug(f"Updated asset {asset_name}: {float(amount):.8f}")
+                elif asset and not isinstance(asset, dict):  # Handle case where asset is not a dictionary
+                    # Log the unexpected format but don't crash
+                    self.logger.warning(f"Received asset in unexpected format: {type(asset)}, value: {asset}")
                 
-                # Extract account balance, usually in the account item
-                if "account_balance" in item:
-                    account_balance = float(item["account_balance"])
+                # Extract position data
+                position = item.get("position", {})
+                if not position:
+                    continue
+                    
+                # Ensure position is a dictionary before using .get()
+                if not isinstance(position, dict):
+                    self.logger.warning(f"Received position in unexpected format: {type(position)}, value: {position}")
+                    continue
+                    
+                instrument = position.get("instrument_name", "")
                 
-                # Extract margin information
-                if "margin_used" in item:
-                    margin_used = float(item["margin_used"])
+                # Only process our target instrument
+                if self.perp_name and instrument == self.perp_name:
+                    # Safely extract values with defaults
+                    size = float(position.get('size', 0.0) or 0.0)
+                    avg_price = float(position.get('average_price', 0.0) or 0.0)
+                    
+                    # Update position tracking
+                    position_size = size
+                    position_value = abs(size * avg_price) if avg_price > 0 else 0.0
+                    
+                    # Update the risk manager with position information - use async call properly
+                    await self.risk_manager.update_position(
+                        size=size,
+                        price=avg_price,
+                        timestamp=time.time()
+                    )
+                    
+                    self.logger.info(
+                        f"Updated position for {instrument}: "
+                        f"Size={size:.8f}, "
+                        f"Avg Price={avg_price:.2f}, "
+                        f"Value={position_value:.2f}"
+                    )
+                    
+            # Update market maker with position information for inventory management
+            if hasattr(self.market_maker, 'update_position'):
+                self.market_maker.update_position(position_size, avg_price)
                 
-                # Some exchanges provide utilization directly
-                if "margin_utilization" in item:
-                    margin_utilization = float(item["margin_utilization"])
-            
-            # Calculate margin utilization if not provided directly
-            if margin_utilization == 0.0 and account_balance > 0:
-                margin_utilization = margin_used / account_balance
-            
-            # Update market maker with position and margin information
-            self.market_maker.update_position(position_size, mark_price)
-            
-            # Set margin utilization in market maker
-            if hasattr(self.market_maker, 'margin_utilization'):
-                self.market_maker.margin_utilization = margin_utilization
-            else:
-                setattr(self.market_maker, 'margin_utilization', margin_utilization)
-            
-            # Log margin information
-            self.logger.info(
-                f"Portfolio update: Position={position_size:.4f}, Mark price={mark_price:.2f}, "
-                f"Margin utilization={margin_utilization:.2%}"
-            )
-            
         except Exception as e:
             self.logger.error(f"Error handling portfolio update: {str(e)}")
+            
+        # Trigger quote update after position change
+        async with self.quote_cv:
+            self.condition_met = True
+            self.quote_cv.notify()
 
     async def handle_trade_update(self, trade_data: Dict):
         """
@@ -895,7 +753,13 @@ class AvellanedaQuoter:
                 self.logger.info("Login successful")
             elif cid == CALL_IDS["subscribe"]:
                 self.logger.info("Subscription successful")
-            elif cid >= 100:  # Order IDs
+            elif cid == CALL_IDS["mass_quote"]:
+                # Note: We're using individual limit orders now, but keeping this handler for backward compatibility
+                self.logger.info("Mass quote request successful (legacy handler)")
+                # Update the order manager with the mass quote result
+                if hasattr(self, 'order_manager') and self.order_manager is not None:
+                    await self.order_manager.handle_order_result(result, cid)
+            elif cid >= 100:  # Other order IDs
                 await self.order_manager.handle_order_result(result, cid)
                 
         except Exception as e:
@@ -904,56 +768,25 @@ class AvellanedaQuoter:
     async def handle_error(self, error: Dict, cid: Optional[int]):
         """Handle API errors"""
         try:
-            error_msg = error.get('message', '')
-            error_code = error.get('code', -1)
-            
-            # Handle rate limit errors specifically
-            if error_code == 4 or "throttle exceeded" in error_msg.lower() or "too many request" in error_msg.lower():
-                self.logger.warning(f"Rate limit hit (code {error_code}), slowing down requests")
-                
-                # Apply stronger rate limiting measures when we hit actual rate limit errors
-                current_time = time.time()
-                
-                # Track rate limit errors to implement exponential backoff
-                if not hasattr(self, 'rate_limit_errors'):
-                    self.rate_limit_errors = 0
-                    self.last_rate_limit_error = 0
-                
-                # Reset error count if it's been a while since last error
-                if current_time - self.last_rate_limit_error > 60:
-                    self.rate_limit_errors = 0
-                
-                self.rate_limit_errors += 1
-                self.last_rate_limit_error = current_time
-                
-                # Immediately reduce request counter to 75% of limit to slow down
-                self.request_counter = int(self.max_requests_per_minute * 0.75)
-                
-                # Implement exponential backoff for cooldown duration based on error frequency
-                if self.rate_limit_errors > 1:
-                    # Calculate cooldown with shorter exponential backoff (0.5s, 1s, 2s, max 3s)
-                    cooldown_time = min(2 ** (self.rate_limit_errors - 2), 3)
-                    self.cooldown_active = True
-                    self.cooldown_until = current_time + cooldown_time
-                    self.logger.warning(f"Rate limit cooldown active for {cooldown_time}s until: {time.ctime(self.cooldown_until)}")
-                    
-                    # If we're getting many consecutive errors, force a shorter pause
-                    if self.rate_limit_errors >= 5:
-                        self.logger.warning(f"Multiple consecutive rate limit errors, enforcing stronger cooldown")
-                        # Wait for a bit to let the rate limit reset, reduced from 1.5s to 0.5s
-                        await asyncio.sleep(0.5)
-                
-                # For order-related rate limits, handle just that order error
-                if cid and cid >= 100:
-                    await self.order_manager.handle_order_error(error, cid)
-                
+            if cid is None:
                 return
-            
-            # Handle other API errors
-            self.logger.error(f"API error for message {cid}: {error}")
-            
-            if cid and cid >= 100:  # Order IDs
+                
+            # API call error handling
+            if cid == CALL_IDS["login"]:
+                self.logger.error(f"Login failed: {error.get('message', '')}")
+            elif cid == CALL_IDS["subscribe"]:
+                self.logger.error(f"Subscription failed: {error.get('message', '')}")
+            elif cid == CALL_IDS["mass_quote"]:
+                # Note: We're using individual limit orders now, but keeping this handler for backward compatibility
+                self.logger.error(f"Mass quote error (legacy handler): {error.get('message', '')}")
+                # Pass to order manager for handling
+                if hasattr(self, 'order_manager') and self.order_manager is not None:
+                    await self.order_manager.handle_order_error(error, cid)
+            elif cid >= 100:  # Order-related errors
                 await self.order_manager.handle_order_error(error, cid)
+            else:
+                # Generic API error
+                self.logger.error(f"API error for message {cid}: {error}")
                 
         except Exception as e:
             self.logger.error(f"Error handling error message: {str(e)}")
@@ -974,7 +807,16 @@ class AvellanedaQuoter:
             # Create ticker from price data if provided, otherwise use the stored ticker
             ticker = None
             if price_data:
-                ticker = Ticker(price_data)
+                # Make sure the price_data has the expected keys for Ticker
+                ticker_data = {
+                    "mark_price": price_data.get("mark_price", 0.0),
+                    "best_bid_price": price_data.get("best_bid_price", price_data.get("bid_price", 0.0)),
+                    "best_ask_price": price_data.get("best_ask_price", price_data.get("ask_price", 0.0)),
+                    "index": price_data.get("index_price", price_data.get("index", 0.0)),
+                    "mark_timestamp": price_data.get("timestamp", price_data.get("mark_timestamp", time.time())),
+                    "funding_rate": price_data.get("funding_rate", 0.0)
+                }
+                ticker = Ticker(ticker_data)
             else:
                 ticker = self.ticker
                 
@@ -990,6 +832,13 @@ class AvellanedaQuoter:
                 if time_since_last < min_update_interval:
                     self.logger.info(f"Skipping quote update - too soon since last update ({time_since_last:.1f}s < {min_update_interval:.1f}s)")
                     return
+                    
+            # Check if we have any active orders in the order manager
+            active_orders_count = len(self.order_manager.active_bids) + len(self.order_manager.active_asks)
+            
+            # Reset current_quotes if no active orders exist in order manager
+            if active_orders_count == 0:
+                self.current_quotes = ([], [])
                     
             # Check if active quotes need updating
             if len(self.current_quotes[0]) > 0 or len(self.current_quotes[1]) > 0:
@@ -1010,12 +859,77 @@ class AvellanedaQuoter:
             # Validate quotes before sending
             bid_quotes, ask_quotes = self.market_maker.validate_quotes(bid_quotes, ask_quotes)
             
+            # Extra validation after market maker validation
+            if self.tick_size > 0:
+                # Check and align all quote prices to tick size
+                aligned_bid_quotes = []
+                for quote in bid_quotes:
+                    aligned_price = round(quote.price / self.tick_size) * self.tick_size
+                    if aligned_price != quote.price:
+                        # Create a new quote with the aligned price
+                        aligned_quote = Quote(
+                            price=aligned_price,
+                            amount=quote.amount,
+                            instrument=quote.instrument,
+                            side=quote.side,
+                            timestamp=quote.timestamp
+                        )
+                        aligned_bid_quotes.append(aligned_quote)
+                        self.logger.debug(f"Aligned bid price from {quote.price} to {aligned_price}")
+                    else:
+                        aligned_bid_quotes.append(quote)
+                
+                aligned_ask_quotes = []
+                for quote in ask_quotes:
+                    aligned_price = round(quote.price / self.tick_size) * self.tick_size
+                    if aligned_price != quote.price:
+                        # Create a new quote with the aligned price
+                        aligned_quote = Quote(
+                            price=aligned_price,
+                            amount=quote.amount,
+                            instrument=quote.instrument,
+                            side=quote.side,
+                            timestamp=quote.timestamp
+                        )
+                        aligned_ask_quotes.append(aligned_quote)
+                        self.logger.debug(f"Aligned ask price from {quote.price} to {aligned_price}")
+                    else:
+                        aligned_ask_quotes.append(quote)
+                
+                # Replace with aligned quotes
+                bid_quotes = aligned_bid_quotes
+                ask_quotes = aligned_ask_quotes
+            
+            # Verify quote prices are valid
+            valid_bid_quotes = []
+            for quote in bid_quotes:
+                if quote.price <= 0 or quote.amount <= 0:
+                    self.logger.warning(f"Invalid bid quote: price={quote.price}, amount={quote.amount}")
+                    continue
+                valid_bid_quotes.append(quote)
+            
+            valid_ask_quotes = []
+            for quote in ask_quotes:
+                if quote.price <= 0 or quote.amount <= 0:
+                    self.logger.warning(f"Invalid ask quote: price={quote.price}, amount={quote.amount}")
+                    continue
+                valid_ask_quotes.append(quote)
+            
+            # Check if we have any valid quotes left
+            if not valid_bid_quotes and not valid_ask_quotes:
+                self.logger.error("No valid quotes after price alignment, skipping update")
+                return
+                
+            # Replace with validated quotes
+            bid_quotes = valid_bid_quotes
+            ask_quotes = valid_ask_quotes
+            
             # Always update quotes if it's been too long since the last update
             max_update_interval = 60.0  # Force update every 60 seconds 
             if hasattr(self, 'last_quote_update_time') and current_time - self.last_quote_update_time >= max_update_interval:
                 self.logger.info(f"Forcing quote update - {current_time - self.last_quote_update_time:.1f}s elapsed since last update")
                 # Cancel existing quotes
-                await self.cancel_all_quotes()
+                await self.cancel_quotes()
                 # Brief pause to allow cancellations to process
                 await asyncio.sleep(0.5)
                 # Place new quotes
@@ -1025,6 +939,15 @@ class AvellanedaQuoter:
                 self.last_quote_update_time = current_time
                 return
             
+            # Check if order manager has active quotes before comparing prices
+            if active_orders_count == 0:
+                # No active orders in the order manager, force update
+                self.logger.info("No active orders in order manager - forcing quote placement")
+                await self.place_quotes(bid_quotes, ask_quotes)
+                self.last_quote_time = current_time
+                self.last_quote_update_time = current_time
+                return
+                
             # Check if cancellation is really needed
             should_cancel = True
             
@@ -1066,7 +989,7 @@ class AvellanedaQuoter:
             # Cancel existing quotes if needed
             if should_cancel:
                 self.logger.info("Cancelling existing quotes...")
-                await self.cancel_all_quotes()
+                await self.cancel_quotes()
                 
                 # Brief pause to allow cancellations to process
                 await asyncio.sleep(0.5)
@@ -1079,28 +1002,51 @@ class AvellanedaQuoter:
             self.last_quote_time = current_time
             self.last_quote_update_time = current_time
                 
+            # Record successful quote placement
+            self.last_quote_time = time.time()
+            
+            # Log quote summary
+            if bid_quotes or ask_quotes:
+                bid_count = len(bid_quotes)
+                ask_count = len(ask_quotes)
+                self.logger.info(f"Sending limit orders: {bid_count} bids, {ask_count} asks")
+                self.logger.info(f"Limit orders sent: {bid_count} bids, {ask_count} asks")
+                
+            # Verify order counts after placement to detect any potential tracking issues
+            await asyncio.sleep(0.5)  # Brief pause to allow orders to be processed
+            current_active_bids = len(self.order_manager.active_bids)
+            current_active_asks = len(self.order_manager.active_asks)
+            max_levels = TRADING_CONFIG["quoting"].get("levels", 6)
+            
+            if current_active_bids > max_levels or current_active_asks > max_levels:
+                self.logger.error(f"Order tracking issue detected! Active orders exceed max levels: {current_active_bids} bids, {current_active_asks} asks (max: {max_levels})")
+                self.logger.info(f"Initiating emergency cancellation to restore order consistency")
+                await self.cancel_quotes("Order tracking issue detected")
+                
         except Exception as e:
             self.logger.error(f"Error updating quotes: {str(e)}", exc_info=True)
             # On error, try to cancel all quotes for safety
             try:
-                await self.cancel_all_quotes()
+                await self.cancel_quotes()
             except Exception as cancel_error:
-                self.logger.error(f"Error cancelling quotes after update error: {str(cancel_error)}")
+                self.logger.error(f"Error cancelling quotes after error: {str(cancel_error)}")
 
-    async def cancel_all_quotes(self):
-        """Cancel all open quotes"""
-        try:
-            # Only cancel if we actually have quotes
-            order_count = len(self.order_manager.active_bids) + len(self.order_manager.active_asks)
-            if order_count == 0:
-                self.logger.info("No quotes to cancel")
-                self.current_quotes = ([], [])
-                return
+    async def cancel_quotes(self, reason="Unknown"):
+        """Cancel all outstanding quotes"""
+        if not self.quoting_enabled:
+            self.logger.debug("Quoting disabled, not cancelling quotes")
+            return
             
-            self.logger.info(f"Cancelling {order_count} quotes...")
+        try:
+            # Cancel all orders for our instrument
+            self.logger.info(f"Cancelling all orders for {self.perp_name} - reason: {reason}")
+            
+            # Use the order_manager's cancel_all_orders method without parameters
             await self.order_manager.cancel_all_orders()
+            
+            # Clear current quotes
             self.current_quotes = ([], [])
-            self.logger.info("All quotes cancelled")
+            
         except Exception as e:
             self.logger.error(f"Error cancelling quotes: {str(e)}", exc_info=True)
 
@@ -1192,103 +1138,198 @@ class AvellanedaQuoter:
             except Exception as e:
                 self.logger.error(f"Error in heartbeat task: {str(e)}")
                 await asyncio.sleep(5)  # Brief pause after error
-
-    async def place_quotes(self, bid_quotes: List[Quote], ask_quotes: List[Quote]):
-        """
-        Place new quotes on the exchange
-        
-        Args:
-            bid_quotes: List of bid quotes to place
-            ask_quotes: List of ask quotes to place
-        """
+                
+    async def send_heartbeat(self):
+        """Send a heartbeat message to keep the connection alive"""
         try:
-            start_time = time.time()
+            # Check if connection is alive before attempting heartbeat
+            if hasattr(self.thalex, 'connected') and callable(self.thalex.connected) and not self.thalex.connected():
+                self.logger.warning("Connection lost before heartbeat, attempting to reconnect...")
+                try:
+                    await self.thalex.connect()
+                    self.logger.info("Successfully reconnected in heartbeat task")
+                except Exception as reconnect_err:
+                    self.logger.error(f"Failed to reconnect in heartbeat task: {str(reconnect_err)}")
+                    return False
             
-            # Enforce maximum number of quotes per side
-            max_quotes_per_side = 3  # Increased from 2 to 3, but still conservative
+            # Try different methods based on what's available in the client
+            heartbeat_sent = False
+            err_msg = None
             
-            if len(bid_quotes) > max_quotes_per_side:
-                self.logger.warning(f"Limiting bid quotes from {len(bid_quotes)} to {max_quotes_per_side}")
-                bid_quotes = bid_quotes[:max_quotes_per_side]
-                
-            if len(ask_quotes) > max_quotes_per_side:
-                self.logger.warning(f"Limiting ask quotes from {len(ask_quotes)} to {max_quotes_per_side}")
-                ask_quotes = ask_quotes[:max_quotes_per_side]
-                
-            # Log quote placement plan
-            self.logger.info(f"Placing {len(bid_quotes)} bids and {len(ask_quotes)} asks")
+            # Method 1: Try to use the ping method if available
+            if not heartbeat_sent and hasattr(self.thalex, 'ping') and callable(self.thalex.ping):
+                try:
+                    await self.thalex.ping(id=CALL_IDS.get("heartbeat", 1010))
+                    heartbeat_sent = True
+                except Exception as e:
+                    err_msg = f"Ping method failed: {str(e)}"
             
-            # Store the new quotes for later reference
-            self.current_quotes = (bid_quotes, ask_quotes)
+            # Method 2: Try to use the _send method with public/ping
+            if not heartbeat_sent and hasattr(self.thalex, '_send') and callable(self.thalex._send):
+                try:
+                    await self.thalex._send("public/ping", id=CALL_IDS.get("heartbeat", 1010))
+                    heartbeat_sent = True
+                except Exception as e:
+                    if err_msg:
+                        err_msg += f"; _send method failed: {str(e)}"
+                    else:
+                        err_msg = f"_send method failed: {str(e)}"
             
-            # Increased delay between quote placements (30% slower)
-            quote_delay = 0.5  # Increased from 0.2 to 0.5 seconds
+            # Method 3: Check if ws attribute exists and try to send a ping frame directly
+            if not heartbeat_sent and hasattr(self.thalex, 'ws') and self.thalex.ws:
+                try:
+                    # Send a WebSocket ping frame
+                    pong_waiter = await self.thalex.ws.ping()
+                    await asyncio.wait_for(pong_waiter, timeout=5.0)
+                    heartbeat_sent = True
+                except Exception as e:
+                    if err_msg:
+                        err_msg += f"; WebSocket ping failed: {str(e)}"
+                    else:
+                        err_msg = f"WebSocket ping failed: {str(e)}"
             
-            # Place quotes in balanced pairs to maintain market presence
-            new_bids = []
-            new_asks = []
-            
-            max_pairs = max(len(bid_quotes), len(ask_quotes))
-            for i in range(max_pairs):
-                # Check rate limit before each pair
-                if not await self.check_rate_limit(priority="high"):
-                    self.logger.warning("Rate limit reached - pausing quote placement")
-                    await asyncio.sleep(1.0)  # Added pause when hitting rate limit
-                    if not await self.check_rate_limit(priority="high"):
-                        break
-                    
-                # Place bid if available
-                if i < len(bid_quotes):
-                    try:
-                        order_id = await self.order_manager.place_order(
-                            instrument=self.perp_name,
-                            direction="buy",
-                            price=bid_quotes[i].price,
-                            amount=bid_quotes[i].amount,
-                            label=MARKET_CONFIG["label"]
-                        )
-                        if order_id:
-                            new_bids.append(order_id)
-                            self.logger.debug(f"Placed bid: {bid_quotes[i].amount:.4f} @ {bid_quotes[i].price:.2f}")
-                    except Exception as e:
-                        self.logger.error(f"Error placing bid quote: {str(e)}")
-                
-                await asyncio.sleep(quote_delay)  # Increased delay between quotes
-                
-                # Check rate limit again before ask
-                if not await self.check_rate_limit(priority="high"):
-                    self.logger.warning("Rate limit reached after bid - pausing")
-                    await asyncio.sleep(1.0)
-                    if not await self.check_rate_limit(priority="high"):
-                        break
-                    
-                # Place ask if available
-                if i < len(ask_quotes):
-                    try:
-                        order_id = await self.order_manager.place_order(
-                            instrument=self.perp_name,
-                            direction="sell",
-                            price=ask_quotes[i].price,
-                            amount=ask_quotes[i].amount,
-                            label=MARKET_CONFIG["label"]
-                        )
-                        if order_id:
-                            new_asks.append(order_id)
-                            self.logger.debug(f"Placed ask: {ask_quotes[i].amount:.4f} @ {ask_quotes[i].price:.2f}")
-                    except Exception as e:
-                        self.logger.error(f"Error placing ask quote: {str(e)}")
-                
-                await asyncio.sleep(quote_delay)  # Increased delay between pairs
-                    
-            # Log placement results
-            elapsed = time.time() - start_time
-            self.logger.info(
-                f"Quote placement completed in {elapsed:.2f}s. Placed {len(new_bids)}/{len(bid_quotes)} bids and "
-                f"{len(new_asks)}/{len(ask_quotes)} asks"
-            )
+            if heartbeat_sent:
+                self.last_heartbeat = time.time()
+                self.logger.debug("Heartbeat sent successfully")
+                return True
+            else:
+                self.logger.warning(f"All heartbeat methods failed: {err_msg}")
+                return False
                 
         except Exception as e:
+            self.logger.warning(f"Failed to send heartbeat: {str(e)}")
+            return False
+
+    async def place_quotes(self, bid_quotes: List[Quote], ask_quotes: List[Quote]):
+        """Place quotes using individual limit orders instead of mass_quote API
+        
+        This method deliberately uses individual limit orders rather than mass quotes
+        to avoid dependency on market maker protection configuration.
+        """
+        if not self.quoting_enabled:
+            self.logger.debug("Quoting disabled, not placing quotes")
+            return
+        
+        if self.cooldown_active and time.time() < self.cooldown_until:
+            self.logger.debug("Cooldown active, not placing quotes")
+            return
+            
+        try:
+            # Enforce max order levels from config
+            max_levels = TRADING_CONFIG["quoting"].get("levels", 6)
+            if len(bid_quotes) > max_levels:
+                self.logger.warning(f"Limiting bid quotes to configured max levels: {max_levels}")
+                bid_quotes = bid_quotes[:max_levels]
+            if len(ask_quotes) > max_levels:
+                self.logger.warning(f"Limiting ask quotes to configured max levels: {max_levels}")
+                ask_quotes = ask_quotes[:max_levels]
+            
+            # Check existing orders to avoid exceeding limits
+            active_bids_count = len(self.order_manager.active_bids)
+            active_asks_count = len(self.order_manager.active_asks)
+            
+            # If we already have orders, cancel them all first to ensure clean state
+            if active_bids_count > 0 or active_asks_count > 0:
+                self.logger.warning(f"Found existing orders before placing quotes: {active_bids_count} bids, {active_asks_count} asks")
+                self.logger.warning(f"Cancelling all existing orders to ensure clean order book")
+                await self.cancel_quotes("Refreshing order book")
+                # Brief pause to allow cancellations to process
+                await asyncio.sleep(0.5)
+                
+                # Verify orders were cancelled
+                if len(self.order_manager.active_bids) > 0 or len(self.order_manager.active_asks) > 0:
+                    self.logger.error(f"Failed to cancel all orders. Still have {len(self.order_manager.active_bids)} bids and {len(self.order_manager.active_asks)} asks")
+                    # Force another cancellation
+                    await self.cancel_quotes("Emergency cancellation")
+                    await asyncio.sleep(1.0)  # Longer wait time
+            
+            # Store current quotes before sending to properly track what was sent
+            self.current_quotes = (bid_quotes, ask_quotes)
+            
+            # Reset tracking variables to ensure clean state
+            placed_bids = 0
+            placed_asks = 0
+            
+            # Place bid quotes as individual limit orders
+            for quote in bid_quotes:
+                if quote.price <= 0 or quote.amount <= 0:
+                    self.logger.warning(f"Invalid bid quote detected: {quote.price}@{quote.amount} - skipping")
+                    continue
+                
+                # Check if we reached the max limit for this side
+                if placed_bids >= max_levels:
+                    self.logger.warning(f"Maximum bid levels ({max_levels}) reached - skipping remaining bids")
+                    break
+                    
+                # Use the order manager to place a limit order
+                try:
+                    await self.order_manager.place_order(
+                        instrument=self.perp_name,
+                        direction="buy",
+                        price=quote.price,
+                        amount=quote.amount,
+                        label="AvellanedaQuoter",
+                        post_only=True
+                    )
+                    self.logger.info(f"Placed bid: {quote.amount:.3f}@{quote.price:.2f}")
+                    placed_bids += 1
+                except Exception as e:
+                    self.logger.error(f"Error placing bid: {str(e)}")
+            
+            # Place ask quotes as individual limit orders
+            for quote in ask_quotes:
+                if quote.price <= 0 or quote.amount <= 0:
+                    self.logger.warning(f"Invalid ask quote detected: {quote.price}@{quote.amount} - skipping")
+                    continue
+                
+                # Check if we reached the max limit for this side
+                if placed_asks >= max_levels:
+                    self.logger.warning(f"Maximum ask levels ({max_levels}) reached - skipping remaining asks")
+                    break
+                    
+                # Use the order manager to place a limit order
+                try:
+                    await self.order_manager.place_order(
+                        instrument=self.perp_name,
+                        direction="sell",
+                        price=quote.price,
+                        amount=quote.amount,
+                        label="AvellanedaQuoter",
+                        post_only=True
+                    )
+                    self.logger.info(f"Placed ask: {quote.amount:.3f}@{quote.price:.2f}")
+                    placed_asks += 1
+                except Exception as e:
+                    self.logger.error(f"Error placing ask: {str(e)}")
+            
+            # Record successful quote placement
+            self.last_quote_time = time.time()
+            
+            # Log quote summary
+            self.logger.info(f"Sending limit orders: {placed_bids} bids, {placed_asks} asks")
+            self.logger.info(f"Limit orders sent: {placed_bids} bids, {placed_asks} asks")
+                
+            # Verify order counts after placement to detect any potential tracking issues
+            await asyncio.sleep(0.5)  # Brief pause to allow orders to be processed
+            current_active_bids = len(self.order_manager.active_bids)
+            current_active_asks = len(self.order_manager.active_asks)
+            
+            if current_active_bids > max_levels or current_active_asks > max_levels:
+                self.logger.error(f"Order tracking issue detected! Active orders exceed max levels: {current_active_bids} bids, {current_active_asks} asks (max: {max_levels})")
+                self.logger.info(f"Initiating emergency cancellation to restore order consistency")
+                await self.cancel_quotes("Order tracking issue detected")
+            
+        except Exception as e:
             self.logger.error(f"Error placing quotes: {str(e)}", exc_info=True)
+            
+            # If rate limit exceeded, implement cooldown
+            if "rate limit" in str(e).lower() or "circuit breaker" in str(e).lower():
+                self.cooldown_active = True
+                self.cooldown_until = time.time() + 5  # 5 second cooldown
+                self.logger.warning(f"Rate limit exceeded, enabling cooldown until {self.cooldown_until}")
+            
+            # Clear current quotes on error to prevent stale state
+            self.current_quotes = ([], [])
 
     def get_market_conditions(self) -> Dict:
         """Get the current market conditions from market data buffer"""

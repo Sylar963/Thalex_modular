@@ -8,7 +8,7 @@ from ..config.market_config import (
     TRADING_CONFIG
 )
 from ..models.data_models import Ticker, Order
-from ..logging import LoggerFactory
+from ..thalex_logging import LoggerFactory
 
 class RiskManager:
     def __init__(self) -> None:

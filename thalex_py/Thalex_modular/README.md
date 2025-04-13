@@ -217,6 +217,51 @@ The market maker includes several optimizations:
 - Caching of market conditions and calculations
 - Rate limit awareness with adaptive backoff
 
+## Performance Optimizations
+
+The system has been optimized for high-frequency trading with the following enhancements:
+
+### Network Layer Optimizations
+
+#### Message Processing Efficiency
+- **Message Batching**: Implemented request batching to reduce the number of API calls, especially for quote updates
+- **Streaming JSON Parsing**: Using `orjson` for faster parsing of incoming market data
+- **Fast Serialization**: Using `ujson` for more efficient message creation
+
+#### Connection Management
+- **Automatic Reconnection**: Added exponential backoff logic for reliable reconnection
+- **Connection Monitoring**: Improved heartbeat system to detect and recover from stalled connections
+- **Circuit Breaker Pattern**: Implemented circuit breaker to handle exchange rate limits gracefully
+
+#### Memory Optimizations
+- **Object Pooling**: Pre-allocation of frequently used objects like Quote and SideQuote
+- **Efficient Data Structures**: Using NumPy arrays for price history and metrics instead of lists
+- **Memory Footprint Reduction**: Added `__slots__` to data classes to reduce memory overhead
+
+#### Latency Reduction
+- **Request Prioritization**: Order operations are given higher priority than market data operations
+- **Separate Processing Paths**: Critical order operations bypass batching for lower latency
+- **Speculative Prefetching**: Added caching for instrument data to reduce lookup times
+
+### Usage
+
+The optimized network layer is enabled by default. To take full advantage of these optimizations:
+
+1. Initialize the client with:
+```python
+await thalex_client.initialize()
+```
+
+2. For high-throughput quote management, use the mass_quote API:
+```python
+await thalex.mass_quote(quotes=quotes, label="MyQuoter", post_only=True)
+```
+
+3. To manage rate limits, configure the client:
+```python
+thalex.rate_limit = 60  # Requests per minute
+```
+
 ## Contributing
 
 Contributions are welcome! Please follow these steps:

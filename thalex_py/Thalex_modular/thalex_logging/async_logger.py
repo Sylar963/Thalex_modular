@@ -123,11 +123,11 @@ class AsyncLogger:
                 # Update metrics
                 now = time.time()
                 self.flush_count += 1
-                messages_per_second = len(messages) / (now - self.last_flush_time)
+                messages_per_second = len(messages) / (now - self.last_flush_time) if messages else 0
                 self.last_flush_time = now
                 
                 # Log performance metrics occasionally
-                if self.flush_count % 100 == 0:
+                if self.flush_count % 100 == 0 and messages:
                     self.logger.debug(
                         f"Logging metrics - Messages/sec: {messages_per_second:.1f}, "
                         f"Total messages: {self.message_count}, "

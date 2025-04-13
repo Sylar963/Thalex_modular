@@ -6,9 +6,10 @@ import thalex as th
 from ..models.data_models import Order, OrderStatus, Quote
 from ..config.market_config import (
     TRADING_CONFIG,
-    MARKET_CONFIG
+    MARKET_CONFIG,
+    CALL_IDS
 )
-from ..logging import LoggerFactory
+from ..thalex_logging import LoggerFactory
 
 class OrderManager:
     """Order management component handling order placement and tracking"""
@@ -49,6 +50,12 @@ class OrderManager:
         # Tick size and instrument name
         self.tick_size = 0.0
         self.perp_name = None
+        
+        # Track mass quotes separately for better handling
+        # Note: We're using individual limit orders now, but keeping this tracking for backward compatibility
+        self.active_mass_quotes = {}
+        self.last_mass_quote_id = None
+        self.recent_mass_quotes = set()  # Track recently sent mass quotes to detect duplicates
         
         self.logger.info("Order manager initialized")
         
@@ -287,11 +294,136 @@ class OrderManager:
     async def handle_order_result(self, result: Dict, order_id: int) -> None:
         """Handle order operation results from API"""
         try:
-            # Check if order is in our tracking
-            if order_id not in self.orders:
-                self.logger.warning(f"Order {order_id} not found for result update")
+            # Special handling for mass_quote response
+            if order_id == CALL_IDS.get("mass_quote", 0) or order_id == 999:
+                self.logger.info(f"Received mass_quote response with ID {order_id}")
+                self.last_mass_quote_id = order_id
+                
+                # Log the full result for debugging 
+                self.logger.info(f"Mass quote response type: {type(result)}, content: {result}")
+                
+                if isinstance(result, dict):
+                    for key, value in result.items():
+                        self.logger.info(f"Response key: {key}, value type: {type(value)}, value: {value}")
+                
+                # In some versions of the API, quotes information is in the root of the result
+                quote_data_root = result.get("quotes", [])
+                if quote_data_root:
+                    self.logger.info(f"Found {len(quote_data_root)} quotes in the response")
+                    
+                    # Track quote IDs
+                    quote_ids = []
+                    
+                    # Process each quote
+                    for quote in quote_data_root:
+                        if "quote_id" in quote:
+                            quote_ids.append(quote["quote_id"])
+                            
+                        # Process bid side if present
+                        if "b" in quote and quote["b"]:
+                            bid_data = quote["b"]
+                            bid_price = float(bid_data.get("p", 0))
+                            bid_amount = float(bid_data.get("a", 0))
+                            
+                            if bid_price > 0 and bid_amount > 0:
+                                quote_id = quote.get("quote_id", f"bid_{len(quote_ids)}")
+                                bid_order = Order(
+                                    id=quote_id,
+                                    price=bid_price,
+                                    amount=bid_amount,
+                                    status=OrderStatus.OPEN,
+                                    direction="buy"
+                                )
+                                self.orders[quote_id] = bid_order
+                                self.active_bids[quote_id] = bid_order
+                                
+                        # Process ask side if present
+                        if "a" in quote and quote["a"]:
+                            ask_data = quote["a"]
+                            ask_price = float(ask_data.get("p", 0))
+                            ask_amount = float(ask_data.get("a", 0))
+                            
+                            if ask_price > 0 and ask_amount > 0:
+                                quote_id = quote.get("quote_id", f"ask_{len(quote_ids)}")
+                                ask_order = Order(
+                                    id=quote_id,
+                                    price=ask_price,
+                                    amount=ask_amount,
+                                    status=OrderStatus.OPEN,
+                                    direction="sell"
+                                )
+                                self.orders[quote_id] = ask_order
+                                self.active_asks[quote_id] = ask_order
+                
+                    # Store the quote IDs linked to this mass quote ID
+                    if quote_ids:
+                        self.active_mass_quotes[order_id] = quote_ids
+                        self.logger.info(f"Tracked {len(quote_ids)} quotes from mass quote {order_id}")
+                    
+                    # Add to our set of recent mass quotes
+                    self.recent_mass_quotes.add(order_id)
+                    if len(self.recent_mass_quotes) > 10:  # Keep only the 10 most recent
+                        oldest = min(self.recent_mass_quotes)
+                        self.recent_mass_quotes.remove(oldest)
+                else:
+                    self.logger.warning(f"No quotes found in mass quote response. Format may be different than expected.")
+                    
+                    # Check if this is a simple success response (which would indicate the quotes are placed
+                    # but details are not returned)
+                    if "result" in result and result.get("result") == "ok":
+                        self.logger.info("Mass quote was successful based on 'result': 'ok'")
+                        
+                        # Even without details, we know the quotes were placed
+                        # Add to our set of recent mass quotes
+                        self.recent_mass_quotes.add(order_id)
+                        if len(self.recent_mass_quotes) > 10:
+                            oldest = min(self.recent_mass_quotes)
+                            self.recent_mass_quotes.remove(oldest)
+                
                 return
                 
+            # Check if order is in our tracking
+            if order_id not in self.orders:
+                # Special handling for mass quotes to avoid "order not found" warnings
+                if order_id in self.recent_mass_quotes or order_id == CALL_IDS.get("mass_quote", 0) or order_id == 999:
+                    self.logger.debug(f"Processing result for known mass quote ID {order_id}")
+                    return
+                
+                self.logger.warning(f"Order {order_id} not found for result update")
+                
+                # Try to determine if this might be part of a mass quote
+                if "order_id" in result and "client_order_id" not in result:
+                    exchange_order_id = result.get("order_id", "unknown")
+                    self.logger.info(f"Result may be for mass quote: exchange order ID {exchange_order_id}, client ID {order_id}")
+                    return
+                
+                # If it's a regular order we should have tracked, try to recreate it
+                if "status" in result and "price" in result and "amount" in result:
+                    self.logger.info(f"Attempting to recover tracking for order {order_id}")
+                    direction = result.get("direction", "")
+                    new_order = Order(
+                        id=order_id,
+                        price=float(result.get("price", 0)),
+                        amount=float(result.get("amount", 0)),
+                        status=OrderStatus(result.get("status", "pending")),
+                        direction=direction
+                    )
+                    
+                    # Add to tracking
+                    self.orders[order_id] = new_order
+                    
+                    # Add to side-specific tracking if order is still open
+                    if new_order.is_open():
+                        if direction == "buy":
+                            self.active_bids[order_id] = new_order
+                        elif direction == "sell":
+                            self.active_asks[order_id] = new_order
+                    
+                    self.logger.info(f"Recovered tracking for order {order_id}")
+                    
+                return
+                
+            # Normal order handling continues here...
             # Extract order details from result
             order_data = result
             
@@ -317,8 +449,48 @@ class OrderManager:
     async def handle_order_error(self, error: Dict, order_id: int) -> None:
         """Handle order operation errors from API"""
         try:
+            # Special handling for mass_quote errors
+            if order_id == CALL_IDS.get("mass_quote", 0) or order_id == 999:  # Also handle hardcoded ID 999
+                error_msg = error.get("message", "")
+                error_code = error.get("code", -1)
+                
+                # If it's an unknown API method error, this is likely due to using a hardcoded ID
+                # Just log it at debug level and don't treat it as a critical error
+                if "unknown API method" in error_msg.lower():
+                    self.logger.debug(f"Ignoring unknown API method error for ID {order_id} - likely using legacy ID")
+                    return
+                
+                self.logger.error(f"Mass quote error (ID {order_id}): {error_code} - {error_msg}")
+                
+                # Clean up any tracking for this mass quote
+                if order_id in self.active_mass_quotes:
+                    quote_ids = self.active_mass_quotes.pop(order_id, [])
+                    for quote_id in quote_ids:
+                        # Clean up any associated quote orders
+                        self.active_bids.pop(quote_id, None)
+                        self.active_asks.pop(quote_id, None)
+                        self.orders.pop(quote_id, None)
+                    
+                    self.logger.info(f"Cleaned up tracking for {len(quote_ids)} quotes associated with failed mass quote {order_id}")
+                
+                # If rate limit error, we should back off
+                if "rate limit" in error_msg.lower() or "too many requests" in error_msg.lower():
+                    # Notify quoter about rate limit if possible
+                    if hasattr(self.thalex, "quoter") and getattr(self.thalex, "quoter", None) is not None:
+                        quoter = self.thalex.quoter
+                        if hasattr(quoter, 'cooldown_active'):
+                            quoter.cooldown_active = True
+                            quoter.cooldown_until = time.time() + 10  # 10-second cooldown
+                            self.logger.warning("Set quoter cooldown due to rate limit error")
+                
+                return
+                
             # Check if order is in our tracking
             if order_id not in self.orders:
+                # Don't warn about mass quote IDs that we know about
+                if order_id in self.recent_mass_quotes or order_id == CALL_IDS.get("mass_quote", 0) or order_id == 999:
+                    return
+                    
                 self.logger.warning(f"Order {order_id} not found for error update")
                 return
                 

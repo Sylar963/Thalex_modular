@@ -18,7 +18,7 @@ sys.path.insert(0, PROJECT_DIR)
 import thalex as th
 from thalex_py.Thalex_modular.config.market_config import BOT_CONFIG
 from thalex_py.Thalex_modular.avellaneda_quoter import AvellanedaQuoter
-from thalex_py.Thalex_modular.logging import LoggerFactory
+from thalex_py.Thalex_modular.thalex_logging import LoggerFactory
 
 # Global variables
 quoter = None

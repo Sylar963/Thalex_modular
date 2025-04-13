@@ -9,7 +9,7 @@ from datetime import datetime
 from ..config.market_config import TRADING_CONFIG, RISK_LIMITS, ORDERBOOK_CONFIG
 from ..models.data_models import Ticker, Quote
 from ..models.position_tracker import PositionTracker, Fill
-from ..logging import LoggerFactory
+from ..thalex_logging import LoggerFactory
 
 class AvellanedaMarketMaker:
     """Avellaneda-Stoikov market making strategy implementation"""
@@ -728,46 +728,81 @@ class AvellanedaMarketMaker:
             return True
 
     def validate_quotes(self, bid_quotes: List[Quote], ask_quotes: List[Quote]) -> Tuple[List[Quote], List[Quote]]:
-        """Validate quotes before sending to exchange"""
+        """Validate and filter quotes"""
+        valid_bid_quotes = []
+        valid_ask_quotes = []
+        
+        # Ensure minimum size is respected (Thalex minimum is 0.01)
+        min_quote_size = 0.01  # Default minimum quote size for Thalex
+        
+        # Get min_size from trading config if available
         try:
-            if not bid_quotes or not ask_quotes:
-                return bid_quotes, ask_quotes
+            if 'trading_strategy' in TRADING_CONFIG and 'avellaneda' in TRADING_CONFIG['trading_strategy']:
+                min_quote_size = max(0.01, TRADING_CONFIG['trading_strategy']['avellaneda'].get('base_size', 0.01))
+        except (KeyError, TypeError):
+            self.logger.warning("Could not get min_size from config, using default of 0.01")
+        
+        # Calculate maximum price deviation from ticker (3% by default)
+        max_deviation_pct = 0.03
+        
+        # Get the market price from the bid/ask quotes if available
+        market_price = 0
+        if len(bid_quotes) > 0 and len(ask_quotes) > 0:
+            # Use midpoint of best bid/ask as reference
+            market_price = (bid_quotes[0].price + ask_quotes[0].price) / 2
+        
+        # Calculate absolute max deviation
+        max_deviation = market_price * max_deviation_pct if market_price > 0 else 1000
+        
+        # Minimum and maximum valid prices
+        min_valid_price = market_price * (1 - max_deviation_pct) if market_price > 0 else 1
+        max_valid_price = market_price * (1 + max_deviation_pct) if market_price > 0 else float('inf')
+        
+        for quote in bid_quotes:
+            # Validate bid quote
+            if quote.price <= 0:
+                self.logger.warning(f"Invalid bid price: {quote.price}")
+                continue
                 
-            # Check bid-ask spread
-            best_bid = bid_quotes[0].price
-            best_ask = ask_quotes[0].price
+            if quote.amount < min_quote_size:
+                self.logger.debug(f"Increasing bid size from {quote.amount} to minimum {min_quote_size}")
+                quote.amount = min_quote_size
+                
+            # Ensure price is not too far from market
+            if market_price > 0 and (quote.price < min_valid_price or quote.price > market_price):
+                # For bids, price should be below market price but not too far
+                if quote.price > market_price:
+                    self.logger.warning(f"Bid price {quote.price} above market {market_price}, adjusting")
+                    quote.price = market_price - (self.tick_size * 2)  # 2 ticks below market
+                elif quote.price < min_valid_price:
+                    self.logger.warning(f"Bid price {quote.price} too far from market {market_price}, adjusting")
+                    quote.price = min_valid_price
             
-            if best_bid >= best_ask:
-                self.logger.warning(f"Invalid spread detected: bid {best_bid} >= ask {best_ask}")
-                
-                # Fix by adjusting to minimum spread
-                mid_price = (best_bid + best_ask) / 2
-                min_spread_ticks = max(3, ORDERBOOK_CONFIG["min_spread"])
-                half_min_spread = (min_spread_ticks * self.tick_size) / 2
-                
-                new_bid = self.round_to_tick(mid_price - half_min_spread)
-                new_ask = self.round_to_tick(mid_price + half_min_spread)
-                
-                # Update quotes
-                for quote in bid_quotes:
-                    quote.price = new_bid
-                
-                for quote in ask_quotes:
-                    quote.price = new_ask
-                
-                self.logger.info(f"Fixed quotes: new bid={new_bid:.2f}, new ask={new_ask:.2f}")
+            valid_bid_quotes.append(quote)
             
-            # Apply risk limits to sizes
-            max_quote_size = RISK_LIMITS.get("max_quote_size", 1.0)
-            for quote in bid_quotes + ask_quotes:
-                if quote.amount > max_quote_size:
-                    quote.amount = max_quote_size
+        for quote in ask_quotes:
+            # Validate ask quote
+            if quote.price <= 0:
+                self.logger.warning(f"Invalid ask price: {quote.price}")
+                continue
+                
+            if quote.amount < min_quote_size:
+                self.logger.debug(f"Increasing ask size from {quote.amount} to minimum {min_quote_size}")
+                quote.amount = min_quote_size
+                
+            # Ensure price is not too far from market
+            if market_price > 0 and (quote.price > max_valid_price or quote.price < market_price):
+                # For asks, price should be above market price but not too far
+                if quote.price < market_price:
+                    self.logger.warning(f"Ask price {quote.price} below market {market_price}, adjusting")
+                    quote.price = market_price + (self.tick_size * 2)  # 2 ticks above market
+                elif quote.price > max_valid_price:
+                    self.logger.warning(f"Ask price {quote.price} too far from market {market_price}, adjusting")
+                    quote.price = max_valid_price
             
-            return bid_quotes, ask_quotes
+            valid_ask_quotes.append(quote)
             
-        except Exception as e:
-            self.logger.error(f"Error validating quotes: {str(e)}")
-            return [], []
+        return valid_bid_quotes, valid_ask_quotes
 
     def round_to_tick(self, value: float) -> float:
         """Round price to nearest tick size"""

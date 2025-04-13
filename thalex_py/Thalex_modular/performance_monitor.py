@@ -6,8 +6,8 @@ from datetime import datetime
 from typing import Dict, List, Optional, Any
 import json
 import random
-
-from .logging import LoggerFactory
+import numpy as np
+from .thalex_logging import LoggerFactory
 
 class PerformanceMonitor:
     """

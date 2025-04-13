@@ -1,51 +1,62 @@
-# Intro
+# Thalex Python Client
 
-This is a free to use python exchange connector library for [Thalex](https://www.thalex.com).
+This is a Python client library for interacting with the [Thalex](https://www.thalex.com) derivatives exchange API.
 
 It is provided free of charge, as is, with no warranties and no recommendations – see MIT license.
-It is not meant to be an advisory tool, nor an inducement, but to lower the development learning curve for users.
 
-See also the [api documentation](https://www.thalex.com/docs/).
+See also the [API documentation](https://www.thalex.com/docs/).
 
-thalex.py has a function for every websocket endpoint with typehints and a recieve function 
-that returns the messages from the exchange one by one.
+## Installation
 
-# How to install
-
-The easiest is just
-```
+```bash
 pip install thalex
 ```
 
-Alternatively, if you want the examples as well, you can
-```
+Alternatively, if you want the examples as well:
+```bash
 git clone https://github.com/thalextech/thalex_py.git
 cd thalex_py
 pip install -e ./
 ```
 
-# Examples
+## Usage
 
-There are some examples on how you could use this library in the examples folder.
+The client provides a function for every WebSocket endpoint with type hints and a receive function 
+that returns messages from the exchange one by one.
 
-Keep in mind that the examples are not meant to be financial advice,
-they just illustrate what an implementation of a trading bot could look like.
+```python
+import thalex as th
+from thalex import Network
 
-If you want to run the examples, you have to rename/copy _keys.py to keys.py, 
-create api keys on thalex ui and put them in keys.py.
+# Initialize client
+client = th.Thalex(network=Network.TEST)  # Use Network.PROD for production
 
-# How to run bots 24/7 in the cloud
+# Connect to WebSocket
+await client.connect()
+
+# Get instruments
+await client.instruments(id=1)
+response = await client.receive()
+```
+
+## Examples
+
+There are examples in the `examples` folder showing how to use this library.
+
+If you want to run the examples, rename/copy `_keys.py` to `keys.py`, 
+create API keys in the Thalex UI and add them to `keys.py`.
+
+## Cloud Deployment
 
 See [this guide](https://thalex.com/blog/how-to-run-a-thalex-bot-on-aws) 
-about how you can get a bot up and running in the cloud.
+about how you can deploy a trading bot in the cloud.
 
-# NFA, your warranty is void
+## Disclaimer
 
-Feel free to use this library however you want, just remember that nothing is financial advice here and
-nothing comes with warranty.
+This library is provided as-is with no warranty. It is not financial advice.
 
-# Issues
+## Support
 
 If you spot any errors/bugs please report or create a pull request.
 
-You can also reach out on thalex_py@thalex.com
+You can also reach out at thalex_py@thalex.com

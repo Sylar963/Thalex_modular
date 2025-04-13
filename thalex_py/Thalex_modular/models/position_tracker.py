@@ -1,9 +1,9 @@
 import time
 import threading
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, NamedTuple
 from datetime import datetime
 
-from ..logging import LoggerFactory
+from ..thalex_logging import LoggerFactory
 
 class Fill:
     """
