@@ -24,6 +24,23 @@ from thalex_py.Thalex_modular.thalex_logging import LoggerFactory
 quoter = None
 shutdown_event = asyncio.Event()
 
+# Ensure all required log directories exist
+def create_log_directories():
+    """Create all required log directories"""
+    # Base logs directory
+    os.makedirs("logs", exist_ok=True)
+    
+    # Create subdirectories based on the LoggerFactory structure
+    subdirs = [
+        "market", "orders", "risk", "hedge", 
+        "performance", "exchange", "positions"
+    ]
+    for subdir in subdirs:
+        os.makedirs(os.path.join("logs", subdir), exist_ok=True)
+    
+    # Also create metrics directory
+    os.makedirs("metrics", exist_ok=True)
+
 async def shutdown():
     """Gracefully shut down the application"""
     print("Shutting down...")
@@ -44,8 +61,8 @@ async def main():
     """Main entry point"""
     global quoter
     
-    # Create a directory for logs
-    os.makedirs("logs", exist_ok=True)
+    # Create all required log directories
+    create_log_directories()
     
     # Initialize Thalex client
     network = BOT_CONFIG["market"]["network"]

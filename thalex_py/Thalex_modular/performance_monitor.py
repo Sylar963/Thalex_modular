@@ -34,7 +34,7 @@ class PerformanceMonitor:
         # Initialize logger
         self.logger = LoggerFactory.configure_component_logger(
             "performance_monitor",
-            log_file=os.path.join(output_dir, "performance.log"),
+            log_file="performance.log",  # Now uses centralized logging structure
             high_frequency=False
         )
         
@@ -111,9 +111,6 @@ class PerformanceMonitor:
         self.logger.info("Starting performance recording task")
         
         try:
-            # Create output directory if it doesn't exist
-            os.makedirs(self.output_dir, exist_ok=True)
-            
             # Start continuous recording
             while True:
                 try:

@@ -113,16 +113,16 @@ BOT_CONFIG = {
     "hedging": {
         "enabled": True,  # Whether to enable cross-asset hedging
         "strategy": "notional",  # Hedging strategy (notional or delta_neutral)
-        "config_path": None,  # Custom config file path (optional)
+        "config_path": "thalex_py/Thalex_modular/config/hedge/hedge_config.json",  # Custom config file path
         
         # Asset correlation pairs
         "pairs": {
-            "BTC-PERP": {
-                "hedge_assets": ["ETH-PERP"],
+            "BTC-PERPETUAL": {
+                "hedge_assets": ["ETH-PERPETUAL"],
                 "correlation_factors": [0.85]
             },
-            "ETH-PERP": {
-                "hedge_assets": ["BTC-PERP"],
+            "ETH-PERPETUAL": {
+                "hedge_assets": ["BTC-PERPETUAL"],
                 "correlation_factors": [1.18]
             }
         },

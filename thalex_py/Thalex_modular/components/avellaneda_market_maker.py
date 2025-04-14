@@ -15,13 +15,16 @@ from ..ringbuffer.volume_candle_buffer import VolumeBasedCandleBuffer
 class AvellanedaMarketMaker:
     """Avellaneda-Stoikov market making strategy implementation"""
     
-    def __init__(self):
+    def __init__(self, exchange_client=None):
         # Initialize logger
         self.logger = LoggerFactory.configure_component_logger(
             "avellaneda_market_maker",
             log_file="market_maker.log",
             high_frequency=True
         )
+        
+        # Store the exchange client
+        self.exchange_client = exchange_client
         
         # Trading parameters
         self.gamma = TRADING_CONFIG["avellaneda"]["gamma"]  # Risk aversion
@@ -124,9 +127,10 @@ class AvellanedaMarketMaker:
         self.use_hedging = TRADING_CONFIG.get("hedging", {}).get("enabled", False)
         if self.use_hedging:
             from .hedge import create_hedge_manager
-            # Create hedge manager with default settings
+            # Create hedge manager with default settings and the exchange client
             self.hedge_manager = create_hedge_manager(
                 config_path=TRADING_CONFIG.get("hedging", {}).get("config_path"),
+                exchange_client=self.exchange_client,
                 strategy_type=TRADING_CONFIG.get("hedging", {}).get("strategy", "notional")
             )
             # Start the hedge manager's background thread for rebalancing
@@ -978,8 +982,14 @@ class AvellanedaMarketMaker:
                     self.is_buy = is_buy
                     self.fill_id = order_id
             
+            # Make sure we have a valid instrument
+            if not self.instrument or self.instrument == "unknown":
+                self.logger.warning(f"No instrument set for fill, using BTC-PERPETUAL as default")
+                instrument = "BTC-PERPETUAL"
+            else:
+                instrument = self.instrument
+                
             # Create the fill object
-            instrument = self.instrument or "unknown"
             fill = HedgeFill(
                 instrument=instrument,
                 price=fill_price,

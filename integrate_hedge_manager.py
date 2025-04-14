@@ -18,11 +18,12 @@ logger = logging.getLogger("hedge_integration")
 class TradingSystem:
     """Example trading system class that uses the hedge manager"""
     
-    def __init__(self, config_path=None):
+    def __init__(self, config_path=None, exchange_client=None):
         """Initialize the trading system with a hedge manager"""
         # Create the hedge manager
         self.hedge_manager = create_hedge_manager(
             config_path=config_path,
+            exchange_client=exchange_client,  # Pass the exchange client explicitly
             strategy_type="notional"  # Options: "notional" or "delta_neutral"
         )
         
@@ -128,13 +129,13 @@ def main():
     trading_system = TradingSystem()
     
     try:
-        # Set initial market prices
-        trading_system.update_market_data("BTC-PERP", 85500.0)
-        trading_system.update_market_data("ETH-PERP", 3200.0)
+        # Set initial market prices - use PERPETUAL naming consistently
+        trading_system.update_market_data("BTC-PERPETUAL", 85500.0)
+        trading_system.update_market_data("ETH-PERPETUAL", 3200.0)
         
         # Example 1: Process a fill (BTC long position)
         fill_data = {
-            "symbol": "BTC-PERP",
+            "symbol": "BTC-PERPETUAL",
             "price": 85500.0,
             "size": 1.0,
             "side": "buy",
@@ -160,8 +161,8 @@ def main():
         
         # Example 2: Price movement
         print("\nUpdating market prices...")
-        trading_system.update_market_data("BTC-PERP", 86000.0)
-        trading_system.update_market_data("ETH-PERP", 3180.0)
+        trading_system.update_market_data("BTC-PERPETUAL", 86000.0)
+        trading_system.update_market_data("ETH-PERPETUAL", 3180.0)
         
         # Calculate new PnL
         status = trading_system.get_portfolio_status()
@@ -170,7 +171,7 @@ def main():
         # Example 3: Close position
         print("\nClosing BTC position...")
         fill_data = {
-            "symbol": "BTC-PERP",
+            "symbol": "BTC-PERPETUAL",
             "price": 86000.0,
             "size": 1.0,
             "side": "sell",

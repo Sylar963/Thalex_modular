@@ -3,9 +3,10 @@ Configuration settings for the hedge manager and strategies.
 This file defines hedge pairs, correlation factors, and execution parameters.
 """
 
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Union, Any
 import json
 import os
+from dataclasses import dataclass, field
 
 # Default hedge configuration
 DEFAULT_HEDGE_CONFIG = {
@@ -46,6 +47,92 @@ DEFAULT_HEDGE_CONFIG = {
         "portfolio_delta_target": 0.0,  # Target portfolio delta (0 = neutral)
     }
 }
+
+@dataclass
+class HedgeConfig:
+    """Configuration for the hedging component"""
+    
+    # Exchange settings
+    exchange_name: str = "thalex"
+    exchange_api_key: Optional[str] = None
+    exchange_api_secret: Optional[str] = None
+    use_testnet: bool = True
+    
+    # Hedging parameters
+    hedge_ratio: float = 1.0  # Default 1:1 hedging
+    min_hedge_amount: float = 0.01  # Minimum amount to hedge
+    max_hedge_amount: Optional[float] = None  # Maximum amount to hedge (None for no limit)
+    
+    # Order parameters
+    default_order_type: str = "market"  # "market" or "limit"
+    slippage_tolerance: float = 0.05  # 5% price slippage tolerance for market orders
+    
+    # Symbols and mappings
+    hedge_symbols: List[str] = field(default_factory=list)  # List of symbols to hedge
+    symbol_mappings: Dict[str, str] = field(default_factory=dict)  # Map from source to hedge symbols
+    
+    # Advanced settings
+    rebalance_threshold: float = 0.1  # 10% threshold for rebalancing
+    hedge_interval: int = 60  # Seconds between hedge checks
+    retry_attempts: int = 3  # Number of retry attempts for failed orders
+    retry_delay: int = 5  # Seconds to wait between retries
+    
+    def __post_init__(self):
+        """Validate and process config after initialization"""
+        # Add validation logic if needed
+        pass
+    
+    def to_dict(self) -> Dict:
+        """Convert config to dictionary"""
+        return {
+            "exchange_name": self.exchange_name,
+            "exchange_api_key": self.exchange_api_key,  # Note: should be masked in logs
+            "exchange_api_secret": "***" if self.exchange_api_secret else None,  # Masked for security
+            "use_testnet": self.use_testnet,
+            "hedge_ratio": self.hedge_ratio,
+            "min_hedge_amount": self.min_hedge_amount,
+            "max_hedge_amount": self.max_hedge_amount,
+            "default_order_type": self.default_order_type,
+            "slippage_tolerance": self.slippage_tolerance,
+            "hedge_symbols": self.hedge_symbols,
+            "symbol_mappings": self.symbol_mappings,
+            "rebalance_threshold": self.rebalance_threshold,
+            "hedge_interval": self.hedge_interval,
+            "retry_attempts": self.retry_attempts,
+            "retry_delay": self.retry_delay
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'HedgeConfig':
+        """Create config from dictionary"""
+        return cls(
+            exchange_name=data.get("exchange_name", "thalex"),
+            exchange_api_key=data.get("exchange_api_key"),
+            exchange_api_secret=data.get("exchange_api_secret"),
+            use_testnet=data.get("use_testnet", True),
+            hedge_ratio=data.get("hedge_ratio", 1.0),
+            min_hedge_amount=data.get("min_hedge_amount", 0.01),
+            max_hedge_amount=data.get("max_hedge_amount"),
+            default_order_type=data.get("default_order_type", "market"),
+            slippage_tolerance=data.get("slippage_tolerance", 0.05),
+            hedge_symbols=data.get("hedge_symbols", []),
+            symbol_mappings=data.get("symbol_mappings", {}),
+            rebalance_threshold=data.get("rebalance_threshold", 0.1),
+            hedge_interval=data.get("hedge_interval", 60),
+            retry_attempts=data.get("retry_attempts", 3),
+            retry_delay=data.get("retry_delay", 5)
+        )
+        
+    @classmethod
+    def load_from_file(cls, file_path: str) -> 'HedgeConfig':
+        """Load configuration from a JSON file"""
+        try:
+            with open(file_path, 'r') as f:
+                config_data = json.load(f)
+            return cls.from_dict(config_data)
+        except Exception as e:
+            print(f"Error loading hedge config from {file_path}: {e}")
+            return cls()  # Return default config on error
 
 class HedgeConfig:
     """Manages configuration for the hedge system"""

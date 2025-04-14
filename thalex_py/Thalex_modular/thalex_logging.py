@@ -9,6 +9,61 @@ class LoggerFactory:
     DEFAULT_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     DEFAULT_LEVEL = logging.INFO
     
+    # Centralized logs configuration
+    LOGS_BASE_DIR = 'logs'
+    LOGS_STRUCTURE = {
+        # Component type to subdirectory mapping
+        'market_maker': 'market',
+        'avellaneda': 'market',  # Also route avellaneda to market directory
+        'order_manager': 'orders',
+        'risk_manager': 'risk',
+        'hedge': 'hedge',
+        'performance': 'performance',
+        'exchange': 'exchange',
+        'position_tracker': 'positions',
+        'orderbook': 'market',
+        'volume_candle_buffer': 'market',
+        'thalex_client': 'exchange',
+        'thalex_bot': 'market'
+        # Default for other components will be the main logs directory
+    }
+    
+    @staticmethod
+    def get_log_file_path(component_name: str, log_file: str) -> str:
+        """
+        Get the full path for a log file based on component type.
+        Organizes logs into subdirectories by component type.
+        
+        Args:
+            component_name: Name of the component
+            log_file: Log file name
+            
+        Returns:
+            Full path to the log file
+        """
+        # If it's already an absolute path, return it directly
+        if os.path.isabs(log_file):
+            return log_file
+            
+        # Determine subdirectory based on component type
+        subdirectory = None
+        for key, value in LoggerFactory.LOGS_STRUCTURE.items():
+            if key in component_name:
+                subdirectory = value
+                break
+                
+        # Construct the log path
+        if subdirectory:
+            log_dir = os.path.join(LoggerFactory.LOGS_BASE_DIR, subdirectory)
+        else:
+            log_dir = LoggerFactory.LOGS_BASE_DIR
+            
+        # Ensure the directory exists
+        os.makedirs(log_dir, exist_ok=True)
+        
+        # Return the full path
+        return os.path.join(log_dir, log_file)
+    
     @staticmethod
     def configure_component_logger(
         component_name: str, 
@@ -54,18 +109,16 @@ class LoggerFactory:
         # File handler if specified
         if log_file:
             try:
-                # Create logs directory if it doesn't exist
-                log_dir = 'logs'
-                if not os.path.exists(log_dir):
-                    os.makedirs(log_dir)
-                    
-                # Full path to log file
-                log_path = log_file if os.path.isabs(log_file) else os.path.join(log_dir, log_file)
+                # Get the full path for the log file
+                log_path = LoggerFactory.get_log_file_path(component_name, log_file)
                 
                 # Create file handler
                 file_handler = logging.FileHandler(log_path)
                 file_handler.setFormatter(formatter)
                 logger.addHandler(file_handler)
+                
+                # Log the file location for debugging
+                logger.debug(f"Logging to file: {log_path}")
             except Exception as e:
                 # Fall back to just console logging
                 logger.warning(f"Could not set up file logging: {str(e)}")
@@ -88,7 +141,7 @@ class LoggerFactory:
         """Get the main bot logger"""
         return LoggerFactory.configure_component_logger(
             "thalex_bot",
-            log_file="thalex_bot.log"
+            log_file="bot.log"
         )
         
     @staticmethod
@@ -98,4 +151,10 @@ class LoggerFactory:
             "performance",
             log_file="performance.log",
             log_level=logging.INFO
-        ) 
+        )
+        
+    @staticmethod
+    def shutdown():
+        """Placeholder for compatibility with async logger factory"""
+        # This synchronous logger doesn't need explicit shutdown
+        logging.shutdown() 

@@ -1,4 +1,5 @@
 import asyncio
+import os
 from typing import Dict, Optional
 from .async_logger import AsyncLogger
 
@@ -9,6 +10,22 @@ class LoggerFactory:
     """
     _instances: Dict[str, AsyncLogger] = {}
     _started = False
+    
+    # Centralized logs configuration
+    LOGS_BASE_DIR = 'logs'
+    LOGS_STRUCTURE = {
+        # Component type to subdirectory mapping
+        'market_maker': 'market',
+        'order_manager': 'orders',
+        'risk_manager': 'risk',
+        'hedge': 'hedge',
+        'performance': 'performance',
+        'exchange': 'exchange',
+        'position_tracker': 'positions',
+        'orderbook': 'market',
+        'volume_candle_buffer': 'market'
+        # Default for other components will be the main logs directory
+    }
     
     @classmethod
     async def initialize(cls):
@@ -25,6 +42,42 @@ class LoggerFactory:
             for logger in cls._instances.values():
                 await logger.stop()
             cls._started = False
+    
+    @classmethod
+    def get_log_file_path(cls, component_name: str, log_file: str) -> str:
+        """
+        Get the full path for a log file based on component type.
+        Organizes logs into subdirectories by component type.
+        
+        Args:
+            component_name: Name of the component
+            log_file: Log file name
+            
+        Returns:
+            Full path to the log file
+        """
+        # If it's already an absolute path, return it directly
+        if os.path.isabs(log_file):
+            return log_file
+            
+        # Determine subdirectory based on component type
+        subdirectory = None
+        for key, value in cls.LOGS_STRUCTURE.items():
+            if key in component_name:
+                subdirectory = value
+                break
+                
+        # Construct the log path
+        if subdirectory:
+            log_dir = os.path.join(cls.LOGS_BASE_DIR, subdirectory)
+        else:
+            log_dir = cls.LOGS_BASE_DIR
+            
+        # Ensure the directory exists
+        os.makedirs(log_dir, exist_ok=True)
+        
+        # Return the full path
+        return os.path.join(log_dir, log_file)
     
     @classmethod
     def get_logger(
@@ -49,13 +102,18 @@ class LoggerFactory:
             AsyncLogger instance
         """
         if name not in cls._instances:
+            # Process log file path if provided
+            processed_log_file = None
+            if log_file:
+                processed_log_file = cls.get_log_file_path(name, log_file)
+            
             # Create new logger instance
             logger = AsyncLogger(
                 name=name,
                 buffer_size=buffer_size,
                 flush_interval=flush_interval,
                 flush_threshold=flush_threshold,
-                log_file=log_file
+                log_file=processed_log_file
             )
             cls._instances[name] = logger
             

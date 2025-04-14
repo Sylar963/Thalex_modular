@@ -39,12 +39,12 @@ class AvellanedaQuoter:
         self.thalex = thalex
         self.logger = LoggerFactory.configure_component_logger(
             "avellaneda_quoter",
-            log_file="avellaneda_quoter.log",
-            high_frequency=True
+            log_file="quoter.log",
+            high_frequency=False  # Only market maker needs high frequency logging
         )
         
         # Set up the market maker components
-        self.market_maker = AvellanedaMarketMaker()
+        self.market_maker = AvellanedaMarketMaker(exchange_client=self.thalex)
         self.order_manager = OrderManager(self.thalex)
         self.risk_manager = RiskManager()
         self.performance_monitor = PerformanceMonitor()

@@ -221,139 +221,161 @@ class HedgeManager:
     
     def update_position(self, asset: str, position: float, price: float) -> Dict:
         """
-        Update position for an asset and calculate required hedges
+        Update a position and rebalance hedges
         
         Args:
-            asset: Asset symbol (e.g., "BTC-PERP")
+            asset: Asset symbol
             position: Current position size
-            price: Current position price
+            price: Current price
             
         Returns:
-            Dict with hedge operations performed
+            Dict with hedge operations and status
         """
         with self.lock:
-            # Update market price
-            self.market_prices[asset] = price
+            self.logger.info(f"Updating position for {asset}: {position} @ {price}")
             
-            # Find hedge assets for this primary asset
+            # Check if this asset is configured for hedging
             hedge_assets = self.config.get_hedge_assets(asset)
+            if not hedge_assets:
+                self.logger.warning(f"Asset {asset} not configured for hedging")
+                return {"status": "no_config", "hedges": []}
             
-            operations = {
-                "asset": asset,
-                "position": position,
-                "price": price,
-                "hedges": []
-            }
-            
-            # If no hedge assets or hedging disabled, return early
-            if not hedge_assets or not self.config.is_hedging_enabled():
-                return operations
+            # Update position tracker
+            if asset not in self.positions:
+                self.positions[asset] = Position(asset)
                 
-            # Initialize active hedges for this asset if needed
+            old_position = self.positions[asset].size
+            self.positions[asset].size = position
+            self.positions[asset].price = price
+
+            # Update market prices
+            self.market_prices[asset] = price
+            self.logger.info(f"Updated position and price for {asset}: {old_position} -> {position} @ {price}")
+            
+            # Initialize hedge positions if they don't exist
             if asset not in self.active_hedges:
                 self.active_hedges[asset] = {}
             
-            # Process each hedge asset
-            for hedge_idx, hedge_asset in enumerate(hedge_assets):
-                # Get correlation factor
-                correlation_factors = self.config.get_correlation_factors(asset)
-                correlation_factor = correlation_factors[hedge_idx] if hedge_idx < len(correlation_factors) else correlation_factors[0]
+            # Get correlation factors for this asset's hedge pairs
+            correlation_factors = self.config.get_correlation_factors(asset)
+            hedge_operations = []
+            
+            self.logger.info(f"Processing hedges for {asset} with {len(hedge_assets)} hedge assets")
+            
+            # Calculate required hedges
+            for i, hedge_asset in enumerate(hedge_assets):
+                self.logger.info(f"Processing hedge {i+1}/{len(hedge_assets)}: {hedge_asset}")
+                # Get correlation factor for this hedge pair
+                correlation_factor = correlation_factors[i] if i < len(correlation_factors) else 1.0
+                hedge_config = self.config.get_hedge_pair_config(asset)
                 
-                # Get or create hedge position tracker
+                # Create hedge position if it doesn't exist
                 if hedge_asset not in self.active_hedges[asset]:
+                    self.logger.info(f"Creating new hedge position for {asset}/{hedge_asset}")
                     self.active_hedges[asset][hedge_asset] = HedgePosition(
                         primary_asset=asset,
                         hedge_asset=hedge_asset,
                         primary_position=position,
-                        primary_price=price
+                        primary_price=price,
+                        hedge_position=0.0,
+                        hedge_price=0.0,
+                        entry_time=time.time()
                     )
-                    
+                
+                # Get current hedge position
                 hedge_position = self.active_hedges[asset][hedge_asset]
                 
-                # Check if primary position direction changed
-                direction_changed = hedge_position.update_primary(position, price)
+                # Update primary position
+                hedge_position.update_primary(position, price)
                 
-                # Get current hedge price
-                hedge_price = self.market_prices.get(hedge_asset, 0)
-                
-                # If no price available, can't calculate hedge
+                # Get current price for hedge asset
+                hedge_price = self.market_prices.get(hedge_asset, 0.0)
                 if hedge_price <= 0:
-                    self.logger.warning(f"No price available for hedge asset {hedge_asset}, skipping")
+                    self.logger.warning(f"No price available for hedge asset {hedge_asset}")
                     continue
-                    
+                
                 # Calculate required hedge position
-                target_hedge_size, metadata = self.strategy.calculate_hedge_position(
-                    primary_asset=asset,
+                required_hedge = self._calculate_required_hedge(
                     primary_position=position,
                     primary_price=price,
-                    hedge_asset=hedge_asset,
-                    hedge_price=hedge_price
+                    hedge_price=hedge_price,
+                    correlation_factor=correlation_factor,
+                    strategy=self.strategy
                 )
                 
-                # If direction changed or rebalance needed, execute hedge
-                current_hedge_size = hedge_position.hedge_position
+                self.logger.info(f"Calculated required hedge for {asset}/{hedge_asset}: {required_hedge} @ {hedge_price}")
+                self.logger.info(f"Current hedge position: {hedge_position.hedge_position}")
                 
-                if direction_changed or self.strategy.should_rebalance(
-                    primary_asset=asset,
-                    primary_position=position,
-                    current_hedge_position=current_hedge_size,
-                    target_hedge_position=target_hedge_size
-                ):
-                    # Calculate size change needed
-                    size_change = target_hedge_size - current_hedge_size
+                # Check if hedge needs to be adjusted
+                min_hedge_size = hedge_config.get("min_hedge_size", 0.01)
+                deviation_threshold = self.config.get_hedge_settings().get("deviation_threshold", 0.05)
+                
+                # Calculate hedge adjustment
+                hedge_adjustment = required_hedge - hedge_position.hedge_position
+                
+                # Only adjust if needed
+                if abs(hedge_adjustment) >= min_hedge_size:
+                    # Calculate deviation percentage
+                    deviation = abs(hedge_adjustment / required_hedge) if required_hedge != 0 else float('inf')
                     
-                    # Skip very small changes
-                    min_size = self.config.get_hedge_pair_config(asset).get("min_hedge_size", 0.01)
-                    if abs(size_change) < min_size and current_hedge_size != 0:
-                        self.logger.debug(f"Skipping small hedge adjustment ({size_change}) for {asset}/{hedge_asset}")
-                        continue
+                    # Only rebalance if deviation is significant
+                    if deviation >= deviation_threshold or hedge_position.hedge_position == 0:
+                        self.logger.info(f"Hedge adjustment needed: {hedge_adjustment} ({deviation:.2%} deviation)")
                         
-                    # Execute hedge if size change is significant
-                    if size_change != 0:
-                        side = OrderSide.BUY if size_change > 0 else OrderSide.SELL
-                        
-                        # Execute the hedge order
-                        order_result = self._execute_hedge_order(
-                            hedge_asset=hedge_asset,
-                            side=side, 
-                            size=abs(size_change),
-                            price=hedge_price,
-                            metadata={
-                                "primary_asset": asset,
-                                "primary_position": position,
-                                "primary_price": price,
-                                "correlation_factor": correlation_factor,
-                                "target_hedge_size": target_hedge_size,
-                                "current_hedge_size": current_hedge_size
-                            }
-                        )
-                        
-                        # If order was filled, update hedge position
-                        if order_result:
-                            # Update hedge position
-                            new_hedge_size = current_hedge_size + size_change
-                            hedge_position.update_hedge(new_hedge_size, hedge_price)
-                            
-                            self.logger.info(
-                                f"Hedge updated for {asset}/{hedge_asset}: "
-                                f"Primary={position:.4f}@{price:.2f}, "
-                                f"Hedge={new_hedge_size:.4f}@{hedge_price:.2f}, "
-                                f"Ratio={hedge_position.hedge_ratio:.2f}"
+                        # Execute the hedge
+                        if hedge_adjustment > 0:
+                            # Need to buy
+                            self.logger.info(f"Executing BUY order for {hedge_asset}: {abs(hedge_adjustment)} @ {hedge_price}")
+                            success = self._execute_hedge_order(
+                                hedge_asset=hedge_asset,
+                                side=OrderSide.BUY,
+                                size=abs(hedge_adjustment),
+                                price=hedge_price,
+                                metadata={"primary_asset": asset, "position": position}
                             )
+                        else:
+                            # Need to sell
+                            self.logger.info(f"Executing SELL order for {hedge_asset}: {abs(hedge_adjustment)} @ {hedge_price}")
+                            success = self._execute_hedge_order(
+                                hedge_asset=hedge_asset,
+                                side=OrderSide.SELL,
+                                size=abs(hedge_adjustment),
+                                price=hedge_price,
+                                metadata={"primary_asset": asset, "position": position}
+                            )
+                        
+                        if success:
+                            self.logger.info(f"Hedge order executed successfully")
+                            # Update hedge position
+                            old_hedge = hedge_position.hedge_position
+                            hedge_position.update_hedge(required_hedge, hedge_price)
                             
-                            operations["hedges"].append({
+                            # Record the operation
+                            hedge_operations.append({
                                 "hedge_asset": hedge_asset,
-                                "side": side.value,
-                                "size": abs(size_change),
+                                "side": "BUY" if hedge_adjustment > 0 else "SELL",
+                                "size": abs(hedge_adjustment),
                                 "price": hedge_price,
-                                "new_position": new_hedge_size,
-                                "hedge_ratio": hedge_position.hedge_ratio
+                                "old_position": old_hedge,
+                                "new_position": hedge_position.hedge_position
                             })
+                        else:
+                            self.logger.error(f"Failed to execute hedge order for {hedge_asset}")
+                    else:
+                        self.logger.info(f"Hedge adjustment not needed (deviation {deviation:.2%} < threshold {deviation_threshold:.2%})")
+                else:
+                    self.logger.info(f"Hedge adjustment too small: {abs(hedge_adjustment)} < min size {min_hedge_size}")
                 
-            # Save state after updates
+                # Calculate PnL
+                hedge_position.calculate_pnl(price, hedge_price)
+            
+            # Save state after update
             self._save_state()
             
-            return operations
+            return {
+                "status": "hedged" if hedge_operations else "no_change",
+                "hedges": hedge_operations
+            }
     
     def update_market_price(self, asset: str, price: float):
         """
@@ -477,7 +499,13 @@ class HedgeManager:
             position = self.positions[asset]
             old_size = position.size
             position.size += size
-            position.price = price  # Update price to latest price
+            position.price = price
+            
+            # Update market prices for the primary asset that had a fill
+            self.market_prices[asset] = price
+            
+            # Update market prices for hedge assets using estimation based on correlation if needed
+            self._update_market_prices_for_hedge_assets(asset, price)
             
             self.logger.info(f"Updated position for {asset}: {old_size:.4f} -> {position.size:.4f} @ {price:.2f}")
             
@@ -584,6 +612,9 @@ class HedgeManager:
         with self.lock:
             self.logger.info("Rebalancing all hedges")
             
+            # First update all prices
+            self._update_all_prices()
+            
             for primary_asset, hedges in self.active_hedges.items():
                 # Get current position and price for primary asset
                 if primary_asset in self.positions:
@@ -599,23 +630,85 @@ class HedgeManager:
             
             self.logger.info("Rebalance completed")
     
+    def _update_all_prices(self):
+        """Update prices for all assets from exchange client"""
+        # First try to fetch prices directly from exchange
+        assets_to_update = set()
+        
+        # Collect all assets we need prices for
+        for primary_asset, hedges in self.active_hedges.items():
+            assets_to_update.add(primary_asset)
+            assets_to_update.update(hedges.keys())
+        
+        # Also add assets from positions that may not be in active_hedges yet
+        assets_to_update.update(self.positions.keys())
+        
+        for asset in assets_to_update:
+            # Try to fetch price from exchange
+            price = self._fetch_price_from_exchange(asset)
+            if price > 0:
+                # Update the price in our cache
+                old_price = self.market_prices.get(asset, 0.0)
+                self.market_prices[asset] = price
+                self.logger.info(f"Updated price for {asset}: {old_price} -> {price}")
+            elif asset in self.market_prices and self.market_prices[asset] > 0:
+                # We already have a price, keep using it
+                self.logger.info(f"Using existing price for {asset}: {self.market_prices[asset]}")
+            else:
+                # Try to estimate price based on other assets
+                for primary_asset, hedges in self.active_hedges.items():
+                    if asset in hedges and primary_asset in self.market_prices and self.market_prices[primary_asset] > 0:
+                        self._update_market_prices_for_hedge_assets(primary_asset, self.market_prices[primary_asset])
+                        break
+                    elif asset == primary_asset and any(hedge_asset in self.market_prices and self.market_prices[hedge_asset] > 0 for hedge_asset in hedges.keys()):
+                        # Find a hedge asset with a price we can use for estimation
+                        for hedge_asset in hedges.keys():
+                            if hedge_asset in self.market_prices and self.market_prices[hedge_asset] > 0:
+                                # Estimate price using the hedge asset price
+                                correlation_factors = self.config.get_correlation_factors(primary_asset)
+                                hedge_idx = list(hedges.keys()).index(hedge_asset)
+                                correlation = correlation_factors[hedge_idx] if hedge_idx < len(correlation_factors) else 1.0
+                                
+                                # Use fallback as last resort - clearly mark as fallback
+                                self.logger.warning(f"No real-time price available for {primary_asset}, using fallback estimation")
+                                
+                                if primary_asset == "BTC-PERPETUAL" and hedge_asset == "ETH-PERPETUAL":
+                                    estimated_price = self.market_prices[hedge_asset] * 16.0
+                                    self.market_prices[primary_asset] = estimated_price
+                                    self.logger.warning(f"FALLBACK PRICE for {primary_asset}: {estimated_price} (estimated from {hedge_asset})")
+                                elif primary_asset == "ETH-PERPETUAL" and hedge_asset == "BTC-PERPETUAL":
+                                    estimated_price = self.market_prices[hedge_asset] / 16.0
+                                    self.market_prices[primary_asset] = estimated_price
+                                    self.logger.warning(f"FALLBACK PRICE for {primary_asset}: {estimated_price} (estimated from {hedge_asset})")
+                                else:
+                                    # For other asset pairs, log a specific warning
+                                    self.logger.warning(f"Unable to estimate price for {primary_asset} - no fallback ratio defined")
+                                
+                                break
+    
     def _save_state(self):
-        """Save current state to file"""
+        """
+        Save hedge manager state to file
+        """
         try:
-            # Convert active hedges to serializable format
-            hedge_state = {}
+            # Convert state to dict
+            state = {
+                "active_hedges": {},
+                "market_prices": self.market_prices
+            }
+            
+            # Convert objects to dicts
             for primary_asset, hedges in self.active_hedges.items():
-                hedge_state[primary_asset] = {}
+                state["active_hedges"][primary_asset] = {}
                 for hedge_asset, position in hedges.items():
-                    hedge_state[primary_asset][hedge_asset] = position.to_dict()
+                    state["active_hedges"][primary_asset][hedge_asset] = position.to_dict()
             
             # Save to file
             with open(self.state_file, 'w') as f:
-                json.dump({
-                    "market_prices": self.market_prices,
-                    "active_hedges": hedge_state,
-                    "last_update": time.time()
-                }, f, indent=2)
+                json.dump(state, f, indent=2)
+                
+            self.logger.debug(f"Hedge state saved to {self.state_file}")
+            
         except Exception as e:
             self.logger.error(f"Error saving hedge state: {e}")
     
@@ -651,6 +744,168 @@ class HedgeManager:
             self.logger.info(f"Loaded hedge state from {self.state_file}")
         except Exception as e:
             self.logger.error(f"Error loading hedge state: {e}")
+
+    def _calculate_required_hedge(
+        self, 
+        primary_position: float,
+        primary_price: float,
+        hedge_price: float,
+        correlation_factor: float,
+        strategy: Any
+    ) -> float:
+        """
+        Calculate the required hedge position based on the primary position
+        
+        Args:
+            primary_position: Primary position size
+            primary_price: Primary position price
+            hedge_price: Hedge asset price
+            correlation_factor: Correlation factor between primary and hedge asset
+            strategy: Hedge strategy object
+            
+        Returns:
+            Required hedge position size
+        """
+        # Calculate monetary value of primary position
+        primary_notional = primary_position * primary_price
+        
+        # Calculate required hedge notional
+        hedge_notional = -primary_notional * correlation_factor
+        
+        # Convert to size in hedge asset
+        if hedge_price > 0:
+            hedge_size = hedge_notional / hedge_price
+        else:
+            hedge_size = 0
+            
+        self.logger.info(
+            f"Hedge calculation: Primary={primary_position}@{primary_price} "
+            f"(${primary_notional:.2f}), Hedge notional=${hedge_notional:.2f}, "
+            f"Hedge size={hedge_size:.6f}@{hedge_price:.2f}, Correlation={correlation_factor:.2f}"
+        )
+        
+        return hedge_size
+
+    def _update_market_prices_for_hedge_assets(self, primary_asset: str, primary_price: float):
+        """
+        Update market prices for hedge assets based on primary asset price
+        Uses correlation to estimate hedge asset price if not available
+        
+        Args:
+            primary_asset: Asset that was filled
+            primary_price: Current price of the primary asset
+        """
+        # Get hedge assets for the primary asset
+        hedge_assets = self.config.get_hedge_assets(primary_asset)
+        if not hedge_assets:
+            return
+            
+        # Get correlation factors
+        correlation_factors = self.config.get_correlation_factors(primary_asset)
+        
+        # Process each hedge asset
+        for i, hedge_asset in enumerate(hedge_assets):
+            # Try to fetch price from exchange client first - this is the primary source of truth
+            fetched_price = self._fetch_price_from_exchange(hedge_asset)
+            if fetched_price > 0:
+                self.market_prices[hedge_asset] = fetched_price
+                self.logger.info(f"Using real-time price for {hedge_asset}: {fetched_price} from exchange")
+                continue
+                
+            # Skip if we already have a valid price
+            if hedge_asset in self.market_prices and self.market_prices[hedge_asset] > 0:
+                self.logger.info(f"Keeping existing valid price for {hedge_asset}: {self.market_prices[hedge_asset]}")
+                continue
+                
+            # If we get here, we couldn't get a real-time price - use fallback as last resort
+            self.logger.warning(f"No real-time price data available for {hedge_asset}, using fallback estimation")
+            
+            # Check if this is the first update - we need both prices to establish a baseline
+            if primary_asset in self.market_prices and hedge_asset in self.market_prices:
+                # We have both prices, but hedge price may be zero or invalid
+                if self.market_prices[hedge_asset] <= 0:
+                    # Try to estimate based on correlation and last known good value
+                    self.logger.warning(f"FALLBACK: Estimating price for {hedge_asset} based on correlation with {primary_asset}")
+                    
+                    # Use approximate price ranges for estimation (can be refined with actual data)
+                    if hedge_asset == "ETH-PERPETUAL" and primary_asset == "BTC-PERPETUAL":
+                        # Typical BTC/ETH price ratio (approximately 16:1 as of 2025)
+                        estimated_price = primary_price / 16.0
+                        self.market_prices[hedge_asset] = estimated_price
+                        self.logger.warning(f"FALLBACK PRICE for {hedge_asset}: {estimated_price} (estimated from {primary_asset})")
+                    elif hedge_asset == "BTC-PERPETUAL" and primary_asset == "ETH-PERPETUAL":
+                        # Inverse of above
+                        estimated_price = primary_price * 16.0
+                        self.market_prices[hedge_asset] = estimated_price
+                        self.logger.warning(f"FALLBACK PRICE for {hedge_asset}: {estimated_price} (estimated from {primary_asset})")
+            else:
+                # First time seeing one of these assets
+                self.logger.warning(f"Need both {primary_asset} and {hedge_asset} real-time prices for accurate hedging")
+    
+    def _fetch_price_from_exchange(self, asset: str) -> float:
+        """
+        Fetch price for an asset from the exchange client
+        
+        Args:
+            asset: Asset symbol to fetch price for
+            
+        Returns:
+            Current price or 0 if not available
+        """
+        if not self.execution.exchange_client:
+            return 0.0
+            
+        try:
+            # Different exchange clients have different methods to fetch price data
+            # Here we handle a few common patterns
+            exchange_client = self.execution.exchange_client
+            
+            # Try standard method first
+            if hasattr(exchange_client, 'get_price') and callable(exchange_client.get_price):
+                price = exchange_client.get_price(asset)
+                if price > 0:
+                    return price
+                    
+            # Try fetch_ticker if available
+            if hasattr(exchange_client, 'fetch_ticker') and callable(exchange_client.fetch_ticker):
+                try:
+                    ticker = exchange_client.fetch_ticker(asset)
+                    if ticker and 'last' in ticker and ticker['last'] > 0:
+                        return float(ticker['last'])
+                except Exception as e:
+                    self.logger.debug(f"Error fetching ticker for {asset}: {e}")
+                    
+            # Try get_mark_price if available
+            if hasattr(exchange_client, 'get_mark_price') and callable(exchange_client.get_mark_price):
+                price = exchange_client.get_mark_price(asset)
+                if price > 0:
+                    return price
+                    
+            # Try get_instrument_data if available (Thalex specific)
+            if hasattr(exchange_client, 'get_instrument_data') and callable(exchange_client.get_instrument_data):
+                data = exchange_client.get_instrument_data(asset)
+                if data and 'mark_price' in data:
+                    return float(data['mark_price'])
+                    
+            # Try get_ticker if available
+            if hasattr(exchange_client, 'get_ticker') and callable(exchange_client.get_ticker):
+                ticker = exchange_client.get_ticker(asset)
+                if ticker:
+                    # Different exchanges use different keys for price
+                    for key in ['mark_price', 'last', 'price', 'close']:
+                        if key in ticker and ticker[key] > 0:
+                            return float(ticker[key])
+                            
+            # Last resort - check if exchange client has market_prices attribute
+            if hasattr(exchange_client, 'market_prices') and isinstance(exchange_client.market_prices, dict):
+                if asset in exchange_client.market_prices and exchange_client.market_prices[asset] > 0:
+                    return float(exchange_client.market_prices[asset])
+                    
+            return 0.0
+            
+        except Exception as e:
+            self.logger.error(f"Error fetching price for {asset} from exchange: {e}")
+            return 0.0
 
 
 # Factory function to create hedge manager

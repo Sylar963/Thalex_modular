@@ -1,0 +1,32 @@
+{
+  "hedge_pairs": {
+    "BTC-PERPETUAL": {
+      "hedge_assets": ["ETH-PERPETUAL"],
+      "correlation_factors": [0.85],
+      "min_hedge_size": 0.01,
+      "slippage_tolerance": 0.001
+    },
+    "ETH-PERPETUAL": {
+      "hedge_assets": ["BTC-PERPETUAL"],
+      "correlation_factors": [1.18],
+      "min_hedge_size": 0.01,
+      "slippage_tolerance": 0.001
+    }
+  },
+  "hedge_settings": {
+    "enabled": true,
+    "execution_mode": "market",
+    "execution_timeout": 30,
+    "rebalance_frequency": 300,
+    "deviation_threshold": 0.05,
+    "max_hedge_ratio": 1.0,
+    "profit_target": 0.02,
+    "stop_loss": 0.05
+  },
+  "delta_settings": {
+    "calculation_method": "notional",
+    "use_mark_price": true,
+    "delta_threshold": 0.01,
+    "portfolio_delta_target": 0.0
+  }
+} 

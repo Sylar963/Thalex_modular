@@ -20,10 +20,46 @@ from thalex_py.Thalex_modular.components.hedge import create_hedge_manager
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("force_hedge")
 
+# Create a mock exchange client that can provide prices
+class MockExchangeClient:
+    """Mock exchange client for testing"""
+    
+    def __init__(self):
+        """Initialize with market prices"""
+        self.market_prices = {}
+        
+    def set_price(self, symbol, price):
+        """Set market price for a symbol"""
+        self.market_prices[symbol] = price
+        
+    def get_price(self, symbol):
+        """Get market price for a symbol"""
+        return self.market_prices.get(symbol, 0)
+        
+    def get_mark_price(self, symbol):
+        """Get mark price (same as market price for mock)"""
+        return self.market_prices.get(symbol, 0)
+        
+    def get_ticker(self, symbol):
+        """Get ticker data"""
+        price = self.market_prices.get(symbol, 0)
+        return {"mark_price": price, "last": price}
+
 def force_rebalance(btc_price=None, eth_price=None):
     """Force a rebalance of hedge positions"""
-    # Create hedge manager
-    hedge_manager = create_hedge_manager()
+    # Create mock exchange client with prices
+    exchange_client = MockExchangeClient()
+    
+    # Set prices in the mock client
+    if btc_price:
+        exchange_client.set_price("BTC-PERPETUAL", btc_price)
+    if eth_price:
+        exchange_client.set_price("ETH-PERPETUAL", eth_price)
+    
+    # Create hedge manager with exchange client
+    hedge_manager = create_hedge_manager(
+        exchange_client=exchange_client
+    )
     
     # Start the hedge manager
     hedge_manager.start()
@@ -44,8 +80,8 @@ def force_rebalance(btc_price=None, eth_price=None):
                 active_hedges = state.get("active_hedges", {})
                 
                 # Use provided prices or get from state
-                btc_price = btc_price or market_prices.get("BTC-PERP", 0)
-                eth_price = eth_price or market_prices.get("ETH-PERP", 0)
+                btc_price = btc_price or market_prices.get("BTC-PERPETUAL", 0)
+                eth_price = eth_price or market_prices.get("ETH-PERPETUAL", 0)
                 
                 # Extract current positions
                 for primary_asset, hedges in active_hedges.items():
@@ -61,11 +97,11 @@ def force_rebalance(btc_price=None, eth_price=None):
         
         # Set market prices if provided
         if btc_price:
-            hedge_manager.update_market_price("BTC-PERP", btc_price)
+            hedge_manager.update_market_price("BTC-PERPETUAL", btc_price)
             logger.info(f"Updated BTC price: {btc_price}")
         
         if eth_price:
-            hedge_manager.update_market_price("ETH-PERP", eth_price)
+            hedge_manager.update_market_price("ETH-PERPETUAL", eth_price)
             logger.info(f"Updated ETH price: {eth_price}")
         
         # Force rebalance for all positions

@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 *.so
 .Python
+env/
 build/
 develop-eggs/
 dist/
@@ -20,11 +21,18 @@ wheels/
 .installed.cfg
 *.egg
 
-# Virtual Environment
-venv/
-ENV/
-env/
+# Environment variables
 .env
+.env.*
+
+
+# Logs
+*.log
+logs/
+log/
+
+# Local state
+hedge_state.json
 
 # IDE
 .idea/
@@ -32,10 +40,8 @@ env/
 *.swp
 *.swo
 
-# Logs
-*.log
-logs/
-log/
+# Thalex specific
+thalex_credentials.json
 
 # Local development settings
 .env.local
