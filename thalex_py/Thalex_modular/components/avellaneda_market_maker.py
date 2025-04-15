@@ -272,44 +272,127 @@ class AvellanedaMarketMaker:
     
     def update_vamp(self, price: float, volume: float, is_buy: bool, is_aggressive: bool=False):
         """Update Volume-Adjusted Market Price calculations"""
+        # Log entry
+        side_str = "BUY" if is_buy else "SELL"
+        agg_str = "aggressive" if is_aggressive else "passive"
+        self.logger.debug(f"Updating VAMP with {side_str} {volume:.6f} @ {price:.2f} ({agg_str})")
+        
+        # Save old values for comparison
+        old_vwap = getattr(self, 'vwap', 0)
+        old_vamp_value = getattr(self, 'vamp_value', 0)
+        
         # Update VWAP (Volume-Weighted Average Price)
         self.volume_price_sum += price * volume
         self.total_volume += volume
         if self.total_volume > 0:
             self.vwap = self.volume_price_sum / self.total_volume
+            self.logger.debug(f"VWAP updated: {old_vwap:.2f} → {self.vwap:.2f} (Δ: {self.vwap - old_vwap:+.2f})")
         
-        # Update aggressive volume tracking
+        # Update aggressive volume tracking with detailed logging
         if is_aggressive:
             if is_buy:
+                old_buys = self.market_buys_volume
                 self.market_buys_volume += volume
                 self.aggressive_buys_sum += price * volume
+                self.logger.debug(f"Aggressive buys: {old_buys:.6f} → {self.market_buys_volume:.6f} (Δ: +{volume:.6f})")
             else:
+                old_sells = self.market_sells_volume
                 self.market_sells_volume += volume
                 self.aggressive_sells_sum += price * volume
+                self.logger.debug(f"Aggressive sells: {old_sells:.6f} → {self.market_sells_volume:.6f} (Δ: +{volume:.6f})")
+            
+            # Record impact in the impact window for time-weighted impact decay
+            current_time = time.time()
+            impact_value = volume * (1 if is_buy else -1)
+            self.vamp_impact_window.append((current_time, impact_value))
+            
+            # Calculate time-weighted impact for market making adjustments
+            self.vamp_impact = self._calculate_time_weighted_impact()
+            self.logger.debug(f"VAMP impact updated: {self.vamp_impact:.4f} (window size: {len(self.vamp_impact_window)})")
         
         # Calculate VAMP
         vamp = self.calculate_vamp()
-        self.logger.debug(f"VAMP updated: {vamp:.2f}, VWAP: {self.vwap:.2f}")
+        
+        # Record the change
+        vamp_change = vamp - old_vamp_value
+        self.vamp_value = vamp
+        
+        # More detailed logging with value changes
+        self.logger.info(
+            f"VAMP updated: {old_vamp_value:.2f} → {vamp:.2f} (Δ: {vamp_change:+.2f}), "
+            f"VWAP: {self.vwap:.2f}, Total Vol: {self.total_volume:.6f}, "
+            f"Buy/Sell Ratio: {self._get_buy_sell_ratio():.2f}, Impact: {self.vamp_impact:.4f}"
+        )
+        
         return vamp
+    
+    def _get_buy_sell_ratio(self) -> float:
+        """Calculate buy/sell ratio for logging"""
+        if self.market_buys_volume + self.market_sells_volume == 0:
+            return 1.0  # Neutral if no volume
+        return self.market_buys_volume / (self.market_buys_volume + self.market_sells_volume)
+    
+    def _calculate_time_weighted_impact(self) -> float:
+        """Calculate time-weighted impact from the impact window"""
+        if not self.vamp_impact_window:
+            return 0.0
+            
+        # Current time
+        current_time = time.time()
+        
+        # Calculate decay factor - more recent trades have higher weight
+        total_weight = 0.0
+        weighted_impact = 0.0
+        
+        # Max age to consider (default 5 minutes)
+        max_age = TRADING_CONFIG["vamp"].get("max_impact_age", 300)
+        
+        for timestamp, impact in self.vamp_impact_window:
+            age = current_time - timestamp
+            if age > max_age:
+                continue  # Skip too old values
+                
+            # Linear decay weight (1.0 for newest, approaching 0 for oldest)
+            weight = max(0, 1.0 - (age / max_age))
+            weighted_impact += impact * weight
+            total_weight += weight
+            
+        # Normalize by total weight
+        if total_weight > 0:
+            return weighted_impact / total_weight
+        return 0.0
     
     def calculate_vamp(self) -> float:
         """Calculate Volume-Adjusted Market Price"""
         # If no volume, use mid_price
         if self.total_volume == 0:
+            self.logger.debug("No volume data available for VAMP calculation")
             return 0.0
             
         # Basic VWAP if no aggressive trades
         if self.market_buys_volume == 0 and self.market_sells_volume == 0:
+            self.logger.debug("No aggressive trades, using VWAP as VAMP")
             return self.vwap
             
-        # Calculate buy/sell pressure
-        buy_vwap = self.aggressive_buys_sum / self.market_buys_volume if self.market_buys_volume > 0 else 0
-        sell_vwap = self.aggressive_sells_sum / self.market_sells_volume if self.market_sells_volume > 0 else 0
+        # Calculate buy/sell pressure with detailed logging
+        buy_vwap = 0
+        sell_vwap = 0
+        
+        if self.market_buys_volume > 0:
+            buy_vwap = self.aggressive_buys_sum / self.market_buys_volume
+            self.logger.debug(f"Buy VWAP: {buy_vwap:.2f} from {self.market_buys_volume:.6f} volume")
+            
+        if self.market_sells_volume > 0:
+            sell_vwap = self.aggressive_sells_sum / self.market_sells_volume
+            self.logger.debug(f"Sell VWAP: {sell_vwap:.2f} from {self.market_sells_volume:.6f} volume")
         
         # If only one side has volume, use that side
         if self.market_buys_volume == 0:
+            self.logger.debug("Only sell-side aggressive volume, using sell VWAP")
             return sell_vwap
+            
         if self.market_sells_volume == 0:
+            self.logger.debug("Only buy-side aggressive volume, using buy VWAP")
             return buy_vwap
             
         # Calculate VAMP using both sides
@@ -318,6 +401,12 @@ class AvellanedaMarketMaker:
         
         # VAMP is weighted average of buy and sell VWAPs
         vamp = (buy_vwap * buy_ratio) + (sell_vwap * sell_ratio)
+        
+        # Detailed calculation explanation
+        self.logger.debug(
+            f"VAMP calculation: ({buy_vwap:.2f} × {buy_ratio:.2f}) + ({sell_vwap:.2f} × {sell_ratio:.2f}) = {vamp:.2f}, "
+            f"Buy bias: {'+' if buy_ratio > 0.5 else '-'}{abs(buy_ratio - 0.5) * 2:.1f}x"
+        )
         
         return vamp
 
@@ -1536,6 +1625,9 @@ class AvellanedaMarketMaker:
         
         # Update volume-based indicators if trade data is provided
         if is_trade and volume > 0 and is_buy is not None:
+            buy_sell_str = "BUY" if is_buy else "SELL"
+            self.logger.debug(f"Processing trade: {buy_sell_str} {volume:.6f} @ {price:.2f}")
+            
             # Update VAMP
             self.update_vamp(price, volume, is_buy)
             
@@ -1543,15 +1635,30 @@ class AvellanedaMarketMaker:
             if self.volume_buffer:
                 # Convert to milliseconds for the volume candle buffer
                 timestamp = int(current_time * 1000)
+                
+                # Log details about the trade being added to candle
+                self.logger.debug(
+                    f"Adding trade to volume candle: {buy_sell_str} {volume:.6f} @ {price:.2f}, "
+                    f"current candle volume: {getattr(self.volume_buffer.current_candle, 'volume', 0):.6f}/{self.volume_buffer.volume_threshold:.6f}"
+                )
+                
+                # Update the candle with trade data
                 candle = self.volume_buffer.update(price, volume, is_buy, timestamp)
                 
                 # If a candle was completed, update predictive parameters
                 if candle and candle.is_complete:
+                    self.logger.info(
+                        f"Volume candle completed: O:{candle.open_price:.2f}, H:{candle.high_price:.2f}, "
+                        f"L:{candle.low_price:.2f}, C:{candle.close_price:.2f}, V:{candle.volume:.6f}, "
+                        f"Δ:{candle.delta_ratio:.2f}, triggering parameter update"
+                    )
                     self._update_predictive_parameters()
                     self.force_grid_update = True  # Force grid update when new candle is complete
+                    self.logger.info("Forcing grid update due to new candle completion")
         
         # Periodically update predictive parameters
         if self.volume_buffer and current_time - self.last_prediction_time > self.prediction_interval:
+            self.logger.info(f"Periodic prediction update triggered after {current_time - self.last_prediction_time:.1f}s")
             self._update_predictive_parameters()
             self.last_prediction_time = current_time
             
@@ -1561,7 +1668,8 @@ class AvellanedaMarketMaker:
             self.force_grid_update = False
             
             # Log the update
-            self.logger.debug(f"Triggering grid update due to market data update")
+            update_reason = "forced update" if self.force_grid_update else f"time-based update ({self.grid_update_interval}s interval)"
+            self.logger.debug(f"Triggering grid update due to {update_reason}")
             
             # This will signal that grids should be updated on the next quote generation
             return True
@@ -1577,53 +1685,98 @@ class AvellanedaMarketMaker:
             # Get predictions from volume candle buffer
             predictions = self.volume_buffer.get_predicted_parameters()
             
+            # Always log that we're checking predictions
+            self.logger.info(f"Checking volume candle predictions at {time.strftime('%H:%M:%S')}")
+            
             if predictions:
+                # Log all raw prediction values
+                self.logger.info(
+                    f"Raw predictions: gamma_adj={predictions.get('gamma_adjustment', 0):.3f}, "
+                    f"kappa_adj={predictions.get('kappa_adjustment', 0):.3f}, "
+                    f"res_price_offset={predictions.get('reservation_price_offset', 0):.6f}, "
+                    f"trend_dir={predictions.get('trend_direction', 0)}, "
+                    f"vol_adj={predictions.get('volatility_adjustment', 0):.3f}"
+                )
+                
                 # Store the adjustments for use in other components
                 self.predictive_adjustments = predictions
                 self.predictive_adjustments["last_update_time"] = time.time()
                 
                 # Update Avellaneda parameters based on predictions
+                # Track changes to summarize at the end
+                changes_made = []
                 
                 # 1. Adjust gamma (risk aversion) based on prediction
                 gamma_adjustment = predictions.get("gamma_adjustment", 0)
                 if abs(gamma_adjustment) > 0.05:  # Only apply significant adjustments
+                    old_gamma = self.gamma
                     new_gamma = self.gamma * (1 + gamma_adjustment)
                     self.update_gamma(new_gamma)
-                    self.logger.info(f"Adjusted gamma from {self.gamma:.3f} to {new_gamma:.3f} based on volume candle prediction")
+                    changes_made.append(f"gamma: {old_gamma:.3f} → {new_gamma:.3f} (adj: {gamma_adjustment:+.3f})")
+                else:
+                    self.logger.debug(f"Skipping gamma adjustment: {gamma_adjustment:.3f} (below threshold)")
                     
                 # 2. Adjust kappa (market depth) based on prediction
                 kappa_adjustment = predictions.get("kappa_adjustment", 0)
+                old_kappa = self.kappa
                 if abs(kappa_adjustment) > 0.05:  # Only apply significant adjustments
                     self.kappa = self.k_default * (1 + kappa_adjustment)
-                    self.logger.info(f"Adjusted kappa to {self.kappa:.3f} based on volume candle prediction")
+                    changes_made.append(f"kappa: {old_kappa:.3f} → {self.kappa:.3f} (adj: {kappa_adjustment:+.3f})")
+                else:
+                    self.logger.debug(f"Skipping kappa adjustment: {kappa_adjustment:.3f} (below threshold)")
                     
                 # 3. Set reservation price offset based on prediction
+                old_offset = getattr(self, 'reservation_price_offset', 0)
                 self.reservation_price_offset = predictions.get("reservation_price_offset", 0)
                 if abs(self.reservation_price_offset) > 0.00001:
-                    self.logger.info(f"Set reservation price offset to {self.reservation_price_offset:.6f} based on prediction")
+                    changes_made.append(f"res_price_offset: {old_offset:.6f} → {self.reservation_price_offset:.6f}")
+                else:
+                    self.logger.debug(f"Reservation price offset: {self.reservation_price_offset:.6f} (minor adjustment)")
                     
                 # 4. Track trend direction for grid spacing adjustment
+                old_trend = getattr(self, 'trend_direction', 0)
                 trend_direction = predictions.get("trend_direction", 0)
+                if trend_direction != old_trend:
+                    self.trend_direction = trend_direction
+                    changes_made.append(f"trend_direction: {old_trend} → {trend_direction}")
                 
                 # 5. Apply volatility adjustment
                 vol_adjustment = predictions.get("volatility_adjustment", 0)
+                old_vol = self.volatility
                 if abs(vol_adjustment) > 0.05:
                     adjusted_vol = self.volatility * (1 + vol_adjustment)
                     # Clamp to reasonable bounds
                     adjusted_vol = max(min(adjusted_vol, TRADING_CONFIG["volatility"]["ceiling"]), TRADING_CONFIG["volatility"]["floor"])
                     self.volatility = adjusted_vol
-                    self.logger.info(f"Adjusted volatility to {self.volatility:.4f} based on prediction")
-                    
+                    changes_made.append(f"volatility: {old_vol:.4f} → {adjusted_vol:.4f} (adj: {vol_adjustment:+.3f})")
+                else:
+                    self.logger.debug(f"Skipping volatility adjustment: {vol_adjustment:.3f} (below threshold)")
+                
                 # Log the signals from volume candles
                 signals = self.volume_buffer.signals if hasattr(self.volume_buffer, 'signals') else {}
                 if signals:
                     self.logger.info(
-                        f"Signal basis: momentum={signals['momentum']:.2f}, reversal={signals['reversal']:.2f}, "
-                        f"volatility={signals['volatility']:.2f}, exhaustion={signals['exhaustion']:.2f}"
+                        f"Signal basis: momentum={signals.get('momentum', 0):.2f}, "
+                        f"reversal={signals.get('reversal', 0):.2f}, "
+                        f"volatility={signals.get('volatility', 0):.2f}, "
+                        f"exhaustion={signals.get('exhaustion', 0):.2f}"
                     )
+                
+                # Log a summary of all changes
+                if changes_made:
+                    self.logger.info(f"Applied {len(changes_made)} prediction-based adjustments: {', '.join(changes_made)}")
+                else:
+                    self.logger.info("No significant parameter adjustments needed based on predictions")
+                    
+                # Log the current state of all key parameters
+                self.logger.info(
+                    f"Current parameters: gamma={self.gamma:.3f}, kappa={self.kappa:.3f}, "
+                    f"res_price_offset={self.reservation_price_offset:.6f}, "
+                    f"vol={self.volatility:.4f}, trend={getattr(self, 'trend_direction', 0)}"
+                )
                     
         except Exception as e:
-            self.logger.error(f"Error updating predictive parameters: {str(e)}")
+            self.logger.error(f"Error updating predictive parameters: {str(e)}", exc_info=True)
 
     def _calculate_fibonacci_size_multipliers(self, levels: int) -> List[float]:
         """
