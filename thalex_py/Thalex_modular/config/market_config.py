@@ -45,10 +45,10 @@ BOT_CONFIG = {
             "max_loss_threshold": 0.03,    # Maximum loss before gradual exit
             
             # Quote sizing and levels
-            "base_size": 0.1,             # Base quote size
-            "size_multipliers": [1.0, 2.5, 3.5, 2.5, 0.8, 0.5],  # Size multipliers optimized for better fill probability
-            "max_levels": 6,              # Maximum number of quote levels
-            "level_spacing": 30,          # Base spacing between levels in ticks (reduced from 35)
+            "base_size": 0.05,             # Base quote size increased from 0.01
+            "size_multipliers": [0.2, 0.4, 0.6, 1.0, 1.6, 2.0],  # Size multipliers with Fibonacci-like progression
+            "max_levels": 12,              # Maximum number of quote levels (reduced from 21)
+            "level_spacing": 100,          # Base spacing between levels in ticks (increased from 50 to 100)
         },
         
         # Order execution parameters
@@ -111,7 +111,7 @@ BOT_CONFIG = {
     
     # Hedging configuration
     "hedging": {
-        "enabled": True,  # Whether to enable cross-asset hedging
+        "enabled": False,  # Explicitly disable hedging
         "strategy": "notional",  # Hedging strategy (notional or delta_neutral)
         "config_path": "thalex_py/Thalex_modular/config/hedge/hedge_config.json",  # Custom config file path
         
@@ -266,58 +266,25 @@ TRADING_CONFIG = {
         "amend_threshold": BOT_CONFIG["trading_strategy"]["avellaneda"]["max_loss_threshold"],
         "post_only": BOT_CONFIG["trading_strategy"]["execution"]["post_only"]
     },
-    "volatility": DEFAULT_VOLATILITY_CONFIG,
     "vamp": {
-        "window": BOT_CONFIG["trading_strategy"]["vamp"]["window"],
-        "aggressive_window": BOT_CONFIG["trading_strategy"]["vamp"]["aggressive_window"],
-        "impact_window": BOT_CONFIG["trading_strategy"]["vamp"]["impact_window"],
+        "window": 50,                   # Number of price-volume samples
+        "aggressive_window": 20,        # Number of aggressive trade samples
+        "impact_window": 30,            # Number of market impact samples
     },
     "volume_candle": {
-        "threshold": 0.1,                # Volume required to complete a candle (BTC) - reduced for more frequent candles
-        "max_candles": 200,              # Maximum number of candles to store
-        "max_time_seconds": 180,         # Maximum time before forcing candle close - reduced to 3 minutes
-        "enable_predictions": True,      # Whether to enable predictive features
-        "prediction_update_interval": 5, # How often to update predictions (in seconds)
-        "sensitivity": {                 # Sensitivity parameters for predictive signals
-            "momentum": 1.5,             # How sensitive momentum signals should be (increased from 1.0)
-            "reversal": 1.2,             # How sensitive reversal signals should be (increased from 1.0)
-            "volatility": 1.3,           # How sensitive volatility predictions should be (increased from 1.0)
-            "reservation_price": 1.5     # How much to adjust reservation price (increased from 1.0)
+        "threshold": 0.5,               # Volume threshold to complete a candle (BTC)
+        "max_candles": 100,             # Maximum candles to keep in buffer
+        "max_time_seconds": 300,        # Maximum time before forcing candle completion
+        "prediction_update_interval": 10.0, # How often to update predictions (seconds)
+        "sensitivity": {
+            "momentum": 1.0,            # Sensitivity multiplier for momentum signals
+            "reversal": 1.0,            # Sensitivity multiplier for reversal signals
+            "volatility": 1.0,          # Sensitivity multiplier for volatility signals
+            "reservation_price": 1.0    # Sensitivity for reservation price adjustments
         }
     },
-    "hedging": {
-        "enabled": BOT_CONFIG["hedging"].get("enabled", False),
-        "strategy": BOT_CONFIG["hedging"].get("strategy", "notional"),
-        "config_path": BOT_CONFIG["hedging"].get("config_path", None),
-        # Hedge pairs configuration
-        "hedge_pairs": {
-            pair: {
-                "hedge_assets": config["hedge_assets"],
-                "correlation_factors": config["correlation_factors"],
-                "min_hedge_size": 0.01,
-                "slippage_tolerance": BOT_CONFIG["hedging"]["execution"]["slippage_tolerance"]
-            }
-            for pair, config in BOT_CONFIG["hedging"]["pairs"].items()
-        },
-        # Hedge settings
-        "hedge_settings": {
-            "enabled": BOT_CONFIG["hedging"]["enabled"],
-            "execution_mode": BOT_CONFIG["hedging"]["execution"]["mode"],
-            "execution_timeout": BOT_CONFIG["hedging"]["execution"]["timeout"],
-            "rebalance_frequency": BOT_CONFIG["hedging"]["rebalance"]["frequency"],
-            "deviation_threshold": BOT_CONFIG["hedging"]["rebalance"]["threshold"],
-            "max_hedge_ratio": 1.0,
-            "profit_target": 0.02,
-            "stop_loss": 0.05
-        },
-        # Delta settings
-        "delta_settings": {
-            "calculation_method": "notional",
-            "use_mark_price": True,
-            "delta_threshold": 0.01,
-            "portfolio_delta_target": 0.0
-        }
-    }
+    "volatility": DEFAULT_VOLATILITY_CONFIG,
+    "hedging": BOT_CONFIG.get("hedging", {"enabled": False})
 }
 
 # Risk management configuration
@@ -366,12 +333,12 @@ QUOTING_CONFIG = DeprecatedConfigDict({
     "error_retry_interval": BOT_CONFIG["connection"]["retry_delay"],
     # Add base_levels for compatibility with existing code
     "base_levels": [
-        {"size": 0.1, "spread_multiplier": 1.0},  # Level 0 (closest to mid)
-        {"size": 0.2, "spread_multiplier": 1.2},  # Level 1
-        {"size": 0.3, "spread_multiplier": 1.5},  # Level 2
-        {"size": 0.2, "spread_multiplier": 1.8},  # Level 3 
-        {"size": 0.1, "spread_multiplier": 2.2},  # Level 4
-        {"size": 0.1, "spread_multiplier": 2.5},  # Level 5 (furthest from mid)
+        {"size": 0.03, "spread_multiplier": 1.0},  # Level 0 (closest to mid) - smaller size
+        {"size": 0.06, "spread_multiplier": 1.2},  # Level 1
+        {"size": 0.09, "spread_multiplier": 1.5},  # Level 2
+        {"size": 0.12, "spread_multiplier": 1.8},  # Level 3 
+        {"size": 0.15, "spread_multiplier": 2.2},  # Level 4
+        {"size": 0.20, "spread_multiplier": 2.5},  # Level 5 (furthest from mid) - larger size
     ]
 }, "QUOTING_CONFIG")
 

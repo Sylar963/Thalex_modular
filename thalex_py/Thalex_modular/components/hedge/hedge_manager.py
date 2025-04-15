@@ -145,34 +145,34 @@ class HedgeManager:
     This is the main entry point for the hedging system.
     """
     
-    def __init__(
-        self, 
-        config_path: Optional[str] = None, 
-        exchange_client: Any = None,
-        strategy_type: str = "notional"
-    ):
+    def __init__(self, config: HedgeConfig, exchange_client: Any = None):
         """
-        Initialize the hedge manager
+        Initialize hedge manager
         
         Args:
-            config_path: Path to configuration file
-            exchange_client: Exchange API client
-            strategy_type: Type of hedge strategy to use ("notional" or "delta_neutral")
+            config: Hedge configuration
+            exchange_client: Exchange API client instance (optional)
         """
-        # Initialize configuration
-        self.config = HedgeConfig(config_path)
-        
-        # Initialize logger
         self.logger = LoggerFactory.configure_component_logger(
             "hedge_manager",
-            log_file="hedge_manager.log"
+            log_file="hedge_manager.log"  # Will be placed in logs/hedge/ directory
         )
+        self.config = config
         
-        # Create strategy
-        self.strategy = create_hedge_strategy(strategy_type, self.config)
+        # Initialize execution module with the provided exchange client
+        self.execution = HedgeExecution(config, exchange_client=exchange_client)
         
-        # Create execution module
-        self.execution = HedgeExecution(self.config, exchange_client)
+        # Load strategy
+        self.strategy = self.load_strategy(config.strategy_name)
+        self.logger.info(f"Loaded hedge strategy: {config.strategy_name}")
+        
+        # Initialize positions tracking
+        self.positions = {}  # instrument_id -> position size
+        self.position_updates = {}  # Dictionary to track position updates
+        
+        # Initialize PnL tracking
+        self.realized_pnl = 0.0
+        self.unrealized_pnl = 0.0
         
         # Initialize state
         self.active_hedges: Dict[str, Dict[str, HedgePosition]] = {}  # primary_asset -> {hedge_asset -> position}
@@ -189,10 +189,23 @@ class HedgeManager:
         self.last_pnl_calculation = 0
         self.state_file = Path("hedge_state.json")
         
-        self.logger.info(f"Hedge manager initialized with strategy: {strategy_type}")
+        self.logger.info(f"Hedge manager initialized with strategy: {config.strategy_name}")
         
         # Try to load state
         self._load_state()
+    
+    def load_strategy(self, strategy_name: str):
+        """
+        Load hedge strategy by name
+        
+        Args:
+            strategy_name: Strategy name
+            
+        Returns:
+            HedgeStrategy instance
+        """
+        from .hedge_strategy import create_hedge_strategy
+        return create_hedge_strategy(strategy_name, self.config)
     
     def start(self):
         """Start the hedge manager"""
@@ -910,23 +923,43 @@ class HedgeManager:
 
 # Factory function to create hedge manager
 def create_hedge_manager(
-    config_path: Optional[str] = None,
-    exchange_client: Any = None,
-    strategy_type: str = "notional"
+    config_path: str = None,
+    config_dict: Dict = None,
+    hedge_config: HedgeConfig = None,
+    exchange_client: Any = None
 ) -> HedgeManager:
     """
     Factory function to create a hedge manager
     
     Args:
-        config_path: Path to configuration file
-        exchange_client: Exchange client instance
-        strategy_type: Hedge strategy type
+        config_path: Path to the config file
+        config_dict: Configuration as dictionary
+        hedge_config: HedgeConfig instance
+        exchange_client: Exchange API client instance (optional)
         
     Returns:
         HedgeManager instance
     """
-    return HedgeManager(
-        config_path=config_path,
-        exchange_client=exchange_client,
-        strategy_type=strategy_type
-    ) 
+    # Extract strategy from config_dict if present
+    strategy_name = "notional"  # Default strategy
+    if config_dict and 'strategy' in config_dict:
+        strategy_name = config_dict.pop('strategy')
+        
+    # Get config
+    if hedge_config is None:
+        if config_dict is not None:
+            hedge_config = HedgeConfig(**config_dict)
+        elif config_path is not None:
+            # Load from file
+            config_dict = load_config(config_path)
+            hedge_config = HedgeConfig(**config_dict)
+        else:
+            # Default config
+            hedge_config = HedgeConfig()
+    
+    # Add strategy_name to HedgeConfig object through monkey patching
+    hedge_config.strategy_name = strategy_name
+    
+    # Create manager with the provided exchange client
+    hedge_manager = HedgeManager(hedge_config, exchange_client=exchange_client)
+    return hedge_manager 

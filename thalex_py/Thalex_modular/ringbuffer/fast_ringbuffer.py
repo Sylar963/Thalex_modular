@@ -11,7 +11,7 @@ class FastRingBuffer:
         self,
         capacity: int,
         dtype: np.dtype = np.float64,
-        fill_value: Union[int, float] = np.nan
+        fill_value: Union[int, float] = None
     ):
         """
         Initialize ring buffer with specified capacity.
@@ -24,7 +24,14 @@ class FastRingBuffer:
         self.capacity = capacity
         self.dtype = dtype
         
-        # Pre-allocate buffer
+        # Use 0 for integral types or NaN for floating point to avoid casting errors
+        if fill_value is None:
+            if np.issubdtype(dtype, np.integer):
+                fill_value = 0
+            else:
+                fill_value = np.nan
+        
+        # Pre-allocate buffer with appropriate fill value
         self._buffer = np.full(capacity, fill_value, dtype=dtype)
         self._index = 0
         self._is_full = False
@@ -60,35 +67,69 @@ class FastRingBuffer:
                 
             # Calculate indices for the batch
             indices = np.arange(self._index, self._index + n_values) % self.capacity
+            
+            # Convert to proper dtype to avoid casting warnings
+            if value.dtype != self.dtype:
+                value = value.astype(self.dtype, copy=True)
+                
             self._buffer[indices] = value
             
             # Update statistical accumulators
             if not self._is_full:
-                valid_values = value[~np.isnan(value)]
-                self._sum = np.nansum(self._buffer)
-                self._sum_sq = np.nansum(self._buffer ** 2)
-                self._min = np.nanmin(valid_values) if len(valid_values) > 0 else self._min
-                self._max = np.nanmax(valid_values) if len(valid_values) > 0 else self._max
+                # Check for floating point or integer types
+                if np.issubdtype(self.dtype, np.floating):
+                    valid_values = value[~np.isnan(value)]
+                    self._sum = np.nansum(self._buffer)
+                    self._sum_sq = np.nansum(self._buffer ** 2)
+                else:
+                    valid_values = value
+                    self._sum = np.sum(self._buffer[:self._index + n_values])
+                    self._sum_sq = np.sum(self._buffer[:self._index + n_values] ** 2)
+                    
+                self._min = np.min(valid_values) if len(valid_values) > 0 else self._min
+                self._max = np.max(valid_values) if len(valid_values) > 0 else self._max
             else:
                 # Update accumulators by removing old values and adding new ones
                 old_values = self._buffer[indices]
-                self._sum += np.nansum(value - old_values)
-                self._sum_sq += np.nansum(value ** 2 - old_values ** 2)
-                self._min = np.nanmin(self._buffer)
-                self._max = np.nanmax(self._buffer)
+                
+                # For floating point types, handle NaN values
+                if np.issubdtype(self.dtype, np.floating):
+                    self._sum += np.nansum(value - old_values)
+                    self._sum_sq += np.nansum(value ** 2 - old_values ** 2)
+                    self._min = np.nanmin(self._buffer)
+                    self._max = np.nanmax(self._buffer)
+                else:
+                    self._sum += np.sum(value - old_values)
+                    self._sum_sq += np.sum(value ** 2 - old_values ** 2)
+                    self._min = np.min(self._buffer)
+                    self._max = np.max(self._buffer)
             
             self._index = (self._index + n_values) % self.capacity
             if not self._is_full and self._index == 0:
                 self._is_full = True
                 
         else:
-            # Single value append
+            # Single value append - verify proper dtype
+            if not isinstance(value, self.dtype):
+                try:
+                    value = self.dtype(value)
+                except (ValueError, TypeError):
+                    warnings.warn(f"Could not convert {value} to {self.dtype}. Using default.")
+                    # Use appropriate default value for the dtype
+                    if np.issubdtype(self.dtype, np.floating):
+                        value = np.nan
+                    else:
+                        value = 0
+            
+            # Store the old value for statistic updates
             old_value = self._buffer[self._index]
             self._buffer[self._index] = value
             
             # Update statistical accumulators
-            if not np.isnan(value):
-                if not self._is_full or np.isnan(old_value):
+            is_valid = not np.isnan(value) if np.issubdtype(self.dtype, np.floating) else True
+            
+            if is_valid:
+                if not self._is_full or (np.issubdtype(self.dtype, np.floating) and np.isnan(old_value)):
                     self._sum += value
                     # Handle potential overflow with large timestamp values
                     try:

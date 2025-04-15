@@ -62,12 +62,40 @@ class AsyncLogger:
             self._flush_task = asyncio.create_task(self._flush_loop())
             
     async def stop(self):
-        """Stop the async logging task and flush remaining messages"""
+        """Stop the async logging task and flush remaining messages with timeout protection"""
         if self._running:
-            self._running = False
-            if self._flush_task:
-                await self._flush_task
-            await self._flush_messages()
+            try:
+                # Set running flag to false to stop the flush loop
+                self._running = False
+                
+                # Cancel the flush task if it exists
+                if self._flush_task and not self._flush_task.done():
+                    self._flush_task.cancel()
+                    try:
+                        # Wait for the task to be cancelled with a timeout
+                        await asyncio.wait_for(asyncio.shield(self._flush_task), timeout=1.0)
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        # This is expected when we cancel the task or it times out
+                        pass
+                    except Exception as e:
+                        self.logger.error(f"Error cancelling flush task: {str(e)}")
+                
+                # Try to flush the remaining messages with a timeout
+                try:
+                    await asyncio.wait_for(self._flush_messages(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    self.logger.warning(f"Final message flush timed out for {self.name}")
+                except Exception as e:
+                    self.logger.error(f"Error during final message flush: {str(e)}")
+            except Exception as e:
+                self.logger.error(f"Error during logger shutdown: {str(e)}")
+                
+            # Add a final direct log message to indicate shutdown
+            try:
+                self.logger.info(f"AsyncLogger {self.name} stopped")
+            except:
+                # If the logger is unavailable, just continue
+                pass
             
     def log(self, level: int, message: str, *args, **kwargs):
         """Add a log message to the buffer"""

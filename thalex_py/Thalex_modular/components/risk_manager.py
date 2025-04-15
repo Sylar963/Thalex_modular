@@ -198,13 +198,14 @@ class RiskManager:
         Returns:
             Float representing PnL percentage (positive for profit, negative for loss)
         """
+        # Can't calculate PnL without a position or valid entry price
         if self.position_size == 0 or self.entry_price == 0:
             return 0.0
             
-        # For long positions: (current_price - entry_price) / entry_price
-        # For short positions: (entry_price - current_price) / entry_price
+        # For long positions, profit when current > entry
         if self.position_size > 0:
             return (current_price - self.entry_price) / self.entry_price
+        # For short positions, profit when entry > current
         else:
             return (self.entry_price - current_price) / self.entry_price
 
@@ -409,3 +410,108 @@ class RiskManager:
             
         except Exception as e:
             self.logger.error(f"Error updating trade metrics: {str(e)}")
+
+    async def update_position_fill(self, direction: str, price: float, size: float, timestamp: Optional[float] = None) -> Dict[str, Any]:
+        """
+        Update position tracking directly from order fill events (faster, more accurate)
+        
+        Args:
+            direction: Order direction ('buy' or 'sell')
+            price: Fill price
+            size: Fill size
+            timestamp: Optional timestamp for the update
+            
+        Returns:
+            Dict containing current position metrics and risk status
+        """
+        current_time = timestamp or time.time()
+        
+        # Adjust size based on direction
+        position_change = size if direction.lower() == 'buy' else -size
+        
+        # Calculate PnL before update if we have a position
+        if self.position_size != 0:
+            old_pnl = self.calculate_pnl_percentage(price)
+            
+            # Update drawdown
+            if old_pnl < 0:
+                self.current_drawdown = abs(old_pnl)
+                self.max_drawdown = max(self.max_drawdown, self.current_drawdown)
+            else:
+                self.current_drawdown = 0
+                # Track peak profit for take profit logic
+                if old_pnl > self.peak_profit:
+                    self.peak_profit = old_pnl
+        
+        # Update position
+        old_position = self.position_size
+        new_position = self.position_size + position_change
+        
+        # Calculate if this is a new position, adding to position, or reducing position
+        is_new_position = (old_position == 0)
+        is_reducing_position = (abs(new_position) < abs(old_position) and 
+                                ((old_position > 0 and new_position > 0) or 
+                                 (old_position < 0 and new_position < 0)))
+        is_closing_position = (new_position == 0)
+        is_reversing_position = (old_position * new_position < 0)  # Sign change
+        
+        # Handle entry price updates
+        if is_new_position:
+            # New position - set entry price to fill price
+            self.position_start_time = current_time
+            self.entry_price = price
+            self.logger.info(f"New position opened: {position_change:.4f} @ {price:.2f}")
+        elif is_reducing_position or is_closing_position:
+            # Reducing position - calculate realized PnL
+            pnl = position_change * (price - self.entry_price) * (-1 if old_position < 0 else 1)
+            self.realized_pnl += pnl
+            
+            if is_closing_position:
+                # Position closed - reset entry price
+                self.entry_price = 0
+                self.logger.info(f"Position closed: realized PnL: {pnl:.2f}")
+            else:
+                # Keep same entry price when reducing
+                self.logger.info(f"Position reduced: {old_position:.4f} -> {new_position:.4f}, realized PnL: {pnl:.2f}")
+        elif is_reversing_position:
+            # Position reversal - close old position, open new position
+            # Calculate realized PnL on the closed portion
+            pnl = old_position * (price - self.entry_price) * (-1 if old_position < 0 else 1)
+            self.realized_pnl += pnl
+            
+            # Set new entry price
+            self.entry_price = price
+            self.position_start_time = current_time
+            self.logger.info(f"Position reversed: {old_position:.4f} -> {new_position:.4f}, realized PnL: {pnl:.2f}")
+        else:
+            # Adding to position - update entry price with weighted average
+            total_value = (self.position_size * self.entry_price) + (position_change * price)
+            self.entry_price = total_value / new_position
+            self.logger.info(f"Position increased: {old_position:.4f} -> {new_position:.4f} @ {price:.2f}, new avg: {self.entry_price:.2f}")
+        
+        # Update position size
+        self.position_size = new_position
+        self.position_value = abs(self.position_size * price)
+        
+        # Update utilization metrics
+        self.position_utilization = abs(self.position_size) / self.max_position
+        self.notional_utilization = self.position_value / self.max_notional
+        
+        # Check risk limits 
+        exceeded_limit, reason = self.check_position_limits(price)
+        
+        # Log position update
+        if exceeded_limit:
+            self.logger.warning(
+                f"Position updated from fills: {old_position:.3f} -> {self.position_size:.3f} @ {price:.2f} "
+                f"(util: pos={self.position_utilization:.2%}, notional={self.notional_utilization:.2%}). "
+                f"Risk limit exceeded: {reason}"
+            )
+        
+        return {
+            "position_size": self.position_size,
+            "entry_price": self.entry_price,
+            "position_value": self.position_value,
+            "risk_limit_exceeded": exceeded_limit,
+            "reason": reason if exceeded_limit else ""
+        }

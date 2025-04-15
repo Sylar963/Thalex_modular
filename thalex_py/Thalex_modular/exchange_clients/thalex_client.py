@@ -5,6 +5,7 @@ This client adapts the native thalex API to work with the hedge execution system
 
 import asyncio
 import logging
+import time
 from typing import Dict, Optional, Any, List
 from enum import Enum
 
@@ -98,11 +99,48 @@ class ThalexClient:
     async def _update_prices_continuous(self):
         """Continuously update market prices from ticker data"""
         logger.info("Starting continuous price updates")
+        last_successful_update = None
+        no_message_counter = 0
+        error_counter = 0
+        
+        # Initialize prices with reasonable defaults if needed
+        if "BTC-PERPETUAL" not in self.market_prices:
+            self.market_prices["BTC-PERPETUAL"] = 0.0
+        if "ETH-PERPETUAL" not in self.market_prices:
+            self.market_prices["ETH-PERPETUAL"] = 0.0
         
         while True:
             try:
-                # Get a message from the websocket
-                message = await self.thalex.receive()
+                # Get a message from the websocket with timeout
+                message = await asyncio.wait_for(self.thalex.receive(), timeout=5.0)
+                
+                if not message:
+                    no_message_counter += 1
+                    if no_message_counter >= 10:
+                        logger.warning(f"No messages received for {no_message_counter} attempts, checking connection...")
+                        no_message_counter = 0
+                        
+                        # Check connection and reinitialize if needed
+                        if not self.thalex.connected():
+                            logger.error("Thalex client disconnected, attempting to reconnect...")
+                            reconnected = await self.initialize()
+                            if reconnected:
+                                logger.info("Successfully reconnected to Thalex")
+                            else:
+                                logger.error("Failed to reconnect to Thalex")
+                                await asyncio.sleep(5)  # Wait before retrying
+                    continue
+                
+                no_message_counter = 0  # Reset counter on successful message
+                
+                # Try to parse message if it's a string
+                if isinstance(message, str):
+                    try:
+                        import json
+                        message = json.loads(message)
+                    except json.JSONDecodeError:
+                        logger.error(f"Failed to parse message as JSON: {message[:100]}...")
+                        continue
                 
                 # Process ticker updates
                 if message and isinstance(message, dict):
@@ -117,21 +155,61 @@ class ThalexClient:
                                 instrument = parts[1]
                                 data = params.get('data', {})
                                 
-                                # Update price information
+                                # Update price information with explicit logging
+                                old_price = self.market_prices.get(instrument, 0.0)
+                                
+                                # Update with last price if available
                                 if 'last_price' in data and data['last_price'] > 0:
-                                    self.market_prices[instrument] = data['last_price']
-                                    logger.debug(f"Updated {instrument} price to {data['last_price']}")
+                                    new_price = data['last_price']
+                                    self.market_prices[instrument] = new_price
+                                    logger.info(f"Updated {instrument} price: {old_price} -> {new_price}")
+                                    last_successful_update = time.time()
                                 
                                 # Also update with mark price if available
                                 if 'mark_price' in data and data['mark_price'] > 0:
-                                    self.market_prices[f"{instrument}_mark"] = data['mark_price']
-                                    logger.debug(f"Updated {instrument} mark price to {data['mark_price']}")
+                                    mark_price = data['mark_price']
+                                    self.market_prices[f"{instrument}_mark"] = mark_price
+                                    logger.info(f"Updated {instrument} mark price to {mark_price}")
+                                    last_successful_update = time.time()
+                            else:
+                                logger.warning(f"Malformed channel format: {params['channel']}")
+                    else:
+                        # Log other message types for debugging
+                        if message.get('method') != 'heartbeat':  # Skip heartbeat messages
+                            logger.debug(f"Received non-ticker message: {message}")
+                
+                # Check if we haven't received price updates for too long
+                if last_successful_update and time.time() - last_successful_update > 60:
+                    logger.warning(f"No price updates for {int(time.time() - last_successful_update)} seconds")
+                    # Attempt resubscription
+                    try:
+                        logger.info("Attempting to resubscribe to ticker data...")
+                        instruments = ["BTC-PERPETUAL", "ETH-PERPETUAL"]
+                        channels = [f"ticker.{i}.raw" for i in instruments]
+                        subscribe_response = await self.thalex.public_subscribe(channels=channels)
+                        logger.info(f"Resubscribe response: {subscribe_response}")
+                        last_successful_update = time.time()  # Reset timer
+                    except Exception as e:
+                        logger.error(f"Error resubscribing to ticker data: {e}")
             
+            except asyncio.TimeoutError:
+                logger.warning("Timeout waiting for ticker data")
+                continue
             except asyncio.CancelledError:
                 logger.info("Price update task cancelled")
                 break
             except Exception as e:
-                logger.error(f"Error in price update task: {e}")
+                error_counter += 1
+                logger.error(f"Error in price update task: {str(e)}")
+                if error_counter >= 5:
+                    logger.error(f"Too many consecutive errors ({error_counter}), attempting reinitialization")
+                    error_counter = 0
+                    try:
+                        # Try to reconnect and reinitialize
+                        await self.initialize()
+                    except Exception as reconnect_error:
+                        logger.error(f"Failed to reinitialize after errors: {reconnect_error}")
+                
                 await asyncio.sleep(1)  # Prevent tight loop on error
     
     def get_price(self, instrument_name: str) -> float:
@@ -160,6 +238,24 @@ class ThalexClient:
         # Return the cached mark price if available
         return self.market_prices.get(f"{instrument_name}_mark", 0.0)
     
+    async def ensure_initialized(self) -> bool:
+        """
+        Ensure the client is initialized before proceeding with operations
+        
+        Returns:
+            True if successfully initialized or already initialized
+        """
+        if self.is_initialized:
+            # Check if the connection is still active
+            if not self.thalex.connected():
+                logger.warning("Client was initialized but connection lost, reconnecting...")
+                self.is_initialized = False
+                return await self.initialize()
+            return True
+            
+        logger.info("Client not initialized, initializing now...")
+        return await self.initialize()
+    
     async def place_market_order(self, symbol: str, side: str, size: float) -> Dict:
         """
         Place a market order
@@ -175,10 +271,10 @@ class ThalexClient:
         logger.info(f"Placing market order: {symbol} {side} {size}")
         
         # Ensure client is initialized
-        if not self.is_initialized:
-            success = await self.initialize()
-            if not success:
-                return {"status": "error", "error": "Failed to initialize client"}
+        initialized = await self.ensure_initialized()
+        if not initialized:
+            logger.error("Failed to initialize client before placing market order")
+            return {"status": "error", "error": "Failed to initialize client"}
         
         try:
             # Convert order direction
@@ -204,7 +300,7 @@ class ThalexClient:
             return {
                 "status": "filled",
                 "filled_size": size,
-                "filled_price": self.get_price(symbol)
+                "filled_price": self.get_price(symbol) or response.get("price", 0.0)
             }
             
         except Exception as e:
@@ -227,11 +323,11 @@ class ThalexClient:
         logger.info(f"Placing limit order: {symbol} {side} {size} @ {price}")
         
         # Ensure client is initialized
-        if not self.is_initialized:
-            success = await self.initialize()
-            if not success:
-                return {"status": "error", "error": "Failed to initialize client"}
-        
+        initialized = await self.ensure_initialized()
+        if not initialized:
+            logger.error("Failed to initialize client before placing limit order")
+            return {"status": "error", "error": "Failed to initialize client"}
+            
         try:
             # Convert order direction
             direction = Direction.BUY if side.lower() == "buy" else Direction.SELL
@@ -274,19 +370,20 @@ class ThalexClient:
             order_id: Order ID to cancel
             
         Returns:
-            True if successful
+            True if cancellation was successful
         """
         logger.info(f"Cancelling order: {order_id}")
         
         # Ensure client is initialized
-        if not self.is_initialized:
-            success = await self.initialize()
-            if not success:
-                return False
+        initialized = await self.ensure_initialized()
+        if not initialized:
+            logger.error("Failed to initialize client before cancelling order")
+            return False
         
         try:
+            # Call Thalex cancel method
             response = await self.thalex.cancel(order_id=order_id)
-            logger.info(f"Cancel order response: {response}")
+            logger.info(f"Cancel response: {response}")
             return True
         except Exception as e:
             logger.error(f"Error cancelling order: {e}")

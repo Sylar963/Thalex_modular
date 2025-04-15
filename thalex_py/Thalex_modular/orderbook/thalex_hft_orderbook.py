@@ -242,16 +242,25 @@ class ThalexHFTOrderbook:
     # ------------------------------------------------------------------------ #
     def _normalize_price(self, price: float) -> np.uint64:
         """Normalize price to integer based on tick size."""
-        if self.tick_size == 0: 
-            return np.uint64(0)  # Avoid division by zero
+        if self.tick_size == 0 or np.isnan(price) or np.isinf(price): 
+            return np.uint64(0)  # Avoid division by zero or invalid values
         # Adding a small epsilon to handle potential floating point inaccuracies
-        return np.uint64(round((price + 1e-9) / self.tick_size))
+        normalized = round((price + 1e-9) / self.tick_size)
+        # Ensure the value is positive and within uint64 range
+        if normalized < 0:
+            normalized = 0
+        return np.uint64(normalized)
 
     def _normalize_size(self, size: float) -> np.uint64:
         """Normalize size to integer based on lot size."""
-        if self.lot_size == 0: 
-            return np.uint64(0)  # Avoid division by zero
-        return np.uint64(round((size + 1e-9) / self.lot_size))
+        if self.lot_size == 0 or np.isnan(size) or np.isinf(size): 
+            return np.uint64(0)  # Avoid division by zero or invalid values
+        # Adding a small epsilon to handle potential floating point inaccuracies
+        normalized = round((size + 1e-9) / self.lot_size)
+        # Ensure the value is positive and within uint64 range
+        if normalized < 0:
+            normalized = 0
+        return np.uint64(normalized)
 
     def _denormalize_price(self, norm_price: np.uint64) -> float:
         """Convert normalized price back to float."""
@@ -310,8 +319,8 @@ class ThalexHFTOrderbook:
             
             # Convert to normalized values in one pass
             for i, (price_str, size_str) in enumerate(bids_raw):
-                price = float(price_str) / self.tick_size
-                size = float(size_str) / self.lot_size
+                price = self._normalize_price(float(price_str))
+                size = self._normalize_size(float(size_str))
                 
                 tmp_bids[i, PRICE_IDX] = price
                 tmp_bids[i, SIZE_IDX] = size
@@ -326,8 +335,8 @@ class ThalexHFTOrderbook:
             
             # Convert to normalized values in one pass
             for i, (price_str, size_str) in enumerate(asks_raw):
-                price = float(price_str) / self.tick_size
-                size = float(size_str) / self.lot_size
+                price = self._normalize_price(float(price_str))
+                size = self._normalize_size(float(size_str))
                 
                 tmp_asks[i, PRICE_IDX] = price
                 tmp_asks[i, SIZE_IDX] = size
@@ -362,8 +371,10 @@ class ThalexHFTOrderbook:
         
         # Check for sequence gaps
         if self._last_sequence > 0 and sequence != self._last_sequence + 1:
-            # Handle sequence gap - consider resetting or requesting snapshot
-            pass
+            # Log sequence gap and request a fresh snapshot via Exception
+            gap_size = sequence - self._last_sequence - 1
+            if gap_size > 0:  # Only handle positive gaps (missing messages)
+                raise ValueError(f"Sequence gap detected: expected {self._last_sequence + 1}, received {sequence}, missing {gap_size} updates")
         
         # Update sequence tracking
         self._last_sequence = sequence
@@ -393,8 +404,8 @@ class ThalexHFTOrderbook:
         # Convert directly to normalized format in one pass
         for i, (price_str, size_str) in enumerate(bids):
             # Convert strings to floats and normalize in one step
-            price = float(price_str) / self.tick_size
-            size = float(size_str) / self.lot_size
+            price = self._normalize_price(float(price_str))
+            size = self._normalize_size(float(size_str))
             
             tmp[i, PRICE_IDX] = price
             tmp[i, SIZE_IDX] = size
@@ -416,8 +427,8 @@ class ThalexHFTOrderbook:
         # Convert directly to normalized format in one pass
         for i, (price_str, size_str) in enumerate(asks):
             # Convert strings to floats and normalize in one step
-            price = float(price_str) / self.tick_size
-            size = float(size_str) / self.lot_size
+            price = self._normalize_price(float(price_str))
+            size = self._normalize_size(float(size_str))
             
             tmp[i, PRICE_IDX] = price
             tmp[i, SIZE_IDX] = size

@@ -37,11 +37,47 @@ class LoggerFactory:
     
     @classmethod
     async def shutdown(cls):
-        """Shutdown all loggers"""
+        """Shutdown all loggers with timeout protection"""
         if cls._started:
-            for logger in cls._instances.values():
-                await logger.stop()
-            cls._started = False
+            try:
+                # Create a list of tasks to shutdown all loggers with timeout
+                shutdown_tasks = []
+                
+                # Create a task for each logger
+                for name, logger in cls._instances.items():
+                    try:
+                        # Add the stop task with a timeout
+                        shutdown_tasks.append(
+                            asyncio.create_task(cls._stop_logger_with_timeout(name, logger, timeout=2.0))
+                        )
+                    except Exception as e:
+                        print(f"Error creating shutdown task for logger {name}: {str(e)}")
+                
+                # Wait for all loggers to complete or timeout
+                if shutdown_tasks:
+                    await asyncio.gather(*shutdown_tasks, return_exceptions=True)
+                
+            except Exception as e:
+                print(f"Error during logger shutdown: {str(e)}")
+            finally:
+                # Mark as stopped regardless of errors
+                cls._started = False
+                
+    @classmethod
+    async def _stop_logger_with_timeout(cls, name, logger, timeout=2.0):
+        """Attempt to stop a logger with a timeout to prevent hanging"""
+        try:
+            # Create a task for the stop operation
+            stop_task = asyncio.create_task(logger.stop())
+            
+            # Wait for the task to complete with a timeout
+            try:
+                await asyncio.wait_for(stop_task, timeout=timeout)
+                print(f"Logger {name} stopped successfully")
+            except asyncio.TimeoutError:
+                print(f"Logger {name} stop operation timed out after {timeout}s")
+        except Exception as e:
+            print(f"Error stopping logger {name}: {str(e)}")
     
     @classmethod
     def get_log_file_path(cls, component_name: str, log_file: str) -> str:

@@ -339,4 +339,60 @@ class PositionTracker:
             "total_pnl": self.get_total_pnl(),
             "total_volume": self.total_volume_traded,
             "fill_count": len(self.fills_history)
-        } 
+        }
+    
+    def update_position(self, size: float, price: float):
+        """
+        Update position without fill details - simpler but less accurate than update_on_fill
+        """
+        try:
+            # Acquire lock for thread safety
+            with self.position_lock:
+                # Calculate position change
+                position_change = size - self.current_position
+                
+                # Skip if no change
+                if abs(position_change) < self.ZERO_THRESHOLD:
+                    return
+                
+                # Process based on whether we're adding to or reducing position
+                if (abs(self.current_position) < self.ZERO_THRESHOLD or 
+                    (self.current_position > 0 and position_change > 0) or 
+                    (self.current_position < 0 and position_change < 0)):
+                    # Adding to position
+                    self._add_to_position(price, position_change)
+                else:
+                    # Reducing position
+                    self._reduce_position(price, position_change)
+                
+                # Validate position data
+                self.validate_position_data()
+                
+        except Exception as e:
+            self.logger.error(f"Error updating position: {str(e)}", exc_info=True)
+            
+    def update_position_size(self, size: float):
+        """
+        Update just the position size without changing entry prices
+        Used with fill-based position tracking where entry prices are tracked elsewhere
+        """
+        try:
+            # Acquire lock for thread safety
+            with self.position_lock:
+                # Skip if no change
+                if abs(size - self.current_position) < self.ZERO_THRESHOLD:
+                    return
+                    
+                old_position = self.current_position
+                
+                # If resetting to zero, clear all tracking data
+                if abs(size) < self.ZERO_THRESHOLD:
+                    self.reset()
+                    self.logger.debug(f"Position reset to zero (from {old_position:.6f})")
+                else:
+                    # Just update the size without changing entry price info
+                    self.current_position = size
+                    self.logger.debug(f"Position size updated: {old_position:.6f} -> {size:.6f}")
+                    
+        except Exception as e:
+            self.logger.error(f"Error updating position size: {str(e)}", exc_info=True) 

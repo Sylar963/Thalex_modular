@@ -58,6 +58,9 @@ class HedgeConfig:
     exchange_api_secret: Optional[str] = None
     use_testnet: bool = True
     
+    # Strategy settings
+    strategy_name: str = "notional"  # Default strategy type
+    
     # Hedging parameters
     hedge_ratio: float = 1.0  # Default 1:1 hedging
     min_hedge_amount: float = 0.01  # Minimum amount to hedge
@@ -89,6 +92,7 @@ class HedgeConfig:
             "exchange_api_key": self.exchange_api_key,  # Note: should be masked in logs
             "exchange_api_secret": "***" if self.exchange_api_secret else None,  # Masked for security
             "use_testnet": self.use_testnet,
+            "strategy": self.strategy_name,  # Include strategy name
             "hedge_ratio": self.hedge_ratio,
             "min_hedge_amount": self.min_hedge_amount,
             "max_hedge_amount": self.max_hedge_amount,
@@ -110,6 +114,7 @@ class HedgeConfig:
             exchange_api_key=data.get("exchange_api_key"),
             exchange_api_secret=data.get("exchange_api_secret"),
             use_testnet=data.get("use_testnet", True),
+            strategy_name=data.get("strategy", "notional"),  # Get 'strategy' from config dict
             hedge_ratio=data.get("hedge_ratio", 1.0),
             min_hedge_amount=data.get("min_hedge_amount", 0.01),
             max_hedge_amount=data.get("max_hedge_amount"),

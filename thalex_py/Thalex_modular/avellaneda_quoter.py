@@ -8,10 +8,17 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple, Union
 from collections import deque
 import random
-
+import math
+import logging
+import mmap
+import ctypes
 import numpy as np
 import websockets
+from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 import orjson  # Fast JSON parsing
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from multiprocessing import shared_memory
 
 import thalex as th
 from thalex import Network
@@ -31,6 +38,100 @@ from thalex_py.Thalex_modular.models.keys import key_ids, private_keys
 from thalex_py.Thalex_modular.performance_monitor import PerformanceMonitor
 from thalex_py.Thalex_modular.thalex_logging import LoggerFactory
 from thalex_py.Thalex_modular.ringbuffer.market_data_buffer import MarketDataBuffer
+from thalex_py.Thalex_modular.ringbuffer.volume_candle_buffer import VolumeBasedCandleBuffer
+from thalex_py.Thalex_modular.profiling.performance_tracer import PerformanceTracer
+
+# Import call IDs from data_models
+from thalex_py.Thalex_modular.models.data_models import (
+    CALL_ID_INSTRUMENTS,
+    CALL_ID_INSTRUMENT,
+    CALL_ID_SUBSCRIBE,
+    CALL_ID_LOGIN,
+    CALL_ID_CANCEL_SESSION,
+    CALL_ID_SET_COD
+)
+
+# Define memory pool for frequently created objects
+class ObjectPool:
+    def __init__(self, factory, size=100):
+        self.factory = factory
+        self.items = [factory() for _ in range(size)]
+        self.lock = threading.RLock()  # Reentrant lock for thread safety
+        
+    def get(self):
+        with self.lock:
+            if self.items:
+                return self.items.pop()
+            return self.factory()
+            
+    def put(self, item):
+        with self.lock:
+            self.items.append(item)
+
+# Lock-free queue implementation for high-frequency components
+class LockFreeQueue:
+    def __init__(self, maxsize=1000):
+        self.maxsize = maxsize
+        self.queue = np.zeros(maxsize, dtype=np.uint64)
+        self.head = 0
+        self.tail = 0
+
+    def put(self, item):
+        """Put item in queue without locking"""
+        if (self.tail + 1) % self.maxsize == self.head:
+            return False  # Queue is full
+        self.queue[self.tail] = item
+        self.tail = (self.tail + 1) % self.maxsize
+        return True
+
+    def get(self):
+        """Get item from queue without locking"""
+        if self.head == self.tail:
+            return None  # Queue is empty
+        item = self.queue[self.head]
+        self.head = (self.head + 1) % self.maxsize
+        return item
+
+# Memory-mapped structure for IPC
+class SharedMarketData:
+    """Memory-mapped structure for sharing market data between processes"""
+    _fields_ = [
+        ('timestamp', ctypes.c_double),
+        ('mid_price', ctypes.c_double),
+        ('best_bid', ctypes.c_double),
+        ('best_ask', ctypes.c_double),
+        ('bid_quantity', ctypes.c_double),
+        ('ask_quantity', ctypes.c_double),
+        ('volatility', ctypes.c_double),
+        ('status', ctypes.c_int)
+    ]
+    
+    def __init__(self, name="thalex_market_data", size=1024):
+        try:
+            self.shm = shared_memory.SharedMemory(name=name, create=True, size=size)
+        except FileExistsError:
+            # Connect to existing shared memory
+            self.shm = shared_memory.SharedMemory(name=name, create=False)
+        
+        # Create numpy array backed by shared memory
+        self.np_array = np.ndarray((1,), dtype=np.float64, buffer=self.shm.buf)
+        
+    def update(self, data_dict):
+        """Update shared memory with market data"""
+        offset = 0
+        for key, value in data_dict.items():
+            if key in ['timestamp', 'mid_price', 'best_bid', 'best_ask', 'bid_quantity', 
+                      'ask_quantity', 'volatility']:
+                self.np_array[offset] = float(value)
+                offset += 1
+                
+    def close(self):
+        """Close shared memory"""
+        self.shm.close()
+        
+    def unlink(self):
+        """Unlink shared memory"""
+        self.shm.unlink()
 
 class AvellanedaQuoter:
     def __init__(self, thalex: th.Thalex):
@@ -53,7 +154,10 @@ class AvellanedaQuoter:
         self.ticker = None
         self.index = None
         self.perp_name = None
-        self.market_data = MarketDataBuffer()
+        self.market_data = MarketDataBuffer(
+            volatility_window=TRADING_CONFIG["volatility"]["window"],
+            capacity=TRADING_CONFIG["volatility"]["min_samples"]
+        )
         
         # Portfolio data
         self.portfolio = {}
@@ -64,6 +168,7 @@ class AvellanedaQuoter:
         self.last_take_profit_check = 0
         self.take_profit_cooldown = 60  # 60 seconds between take profit checks
         self.take_profit_orders = {}  # Track take profit orders
+        self.take_profit_order_id = None  # Track take profit order ID
         
         # Rate limiting parameters - now managed by circuit breaker in Thalex client
         self.max_requests_per_minute = BOT_CONFIG["connection"]["rate_limit"]
@@ -103,283 +208,1031 @@ class AvellanedaQuoter:
         self.last_quote_update_time = 0
         
         # Instrument data cache to avoid frequent lookups
+        self.instrument_data = {}
+        
+        # WebSocket message processing optimization
+        self.message_buffer_size = 32768  # 32KB buffer
+        self.message_buffer = bytearray(self.message_buffer_size)
+        self.message_view = memoryview(self.message_buffer)
+        
+        # Create object pools for frequently created objects
+        # Create a factory function to ensure proper Order initialization 
+        def _create_empty_order():
+            return Order(
+                id=0,
+                price=0.0,
+                amount=0.0,
+                status=OrderStatus.PENDING,
+                direction=None
+            )
+
+        self.order_pool = ObjectPool(lambda: Order(
+            id=0,
+            price=0.0,
+            amount=0.0,
+            status=OrderStatus.PENDING,
+            direction=None
+        ), size=50)
+        self.ticker_pool = ObjectPool(lambda: Ticker({
+            "mark_price": 0.0,
+            "best_bid_price": 0.0,
+            "best_ask_price": 0.0,
+            "index": 0.0,
+            "mark_timestamp": time.time(),
+            "timestamp": time.time()  # Add timestamp parameter
+        }), size=10)
+        
+        # Initialize quote pool
+        self.quote_pool = ObjectPool(lambda: Quote(
+            price=0.0,
+            amount=0.0,
+            instrument="",
+            side="",
+            timestamp=time.time()
+        ), size=100)
+        
+        # Initialize instrument data cache
         self.instrument_data_cache = {}
         
-        # Message processing statistics
-        self.message_processing_times = np.zeros(1000)  # Last 1000 processing times
-        self.message_processing_idx = 0
-        
-        self.logger.info("Avellaneda quoter initialized")
-
-    async def start(self):
-        """Start the quoter and initialize logging"""
-        # Initialize logging system
-        await LoggerFactory.initialize()
-        self.logger.info("Starting Avellaneda quoter...")
-        
+        # Create shared memory for IPC
         try:
-            # Initialize required attributes
-            self.rate_limit_warning_sent = False
-            self.volatile_market_warning_sent = False
-            self.cooldown_active = False
-            self.cooldown_until = 0
-            self.last_ticker_time = 0
-            self.last_quote_time = 0
+            self.shared_market_data = SharedMarketData(name="thalex_market_data", size=1024)
+        except Exception as e:
+            self.logger.warning(f"Failed to create shared memory: {str(e)}")
+            self.shared_market_data = None
+        
+        # Performance tracing
+        self.performance_tracer = PerformanceTracer()
+        
+        self.logger.info("Avellaneda quoter initialized with HFT optimizations")
+        
+    async def start(self):
+        """Start the quoter"""
+        try:
+            self.logger.info("Starting Avellaneda quoter...")
             
-            # Set the rate limit in the Thalex client
-            self.thalex.rate_limit = BOT_CONFIG["connection"]["rate_limit"]
+            # Create performance tracer
+            self.performance_tracer = PerformanceTracer()
             
-            # Explicitly connect to the Thalex API
+            # Initialize setup completion event
+            self.setup_complete = asyncio.Event()
+            
+            # Create condition variable for quote updates
+            self.quote_cv = asyncio.Condition()
+            self.condition_met = False
+            
+            # Initialize the Thalex client connection
             self.logger.info("Connecting to Thalex API...")
             await self.thalex.connect()
             
-            # Check if connection was successful
             if not self.thalex.connected():
-                raise ConnectionError("Failed to establish WebSocket connection")
-            
+                self.logger.error("Failed to connect to Thalex API")
+                return False
+                
             self.logger.info("Successfully connected to Thalex API")
             
-            # Initialize instrument details
-            self.logger.info("Initializing instrument details...")
-            await self.await_instruments()
-            
+            # Set up instrument data with timeout
+            self.logger.info("Setting up instrument data...")
+            try:
+                # Wait up to 30 seconds for instrument data
+                await asyncio.wait_for(self.await_instruments(), timeout=30.0)
+                self.logger.info("Instrument data retrieved successfully")
+            except asyncio.TimeoutError:
+                self.logger.error("Timed out waiting for instrument data")
+            except Exception as e:
+                self.logger.error(f"Error setting up instrument data: {str(e)}")
+                return False
+                
             # Login and setup
-            self.logger.info("Logging in and setting up...")
-            network = MARKET_CONFIG["network"]
-            key_id = key_ids[network]
-            private_key = private_keys[network]
-            await self.thalex.login(key_id, private_key, id=CALL_IDS["login"])
+            try:
+                self.logger.info("Logging in to Thalex API...")
+                # Retrieve credentials from configuration
+                network = MARKET_CONFIG["network"]
+                key_id = key_ids[network]
+                private_key = private_keys[network]
+                
+                # Login to the API
+                await self.thalex.login(key_id, private_key, id=CALL_IDS["login"])
+                self.logger.info("Login successful")
+                
+                # Configure cancel on disconnect
+                await self.thalex.set_cancel_on_disconnect(6, id=CALL_IDS["set_cod"])
+                self.logger.info("Cancel on disconnect configured")
+            except Exception as e:
+                self.logger.error(f"Login failed: {str(e)}")
+                return False
             
-            # Set cancel on disconnect
-            await self.thalex.set_cancel_on_disconnect(6, id=CALL_IDS["set_cod"])
+            # Continue with the rest of the existing code
             
-            # Note: We're not setting up market maker protection since we're using individual limit orders instead of mass quotes
-            self.logger.info("Using individual limit orders instead of mass quotes - no market maker protection needed")
+            # Set the perpetual name from config
+            underlying = MARKET_CONFIG.get("underlying", "BTC")
+            self.perp_name = underlying.split("USD")[0] + "-PERPETUAL"
+            self.logger.info(f"Setting instrument name to {self.perp_name}")
             
-            # Subscribe to channels
-            self.logger.info("Subscribing to channels...")
-            if self.perp_name:  # Only subscribe if we have the instrument name
-                await self.thalex.public_subscribe(
-                    channels=[f"ticker.{self.perp_name}.raw", f"price_index.{BOT_CONFIG['market']['underlying']}"],
-                    id=CALL_IDS["subscribe"]
-                )
-                await self.thalex.private_subscribe(
-                    channels=["session.orders", "account.portfolio", "account.trade_history"],
-                    id=CALL_IDS["subscribe"] + 1
-                )
-            else:
-                raise ValueError("No instrument name available for subscriptions")
-
-            # Create and start tasks
-            self.logger.info("Creating tasks...")
-            tasks = [
-                asyncio.create_task(self.listen_task()),
-                asyncio.create_task(self.quote_task()),
-                asyncio.create_task(self.heartbeat_task()),
-                asyncio.create_task(self.performance_monitor.start_recording(self)),
-                asyncio.create_task(self.gamma_update_task()),
-                asyncio.create_task(self.log_status_task())
-            ]
+            # Set the position delta for position tracking
+            if hasattr(self, 'instrument_data') and 'contractSize' in self.instrument_data:
+                contract_size = self.instrument_data['contractSize']
+                self.logger.info(f"Setting contract size to {contract_size}")
+                self.contract_size = float(contract_size)
             
-            self.logger.info("Tasks created, waiting for completion...")
-            await asyncio.gather(*tasks)
+            # Subscribe to WebSocket topics with retry logic
+            self.logger.info("Setting up WebSocket subscriptions...")
+            max_sub_attempts = 3
+            sub_attempt = 0
             
+            while sub_attempt < max_sub_attempts:
+                try:
+                    # Set up all subscriptions
+                    await self._subscribe_to_websocket_topics()
+                    self.logger.info("WebSocket subscriptions completed")
+                    break
+                except Exception as e:
+                    sub_attempt += 1
+                    self.logger.error(f"Subscription attempt {sub_attempt}/{max_sub_attempts} failed: {str(e)}")
+                    
+                    if sub_attempt >= max_sub_attempts:
+                        self.logger.error("Failed to set up WebSocket subscriptions")
+                        return False
+                    
+                    # Wait before retrying
+                    await asyncio.sleep(1)
+            
+            # Create all the tasks that will run concurrently
+            self.logger.info("Setting up background tasks...")
+            
+            # First create the listener task only and wait for initial connection
+            self.tasks = {
+                'listener': asyncio.create_task(self.listen_task())
+            }
+            
+            # Wait for the listener to establish connection
+            self.logger.info("Waiting for listener task to initialize...")
+            await asyncio.sleep(2)
+            
+            # Now create the rest of the tasks
+            self.tasks.update({
+                'heartbeat': asyncio.create_task(self.heartbeat_task()),
+                'status': asyncio.create_task(self.log_status_task()),
+                'profile': asyncio.create_task(self.profile_optimization_task()),
+                'quote': asyncio.create_task(self.quote_task())
+            })
+            
+            # Extra debug logging to track initialization
+            self.logger.info(f"All {len(self.tasks)} tasks created successfully")
+            self.logger.info(f"Tasks: {', '.join(self.tasks.keys())}")
+            
+            # Initialize quote pool if not already done
+            if not hasattr(self, 'quote_pool'):
+                self.quote_pool = ObjectPool(lambda: Quote(
+                    price=0.0,
+                    amount=0.0,
+                    instrument="",
+                    side="",
+                    timestamp=time.time()
+                ), size=100)
+            
+            # Signal that setup is complete
+            self.setup_complete.set()
+            self.logger.info("Quoter startup complete - all systems operational")
+            
+            return True
+            
+        except asyncio.CancelledError:
+            self.logger.warning("Start-up was cancelled")
+            return False
         except Exception as e:
-            self.logger.error(f"Error in main quoter loop: {str(e)}", exc_info=True)
-        finally:
-            # Ensure proper shutdown
-            await self.shutdown()
+            self.logger.error(f"Error starting quoter: {str(e)}")
+            self.logger.error(traceback.format_exc())
+            return False
 
     async def shutdown(self):
         """Shutdown the quoter and cleanup resources"""
         try:
+            self.logger.info("Starting quoter shutdown sequence...")
+            
             # Cancel all orders
-            await self.order_manager.cancel_all_orders()
+            try:
+                self.logger.info("Cancelling all orders...")
+                await self.order_manager.cancel_all_orders()
+            except Exception as e:
+                self.logger.error(f"Error cancelling orders during shutdown: {str(e)}")
             
             # Shutdown thalex client if connected
-            if self.thalex and self.thalex.connected():
-                await self.thalex.disconnect()
+            try:
+                if self.thalex and hasattr(self.thalex, 'connected') and self.thalex.connected():
+                    self.logger.info("Disconnecting from Thalex...")
+                    await self.thalex.disconnect()
+            except Exception as e:
+                self.logger.error(f"Error disconnecting from Thalex: {str(e)}")
             
-            # Shutdown logging
-            await LoggerFactory.shutdown()
+            # Close shared memory resources with timeout protection
+            try:
+                self.logger.info("Cleaning up shared memory resources...")
+                if hasattr(self, 'shared_market_data') and self.shared_market_data is not None:
+                    try:
+                        self.shared_market_data.close()
+                        self.logger.info("Shared memory closed")
+                    except Exception as se:
+                        self.logger.error(f"Error closing shared memory: {str(se)}")
+                    
+                    try:
+                        self.shared_market_data.unlink()
+                        self.logger.info("Shared memory unlinked")
+                    except FileNotFoundError:
+                        self.logger.error(f"Error unlinking shared memory: File not found")
+                    except Exception as se:
+                        self.logger.error(f"Error unlinking shared memory: {str(se)}")
+            except Exception as e:
+                self.logger.error(f"Error cleaning up shared memory: {str(e)}")
             
+            # Cancel all tasks
+            try:
+                if hasattr(self, 'tasks') and self.tasks:
+                    self.logger.info(f"Cancelling {len(self.tasks)} background tasks...")
+                    for task in self.tasks.values():
+                        if not task.done():
+                            task.cancel()
+                    
+                    # Wait for tasks to actually complete with timeout
+                    try:
+                        # Give tasks up to 5 seconds to clean up
+                        done, pending = await asyncio.wait(self.tasks.values(), timeout=5.0)
+                        if pending:
+                            self.logger.warning(f"{len(pending)} tasks did not complete gracefully and were forced to cancel")
+                    except Exception as wait_error:
+                        self.logger.error(f"Error waiting for tasks to complete: {str(wait_error)}")
+            except Exception as e:
+                self.logger.error(f"Error cancelling tasks: {str(e)}")
+                
             self.logger.info("Quoter shutdown complete")
+            
         except Exception as e:
-            self.logger.error(f"Error during shutdown: {str(e)}")
+            self.logger.error(f"Error during quoter shutdown: {str(e)}", exc_info=True)
 
     async def await_instruments(self):
-        """Initialize instrument details"""
+        """Wait for and process instrument data"""
         try:
-            await self.thalex.instruments(CALL_IDS["instruments"])
-            msg = await self.thalex.receive()
+            self.logger.info("Retrieving instrument data...")
             
-            # Use faster JSON parsing
+            # Get available instruments
             try:
-                msg = orjson.loads(msg)
-            except Exception:
-                msg = json.loads(msg)
+                # Send request for instruments
+                await self.thalex.instruments(CALL_ID_INSTRUMENTS)
                 
-            # Verify the response matches our request ID
-            if "id" not in msg or msg["id"] != CALL_IDS["instruments"]:
-                raise ValueError(f"Unexpected response ID: got {msg.get('id')}, expected {CALL_IDS['instruments']}")
-            
-            if "result" not in msg or not isinstance(msg["result"], list):
-                raise ValueError(f"Invalid instrument response format: missing or invalid 'result' field")
+                # Wait for response with timeout
+                max_retries = 3
+                for retry in range(max_retries):
+                    try:
+                        msg = await asyncio.wait_for(self.thalex.receive(), timeout=5.0)
+                        break
+                    except asyncio.TimeoutError:
+                        if retry < max_retries - 1:
+                            self.logger.warning(f"Timeout waiting for instrument data (attempt {retry+1}/{max_retries}). Retrying...")
+                        else:
+                            raise asyncio.TimeoutError("Timed out waiting for instrument data")
                 
-            # Cache all instruments for faster lookup
-            for instrument in msg["result"]:
-                self.instrument_data_cache[instrument["instrument_name"]] = instrument
-            
-            # Find our target perpetual instrument
-            perpetual_found = False
-            for i in msg["result"]:
-                if i["type"] == "perpetual" and i["underlying"] == MARKET_CONFIG["underlying"]:
-                    perpetual_found = True
-                    tick_size = i["tick_size"]
-                    self.perp_name = i["instrument_name"]
+                # Parse message
+                try:
+                    data = orjson.loads(msg)
+                except Exception:
+                    data = json.loads(msg)
+                
+                # Handle error in response
+                if data.get("error"):
+                    self.logger.error(f"Error retrieving instruments: {data['error']}")
+                    return False
+                
+                # Store instrument data in cache
+                result = data.get("result", [])
+                # Store using appropriate key based on the actual structure
+                self.instrument_data_cache = {}
+                for instr in result:
+                    key = instr.get("name") or instr.get("asset") or instr.get("symbol")
+                    if key:
+                        self.instrument_data_cache[key] = instr
+                
+                # Log the available instruments for debugging
+                self.logger.info(f"Retrieved {len(result)} instruments")
+                for instr in result:
+                    self.logger.debug(f"Instrument: {instr}")
+                
+                # Find perpetual contract 
+                instruments = result
+                perpetual = None
+                underlying = MARKET_CONFIG["underlying"]
+                
+                # Try different underlying formats - prioritize BTC-PERPETUAL format
+                underlying_base = underlying.replace("USD", "")
+                underlying_variants = [
+                    f"{underlying_base}-PERPETUAL",  # BTC-PERPETUAL (primary format)
+                    underlying,  # BTCUSD
+                    underlying.replace("USD", "-USD"),  # BTC-USD
+                    underlying.replace("USD", "/USD"),  # BTC/USD
+                    underlying_base,  # BTC
+                    f"{underlying_base}-PERP"  # BTC-PERP
+                ]
+                
+                # Log the variants we're searching for
+                self.logger.info(f"Searching for underlying variants: {underlying_variants}")
+                
+                # First try to find an exact match
+                for instrument in instruments:
+                    # Check using multiple possible field names
+                    instrument_asset = instrument.get("asset") or instrument.get("name") or instrument.get("symbol") or ""
+                    instrument_type = instrument.get("type") or instrument.get("instrument_type") or ""
                     
-                    # Set tick size for all components AND for the quoter itself
-                    self.tick_size = tick_size
-                    self.order_manager.set_tick_size(tick_size)
-                    self.market_maker.set_tick_size(tick_size)
-                    self.logger.info(f"Found perpetual {self.perp_name} with tick size {tick_size} - setting for all components")
-                    return
+                    self.logger.debug(f"Checking instrument: asset={instrument_asset}, type={instrument_type}")
                     
-            if not perpetual_found:
-                self.logger.error(f"Could not find perpetual with underlying {MARKET_CONFIG['underlying']}")
-                raise ValueError(f"Perpetual {MARKET_CONFIG['underlying']} not found")
+                    # Check all variants
+                    for variant in underlying_variants:
+                        if instrument_asset == variant:
+                            perpetual = instrument
+                            self.logger.info(f"Found perpetual match: {instrument_asset}")
+                            break
+                    
+                    if perpetual:
+                        break
                 
-        except ValueError as e:
-            # Re-raise value errors with the original message
-            self.logger.error(f"Error processing instruments: {str(e)}")
-            raise
-        except Exception as e:
-            # Convert other exceptions to a more specific type with context
-            self.logger.error(f"Unexpected error initializing instruments: {str(e)}", exc_info=True)
-            raise RuntimeError(f"Failed to initialize instruments: {str(e)}") from e
-
-    async def check_rate_limit(self, priority: str = "normal") -> bool:
-        """
-        Check if we're under the rate limit - now delegated to Thalex client
-        
-        This is kept for backward compatibility but uses the client's circuit breaker
-        """
-        try:
-            # For high priority operations, we'll attempt even if near limits
-            if priority == "high":
-                # Check if the client has a circuit breaker
-                if hasattr(self.thalex, 'circuit_breaker') and hasattr(self.thalex, 'CircuitState'):
-                    if self.thalex.circuit_breaker.state != self.thalex.CircuitState.OPEN:
-                        return True
-                else:
-                    # Fall back to simple check if circuit breaker not available
-                    return True
-            
-            # Try to use the client's rate limit checking if available
-            if hasattr(self.thalex, '_check_rate_limit') and callable(self.thalex._check_rate_limit):
-                return await self.thalex._check_rate_limit()
-            else:
-                # Fall back to assuming we're under limit if no check method exists
-                self.logger.debug("No rate limit check method available, assuming under limit")
+                # If no exact match, try a more flexible approach
+                if not perpetual:
+                    self.logger.info("No exact match found, trying flexible matching...")
+                    for instrument in instruments:
+                        instrument_name = str(instrument.get("name") or instrument.get("asset") or instrument.get("symbol") or "").upper()
+                        instrument_type = str(instrument.get("type") or instrument.get("instrument_type") or "").lower()
+                        
+                        # Check if it's a perpetual for any of our underlying variants
+                        is_perpetual = ("PERP" in instrument_name or "perpetual" in instrument_type)
+                        
+                        for variant in underlying_variants:
+                            variant_base = variant.replace("USD", "").replace("-", "").replace("/", "")
+                            if variant_base in instrument_name and is_perpetual:
+                                perpetual = instrument
+                                self.logger.info(f"Found flexible match: {instrument_name}")
+                                break
+                        
+                        if perpetual:
+                            break
+                
+                # If still no match, just take the first perpetual
+                if not perpetual:
+                    self.logger.warning(f"No specific perpetual found for {underlying}, looking for any perpetual...")
+                    for instrument in instruments:
+                        instrument_name = str(instrument.get("name") or instrument.get("asset") or instrument.get("symbol") or "").upper()
+                        instrument_type = str(instrument.get("type") or instrument.get("instrument_type") or "").lower()
+                        
+                        if "PERP" in instrument_name or "perpetual" in instrument_type:
+                            perpetual = instrument
+                            self.logger.info(f"Using first available perpetual: {instrument_name}")
+                            break
+                            
+                if not perpetual:
+                    self.logger.error(f"Could not find any perpetual instrument")
+                    # Log the available instruments for debugging
+                    self.logger.debug(f"Available instruments: {instruments}")
+                    return False
+                
+                # Set perpetual contract details
+                self.perp_name = perpetual.get("name") or perpetual.get("asset") or perpetual.get("symbol")
+                self.tick_size = float(perpetual.get("tick_size") or perpetual.get("tickSize") or 1.0)
+                self.contract_size = float(perpetual.get("contract_size") or perpetual.get("contractSize") or 1.0)
+                
+                # Pass tick size to market maker
+                self.market_maker.set_tick_size(self.tick_size)
+                self.order_manager.set_tick_size(self.tick_size)
+                
+                self.logger.info(f"Found perpetual: {self.perp_name} with tick size {self.tick_size}")
+                
                 return True
+                
+            except Exception as e:
+                self.logger.error(f"Error retrieving instrument data: {str(e)}")
+                raise
+                
         except Exception as e:
-            self.logger.error(f"Error in rate limit check: {str(e)}")
-            # On error, be conservative and act as if we're rate limited
-            return False
+            self.logger.error(f"Error in await_instruments: {str(e)}")
+            raise
+
+    # Add a new profile-guided optimization task
+    async def profile_optimization_task(self):
+        """
+        Profile execution and dynamically optimize critical paths.
+        This task monitors performance of key operations and applies optimizations.
+        """
+        while True:
+            try:
+                # Run every 5 minutes
+                await asyncio.sleep(300)
+                
+                # Analyze performance data
+                critical_paths = self.performance_tracer.get_critical_paths()
+                
+                # Apply optimizations to slowest operations
+                if critical_paths:
+                    self.logger.info(f"Optimizing critical paths: {critical_paths}")
+                    for path, avg_time in critical_paths:
+                        if path == "message_processing" and avg_time > 0.001:
+                            # Optimize message processing if too slow
+                            self.message_buffer_size = min(self.message_buffer_size * 2, 1048576)
+                            self.message_buffer = bytearray(self.message_buffer_size)
+                            self.message_view = memoryview(self.message_buffer)
+                            self.logger.info(f"Increased message buffer to {self.message_buffer_size} bytes")
+                        
+                        elif path == "quote_generation" and avg_time > 0.005:
+                            # Reduce quote complexity if too slow
+                            self.max_orders_per_side = max(1, self.max_orders_per_side - 1)
+                            self.logger.info(f"Reduced max orders per side to {self.max_orders_per_side}")
+                
+                # Reset performance data
+                self.performance_tracer.reset()
+                
+            except Exception as e:
+                self.logger.error(f"Error in profile optimization task: {str(e)}")
+                await asyncio.sleep(60)  # Retry after a minute
 
     async def listen_task(self):
         """Listen for websocket messages"""
-        self.logger.info("Starting listen task...")
-        
+        backoff_time = 0.1  # Initial backoff time
+        max_backoff = 30  # Maximum backoff time in seconds
         consecutive_errors = 0
-        max_consecutive_errors = 10
-        base_error_delay = 0.1  # 100ms
-        max_error_delay = 5.0   # 5 seconds
+        max_consecutive_errors = 20  # Maximum consecutive errors before forcing reconnection
+        
+        # Initialize timestamp for the last received message
+        last_message_time = time.time()
+        
+        self.logger.info("Listen task started - ready to receive messages")
         
         while True:
             try:
-                # Check if connection is alive before attempting to receive
-                if hasattr(self.thalex, 'connected') and callable(self.thalex.connected) and not self.thalex.connected():
-                    self.logger.warning("WebSocket connection lost, attempting to reconnect...")
+                # Wait for connection to be established
+                if not self.thalex.connected():
+                    self.logger.warning("WebSocket not connected. Attempting to reconnect...")
                     try:
+                        # First try to disconnect if there's a stale connection
+                        try:
+                            if self.thalex.ws is not None:
+                                await self.thalex.disconnect()
+                                self.logger.info("Closed stale WebSocket connection")
+                                await asyncio.sleep(1)  # Brief pause before reconnecting
+                        except Exception as disconnect_error:
+                            self.logger.error(f"Error closing stale connection: {str(disconnect_error)}")
+                        
+                        # Now try to connect
                         await self.thalex.connect()
-                        self.logger.info("Successfully reconnected WebSocket")
-                        # Reset error counter on successful reconnection
-                        consecutive_errors = 0
-                    except Exception as conn_err:
-                        self.logger.error(f"Failed to reconnect: {str(conn_err)}")
-                        # Use exponential backoff for reconnection attempts
-                        await asyncio.sleep(min(2 ** consecutive_errors, 30))
-                        consecutive_errors += 1
+                        
+                        # If we got here, connection was successful
+                        self.logger.info("Successfully reconnected to WebSocket")
+                        
+                        # Re-authenticate after reconnection
+                        network = MARKET_CONFIG["network"]
+                        key_id = key_ids[network]
+                        private_key = private_keys[network]
+                        
+                        try:
+                            self.logger.info(f"Re-authenticating with key ID: {key_id}")
+                            await self.thalex.login(key_id, private_key, id=CALL_ID_LOGIN)
+                            self.logger.info("Re-authentication successful")
+                            
+                            # Resubscribe to channels
+                            await self._subscribe_to_websocket_topics()
+                            self.logger.info("Successfully resubscribed to WebSocket topics")
+                            
+                            # Reset backoff time after successful reconnection and resubscription
+                            backoff_time = 0.1
+                            consecutive_errors = 0
+                        except Exception as auth_error:
+                            self.logger.error(f"Failed to re-authenticate: {str(auth_error)}")
+                            raise  # Re-raise to trigger the connection retry logic
+                    except Exception as reconnect_error:
+                        self.logger.error(f"Failed to reconnect: {str(reconnect_error)}")
+                        # Use exponential backoff for retries
+                        await asyncio.sleep(backoff_time)
+                        backoff_time = min(max_backoff, backoff_time * 2)
                         continue
                 
-                # Using the optimized receive method that handles reconnections
-                message = await self.thalex.receive()
+                # Check for message timeout
+                current_time = time.time()
+                if current_time - last_message_time > 60:
+                    # If no messages for 60 seconds, log a warning
+                    self.logger.warning(f"No messages received for {current_time - last_message_time:.1f} seconds")
                 
-                # Reset consecutive errors counter on successful message
-                consecutive_errors = 0
-                
-                start_time = time.time()
-                
-                # Use faster JSON parsing if message is still a string
-                if isinstance(message, str):
+                # Use the tracer to monitor message processing performance
+                with self.performance_tracer.trace("message_processing"):
+                    # Get message with timeout protection
                     try:
-                        data = orjson.loads(message)
-                    except Exception:
-                        data = json.loads(message)
-                else:
-                    data = message
-                
-                # Process notification - handle both old and new API formats
-                # New format uses 'channel_name' instead of 'channel'
-                if "notification" in data:
-                    if "channel" in data:
-                        await self.handle_notification(data["channel"], data["notification"])
-                    elif "channel_name" in data:
-                        # New API format with channel_name
-                        await self.handle_notification(data["channel_name"], data["notification"])
+                        # Set a timeout for the receive operation
+                        message = await asyncio.wait_for(self.thalex.receive(), timeout=30.0)
+                        # Update the last received message time
+                        last_message_time = time.time()
+                    except asyncio.TimeoutError:
+                        self.logger.warning("WebSocket receive timed out after 30 seconds")
+                        consecutive_errors += 1
+                        continue
+                    except websockets.exceptions.ConnectionClosedOK:
+                        self.logger.info("WebSocket connection closed normally")
+                        # Mark the connection as closed to trigger reconnection
+                        self.thalex.ws = None
+                        consecutive_errors += 1
+                        await asyncio.sleep(1)  # Brief pause before attempting to reconnect
+                        continue
+                    except websockets.exceptions.ConnectionClosedError as ws_error:
+                        self.logger.error(f"WebSocket connection closed with error: {str(ws_error)}")
+                        # Mark the connection as closed to trigger reconnection
+                        self.thalex.ws = None
+                        consecutive_errors += 1
+                        await asyncio.sleep(1)  # Brief pause before attempting to reconnect
+                        continue
+                    
+                    # Reset error counter on successful message
+                    consecutive_errors = 0
+                    backoff_time = 0.1  # Reset backoff time on success
+                    
+                    # Process message
+                    if message is None:
+                        self.logger.warning("Received None message from WebSocket")
+                        continue
+                    
+                    # Add detailed logging for debugging
+                    if isinstance(message, str):
+                        # Log a sample of the message for debugging
+                        msg_sample = message[:100] + "..." if len(message) > 100 else message
+                        self.logger.info(f"Received message: {msg_sample}")
+                    
+                    # Use faster JSON parsing if message is still a string with pre-allocated buffer
+                        try:
+                            # Check if message buffer is large enough
+                            if len(message) < self.message_buffer_size:
+                                # Copy message bytes directly into pre-allocated buffer
+                                message_bytes = message.encode('utf-8')
+                                self.message_buffer[:len(message_bytes)] = message_bytes
+                                try:
+                                    data = orjson.loads(self.message_view[:len(message_bytes)])
+                                except Exception as json_error:
+                                    self.logger.error(f"Error parsing JSON with orjson: {str(json_error)}")
+                                    # Fall back to standard JSON parsing
+                                    data = json.loads(message)
+                            else:
+                                # Increase buffer size if message is too large
+                                self.message_buffer_size = min(self.message_buffer_size * 2, 1048576)
+                                self.message_buffer = bytearray(self.message_buffer_size)
+                                self.message_view = memoryview(self.message_buffer)
+                                self.logger.info(f"Increased message buffer to {self.message_buffer_size} bytes")
+                                # Fall back to standard parsing for now
+                                data = json.loads(message)
+                        except Exception as e:
+                            self.logger.error(f"Error parsing message: {str(e)}")
+                            # Fall back to standard JSON parsing
+                            try:
+                                data = json.loads(message)
+                            except Exception as json_error:
+                                self.logger.error(f"Failed to parse message as JSON: {str(json_error)}")
+                                continue  # Skip this message
                     else:
-                        self.logger.warning(f"Received notification with unknown channel format: {data.keys()}")
-                # Process response to API call
-                elif "id" in data:
-                    cid = data["id"]
-                    if "result" in data:
-                        await self.handle_result(data["result"], cid)
-                    elif "error" in data:
-                        await self.handle_error(data["error"], cid)
-                else:
-                    self.logger.warning(f"Received unrecognized message format: {data.keys()}")
-                
-                # Track message processing time
-                processing_time = time.time() - start_time
-                self.message_processing_times[self.message_processing_idx] = processing_time
-                self.message_processing_idx = (self.message_processing_idx + 1) % 1000
-                
-                # Log if processing took too long
-                if processing_time > 0.1:  # More than 100ms
-                    self.logger.warning(f"Message processing took {processing_time*1000:.2f}ms")
+                        data = message
+                    
+                    # Log summary of received data
+                    self.logger.info(f"Received data with keys: {list(data.keys())}")
+                    
+                    # Handle the new ticker format directly 
+                    # Some exchanges send ticker updates in a different format
+                    if "type" in data and data["type"] == "ticker" and "data" in data:
+                        self.logger.info(f"Detected direct ticker update format")
+                        ticker_data = data["data"]
+                        await self.handle_ticker_update(ticker_data)
+                        continue
+                    
+                    # Process notification - handle both old and new API formats
+                    # New format uses 'channel_name' instead of 'channel'
+                    if "notification" in data:
+                        # Get the channel name from whichever field is present
+                        channel = data.get("channel") or data.get("channel_name") or ""
+                        notification = data["notification"]
+                        
+                        self.logger.info(f"Processing notification from channel: {channel}")
+                        await self.handle_notification(channel, notification)
+                    # Process response to API call
+                    elif "id" in data:
+                        cid = data["id"]
+                        if "result" in data:
+                            await self.handle_result(data["result"], cid)
+                        elif "error" in data:
+                            await self.handle_error(data["error"], cid)
+                    # Direct ticker data pattern
+                    elif "ticker" in data:
+                        self.logger.info("Detected ticker data pattern")
+                        await self.handle_ticker_update(data["ticker"])
+                    # Other direct data structures
+                    elif "instrument" in data and "price" in data:
+                        self.logger.info("Detected direct market data format")
+                        await self.handle_ticker_update(data)
+                    else:
+                        self.logger.warning(f"Received unrecognized message format with keys: {data.keys()}")
+                        self.logger.warning(f"Received unrecognized message format: {data.keys()}")
                 
             except asyncio.CancelledError:
-                self.logger.info("Listen task cancelled, exiting...")
+                self.logger.info("Listen task cancelled")
                 break
-            except (ConnectionError, websockets.exceptions.ConnectionClosed) as conn_err:
-                consecutive_errors += 1
-                self.logger.error(f"Connection error in listen task (attempt {consecutive_errors}): {str(conn_err)}")
-                # Use exponential backoff for connection errors
-                delay = min(base_error_delay * (2 ** consecutive_errors), max_error_delay)
-                self.logger.info(f"Waiting {delay:.2f}s before reconnection attempt")
-                await asyncio.sleep(delay)
             except Exception as e:
                 consecutive_errors += 1
-                self.logger.error(f"Error in listen task (attempt {consecutive_errors}): {str(e)}", exc_info=True)
+                self.logger.error(f"Error in listen task: {str(e)}", exc_info=True)
                 
-                # If too many consecutive errors, implement exponential backoff
+                # Use exponential backoff strategy
+                await asyncio.sleep(backoff_time)
+                backoff_time = min(max_backoff, backoff_time * 2)
+                
+                # Circuit breaker - if too many errors, force reconnection
                 if consecutive_errors > max_consecutive_errors:
-                    delay = min(base_error_delay * (2 ** (consecutive_errors - max_consecutive_errors)), max_error_delay)
-                    self.logger.warning(f"Too many consecutive errors ({consecutive_errors}), backing off for {delay:.2f}s")
-                    await asyncio.sleep(delay)
+                    self.logger.warning(f"Circuit breaker activated after {consecutive_errors} errors. Forcing reconnection.")
+                    try:
+                        # Close the connection if it's still open
+                        if self.thalex.ws is not None:
+                            await self.thalex.disconnect()
+                    except Exception:
+                        pass  # Ignore errors during disconnect
+                    
+                    # Mark the connection as closed to trigger reconnection on the next iteration
+                    self.thalex.ws = None
+                    
+                    # Take a longer break before reconnecting
+                    await asyncio.sleep(max_backoff)
+                    
+                    # Reset error counter
+                    consecutive_errors = 0
+
+    # Zero-copy message handling for high-frequency market data
+    async def handle_ticker_update(self, ticker_data: Dict):
+        """
+        Handle ticker updates with zero-copy optimizations.
+        
+        Args:
+            ticker_data: Dictionary containing ticker update data
+        """
+        with self.performance_tracer.trace("ticker_processing"):
+            try:
+                # Add debug logging
+                self.logger.info(f"Received ticker update: {ticker_data.keys()}")
+                
+                # Extract instrument ID - handle different possible data formats
+                instrument_id = (
+                    ticker_data.get("instrumentId") or 
+                    ticker_data.get("instrument_id") or 
+                    ticker_data.get("name")
+                )
+                
+                # Handle case where ticker might be nested
+                if not instrument_id and "instrument" in ticker_data:
+                    instrument_data = ticker_data.get("instrument", {})
+                    if isinstance(instrument_data, dict):
+                        instrument_id = instrument_data.get("name") or instrument_data.get("instrumentId")
+                
+                # Debug log
+                if instrument_id:
+                    self.logger.info(f"Processing ticker for instrument: {instrument_id}")
                 else:
-                    await asyncio.sleep(base_error_delay)  # Basic delay on occasional errors
+                    self.logger.warning(f"Could not extract instrument ID from ticker data: {ticker_data}")
+                    # Try to infer from our expected instrument
+                    instrument_id = self.perp_name
+                    self.logger.info(f"Using default instrument ID: {instrument_id}")
+                
+                # Only process relevant instrument updates
+                if instrument_id and self.perp_name and instrument_id == self.perp_name:
+                    # Extract price fields with multiple possible keys
+                    mark_price = (
+                        ticker_data.get("lastPrice") or
+                        ticker_data.get("mark_price") or
+                        ticker_data.get("markPrice") or
+                        ticker_data.get("last") or
+                        0.0
+                    )
+                    
+                    best_bid_price = (
+                        ticker_data.get("bestBidPrice") or
+                        ticker_data.get("best_bid_price") or
+                        ticker_data.get("bid") or
+                        mark_price * 0.999  # fallback - slightly below mark
+                    )
+                    
+                    best_ask_price = (
+                        ticker_data.get("bestAskPrice") or
+                        ticker_data.get("best_ask_price") or
+                        ticker_data.get("ask") or
+                        mark_price * 1.001  # fallback - slightly above mark
+                    )
+                    
+                    index_price = (
+                        ticker_data.get("indexPrice") or
+                        ticker_data.get("index_price") or
+                        ticker_data.get("index") or
+                        mark_price  # fallback to mark price
+                    )
+                    
+                    # Debug pricing info
+                    self.logger.info(f"Ticker prices: mark={mark_price}, bid={best_bid_price}, ask={best_ask_price}")
+                    
+                    # Create a proper Ticker object
+                    ticker_dict = {
+                        "mark_price": float(mark_price),
+                        "best_bid_price": float(best_bid_price),
+                        "best_ask_price": float(best_ask_price),
+                        "mark_timestamp": time.time(),
+                        "index": float(index_price),
+                    }
+                    
+                    ticker = Ticker(ticker_dict)
+                    
+                    # Add computed fields
+                    ticker.best_bid_amount = float(ticker_data.get("bestBidAmount") or ticker_data.get("best_bid_amount") or 1.0)
+                    ticker.best_ask_amount = float(ticker_data.get("bestAskAmount") or ticker_data.get("best_ask_amount") or 1.0)
+                    ticker.instrument_id = instrument_id
+                    
+                    # Update the ticker
+                    self.ticker = ticker
+                    self.last_ticker_time = time.time()
+                    
+                    # Calculate mid price for convenience
+                    mid_price = (ticker.best_bid_price + ticker.best_ask_price) / 2 if ticker.best_bid_price > 0 and ticker.best_ask_price > 0 else ticker.mark_price
+                    
+                    # Update market data buffer
+                    if mid_price > 0:
+                        if hasattr(self, 'market_data') and hasattr(self.market_data, 'prices'):
+                            self.market_data.prices.append(mid_price)
+                        else:
+                            self.logger.warning("Market data buffer not properly initialized")
+                    
+                    # Update ring buffer for market impact metrics
+                    if hasattr(self, 'price_history'):
+                        self.price_history[self.price_history_idx] = mid_price
+                        self.price_history_idx = (self.price_history_idx + 1) % len(self.price_history)
+                        if not self.price_history_full and self.price_history_idx == 0:
+                            self.price_history_full = True
+                    
+                    # Log ticker update and signal for quote update
+                    self.logger.info(f"Updated ticker: {instrument_id}, mark: {ticker.mark_price}, bid: {ticker.best_bid_price}, ask: {ticker.best_ask_price}")
+                    
+                    # Signal quote update if needed
+                    await self.check_market_conditions_for_quote()
+                    
+                    # Update shared memory for IPC with other processes
+                    if hasattr(self, 'shared_market_data') and self.shared_market_data is not None:
+                        try:
+                            # Create a properly sized data array
+                            market_data_dict = {
+                                'timestamp': time.time(),
+                                'mid_price': mid_price,
+                                'best_bid': ticker.best_bid_price,
+                                'best_ask': ticker.best_ask_price,
+                                'bid_quantity': ticker.best_bid_amount,
+                                'ask_quantity': ticker.best_ask_amount,
+                                'volatility': 0.0  # Calculate volatility if needed
+                            }
+                            
+                            # Update only the first array element to avoid index errors
+                            self.shared_market_data.np_array[0] = market_data_dict.get('timestamp', 0.0)
+                        except Exception as shared_memory_error:
+                            # More specific error handling to identify the issue
+                            if "index" in str(shared_memory_error):
+                                # This is an index bounds error, so the array is not sized properly
+                                self.logger.error(f"SharedMarketData array size issue: {self.shared_market_data.np_array.shape}")
+                            else:
+                                self.logger.error(f"Error updating shared memory: {str(shared_memory_error)}")
+                else:
+                    if instrument_id:
+                        self.logger.info(f"Skipping ticker for irrelevant instrument: {instrument_id}, expected: {self.perp_name}")
+                    else:
+                        self.logger.warning("Received ticker without instrument ID")
+            
+            except Exception as e:
+                self.logger.error(f"Error processing ticker update: {str(e)}", exc_info=True)
+
+    # Use Order objects from memory pool instead of creating them
+    def create_order_from_data(self, data: Dict) -> Order:
+        """
+        Create order object from order data using object pool.
+        
+        Args:
+            data: Order data from API
+            
+        Returns:
+            Order object from pool
+        """
+        try:
+            # Get order from pool
+            order = self.order_pool.get()
+            
+            # Update only the fields defined in the Order class
+            order.id = data.get("id", 0)
+            order.price = float(data.get("limitPrice", 0))
+            order.amount = float(data.get("amount", 0))
+            
+            # Handle status safely - converting string to enum
+            status_str = data.get("status", "PENDING")
+            try:
+                order.status = OrderStatus(status_str)
+            except (ValueError, KeyError):
+                order.status = OrderStatus.PENDING
+                
+            order.direction = data.get("side", None)
+            
+            # Store additional data as attributes (optional)
+            # These won't be part of the core Order class but will be accessible
+            order.client_id = data.get("clientId")
+            order.instrument_id = data.get("instrumentId")
+            order.type = data.get("type")
+            order.filled = float(data.get("filled", 0))
+            order.timestamp = time.time()
+            
+            return order
+            
+        except Exception as e:
+            self.logger.error(f"Error creating order from data: {str(e)}")
+            # Fall back to creating a new order if pool fails
+            order = Order(
+                id=data.get("id", 0),
+                price=float(data.get("limitPrice", 0)),
+                amount=float(data.get("amount", 0)),
+                status=OrderStatus.PENDING,  # Use safe default
+                direction=data.get("side", None)
+            )
+            # Add additional attributes
+            order.client_id = data.get("clientId")
+            order.instrument_id = data.get("instrumentId")
+            order.type = data.get("type")
+            order.filled = float(data.get("filled", 0))
+            order.timestamp = time.time()
+            
+            return order
+
+    async def update_quotes(self, price_data: Dict, market_conditions: Dict):
+        """Generate new quotes based on current market data"""
+        with self.performance_tracer.trace("quote_generation"):
+            try:
+                if price_data is None and self.ticker:
+                    # Create price data from ticker if not provided
+                    price_data = {
+                        "mid_price": (self.ticker.best_bid_price + self.ticker.best_ask_price) / 2
+                        if hasattr(self.ticker, 'best_bid_price') and hasattr(self.ticker, 'best_ask_price')
+                        else self.ticker.mark_price
+                    }
+                    self.logger.info(f"Created price data from ticker: mid_price={price_data['mid_price']}")
+                
+                instrument_id = self.perp_name
+                price = price_data.get("mid_price", 0) if price_data else 0
+                
+                self.logger.info(f"Updating quotes for {instrument_id} at price {price}")
+                
+                # Sanity check
+                if price <= 0:
+                    self.logger.warning("Invalid price for quote generation, using fallback")
+                    if self.ticker and self.ticker.mark_price > 0:
+                        price = self.ticker.mark_price
+                    else:
+                        self.logger.error("No valid price available for quote generation")
+                        return
+                
+                if not self.quoting_enabled:
+                    self.logger.info("Quoting is disabled, skipping quote update")
+                    return
+                
+                if self.cooldown_active and time.time() < self.cooldown_until:
+                    self.logger.info(f"Cooldown active until {self.cooldown_until}, skipping quote update")
+                    return
+                
+                # Generate quotes using the Avellaneda market maker or fallback to simple method
+                bid_quotes = []
+                ask_quotes = []
+                
+                try:
+                    if hasattr(self, 'market_maker') and self.market_maker:
+                        self.logger.info("Generating quotes using Avellaneda market maker")
+                        # Use thread pool for CPU-intensive calculations if available
+                        if hasattr(self, 'thread_pool') and self.thread_pool:
+                            # Create a Ticker object from price data
+                            ticker_obj = Ticker({
+                                "mark_price": price,
+                                "best_bid_price": price * 0.999,  # Approximate bid as slightly below price
+                                "best_ask_price": price * 1.001,   # Approximate ask as slightly above price
+                                "mark_timestamp": time.time(),
+                                "index": price
+                            })
+                            
+                            # Call generate_quotes with proper parameters
+                            bid_quotes, ask_quotes = await asyncio.get_event_loop().run_in_executor(
+                                self.thread_pool,
+                                self.market_maker.generate_quotes,
+                                ticker_obj,
+                                market_conditions,
+                                self.max_orders_per_side
+                            )
+                        else:
+                            # Fallback if thread pool not available
+                            # Create a Ticker object from price data
+                            ticker_obj = Ticker({
+                                "mark_price": price,
+                                "best_bid_price": price * 0.999,  # Approximate bid as slightly below price
+                                "best_ask_price": price * 1.001,   # Approximate ask as slightly above price
+                                "mark_timestamp": time.time(),
+                                "index": price
+                            })
+                            
+                            # Call generate_quotes with proper parameters
+                            bid_quotes, ask_quotes = self.market_maker.generate_quotes(
+                                ticker_obj, market_conditions, self.max_orders_per_side
+                            )
+                    else:
+                        # Fallback to simple quote generation
+                        self.logger.warning("Market maker not available, using fallback quote generation")
+                        bid_quotes, ask_quotes = self._generate_simple_quotes(price)
+                except Exception as e:
+                    self.logger.error(f"Error generating quotes with market maker: {str(e)}")
+                    self.logger.warning("Falling back to simple quote generation")
+                    bid_quotes, ask_quotes = self._generate_simple_quotes(price)
+                
+                self.logger.info(f"Generated {len(bid_quotes)} bid quotes and {len(ask_quotes)} ask quotes")
+                
+                # Apply tick size alignment
+                bid_quotes = self.align_prices_to_tick(bid_quotes, is_bid=True)
+                ask_quotes = self.align_prices_to_tick(ask_quotes, is_bid=False)
+                
+                # Validate quotes
+                bid_quotes, ask_quotes = await self.validate_quotes(bid_quotes, ask_quotes)
+                
+                self.current_quotes = (bid_quotes, ask_quotes)
+                
+                # Place the quotes now rather than signaling
+                self.logger.info("Directly placing quotes instead of signaling")
+                await self.place_quotes(bid_quotes, ask_quotes)
+                
+                # Also signal condition variable for quote task to handle fallback
+                async with self.quote_cv:
+                    self.condition_met = True
+                    self.quote_cv.notify()
+                    
+                self.last_quote_update_time = time.time()
+                
+            except Exception as e:
+                self.logger.error(f"Error updating quotes: {str(e)}")
+                # Return quotes to the pool on error
+                if 'bid_quotes' in locals() and 'ask_quotes' in locals():
+                    for quote in bid_quotes + ask_quotes:
+                        if hasattr(self, 'quote_pool'):
+                            self.quote_pool.put(quote)
+    
+    def _generate_simple_quotes(self, price):
+        """Generate simple quotes as a fallback when market maker fails"""
+        self.logger.info("Generating simple quotes as fallback")
+        
+        # Get the number of levels from config
+        levels = TRADING_CONFIG["quoting"].get("levels", 3)
+        
+        # Get step sizes from config or use defaults
+        bid_step = TRADING_CONFIG["order"].get("bid_step", 1.0) * self.tick_size
+        ask_step = TRADING_CONFIG["order"].get("ask_step", 1.0) * self.tick_size
+        
+        # Generate bid and ask prices around the mid price
+        bid_prices = [price - (i+1) * bid_step for i in range(levels)]
+        ask_prices = [price + (i+1) * ask_step for i in range(levels)]
+        
+        # Convert to Quote objects
+        bid_quotes = []
+        ask_quotes = []
+        instrument_id = self.perp_name
+        
+        # Create quote objects for bids
+        for bid_price in bid_prices:
+            quote = self.quote_pool.get() if hasattr(self, 'quote_pool') else Quote(
+                price=bid_price,
+                amount=TRADING_PARAMS.get("order_size", 0.01),
+                instrument=instrument_id,
+                side="BUY",
+                timestamp=time.time()
+            )
+            if hasattr(self, 'quote_pool'):
+                quote.price = bid_price
+                quote.amount = TRADING_PARAMS.get("order_size", 0.01)
+                quote.instrument = instrument_id
+                quote.side = "BUY"
+                quote.timestamp = time.time()
+            bid_quotes.append(quote)
+            
+        # Create quote objects for asks
+        for ask_price in ask_prices:
+            quote = self.quote_pool.get() if hasattr(self, 'quote_pool') else Quote(
+                price=ask_price,
+                amount=TRADING_PARAMS.get("order_size", 0.01),
+                instrument=instrument_id,
+                side="SELL",
+                timestamp=time.time()
+            )
+            if hasattr(self, 'quote_pool'):
+                quote.price = ask_price
+                quote.amount = TRADING_PARAMS.get("order_size", 0.01)
+                quote.instrument = instrument_id
+                quote.side = "SELL"
+                quote.timestamp = time.time()
+            ask_quotes.append(quote)
+        
+        self.logger.info(f"Generated {len(bid_quotes)} simple bid quotes and {len(ask_quotes)} simple ask quotes")
+        
+        return bid_quotes, ask_quotes
 
     async def handle_notification(self, channel: str, notification: Union[Dict, List[Dict]]):
         """Handle incoming notifications from different channels.
@@ -420,107 +1273,6 @@ class AvellanedaQuoter:
         except Exception as e:
             self.logger.error(f"Error processing notification: {str(e)}", exc_info=True)
 
-    async def handle_ticker_update(self, ticker_data: Dict):
-        """Handle a ticker update notification"""
-        try:
-            # Extract needed values
-            instrument_name = ticker_data.get("instrument_name", "")
-            mark_price = ticker_data.get("mark_price", 0.0)
-            index_price = ticker_data.get("index_price", 0.0)
-            bid_price = ticker_data.get("best_bid_price", 0.0)
-            ask_price = ticker_data.get("best_ask_price", 0.0)
-            timestamp = ticker_data.get("timestamp", 0) / 1e6  # Convert to seconds
-            
-            # Validate prices - critical for quote generation
-            if mark_price <= 0:
-                self.logger.warning(f"Invalid mark price received: {mark_price}, skipping update")
-                return
-                
-            if bid_price <= 0 or ask_price <= 0 or bid_price >= ask_price:
-                self.logger.warning(f"Invalid bid/ask prices: bid={bid_price}, ask={ask_price}")
-                # If bid/ask are invalid but mark price is valid, we can still continue
-                # Just log the warning and proceed
-            
-            # Make sure prices are aligned to tick size if tick size is available
-            if hasattr(self, 'tick_size') and self.tick_size > 0:
-                # Round prices to tick size
-                if mark_price > 0:
-                    mark_price = round(mark_price / self.tick_size) * self.tick_size
-                if bid_price > 0:
-                    bid_price = round(bid_price / self.tick_size) * self.tick_size
-                if ask_price > 0:
-                    ask_price = round(ask_price / self.tick_size) * self.tick_size
-                if index_price > 0:
-                    index_price = round(index_price / self.tick_size) * self.tick_size
-                    
-                self.logger.debug(f"Aligned prices to tick size {self.tick_size}: mark={mark_price}, bid={bid_price}, ask={ask_price}")
-            
-            # Update market data buffer using the proper update method
-            self.market_data.update(
-                price=mark_price,
-                volume=0.0,  # Ticker updates don't have volume data
-                timestamp=int(timestamp * 1000),  # Convert back to milliseconds for buffer
-                is_buy=None  # No buy/sell direction in ticker data
-            )
-            
-            self.last_ticker_time = timestamp
-            
-            # Check if we have a ticker to update
-            if self.ticker is None:
-                # Create a new ticker with the expected dictionary format
-                self.ticker = Ticker({
-                    "mark_price": mark_price,
-                    "best_bid_price": bid_price,
-                    "best_ask_price": ask_price,
-                    "index": index_price,
-                    "mark_timestamp": timestamp,
-                    "funding_rate": 0.0  # Default value
-                })
-                self.logger.info(f"Created initial ticker: mark={mark_price}, bid={bid_price}, ask={ask_price}")
-            else:
-                # Update existing ticker (more efficient)
-                old_mark = self.ticker.mark_price
-                self.ticker.mark_price = mark_price
-                self.ticker.best_bid_price = bid_price
-                self.ticker.best_ask_price = ask_price
-                self.ticker.index = index_price
-                self.ticker.mark_ts = timestamp
-                
-                # Log significant price changes
-                if abs(old_mark - mark_price) > (self.tick_size * 10):  # If price moved more than 10 ticks
-                    self.logger.info(f"Significant price change: {old_mark} -> {mark_price} (Δ: {mark_price - old_mark})")
-            
-            # Add to price history using NumPy array for better performance
-            self.price_history[self.price_history_idx] = mark_price
-            self.price_history_idx = (self.price_history_idx + 1) % 100
-            if self.price_history_idx == 0:
-                self.price_history_full = True
-            
-            # Check for volatile market conditions
-            if len(self.price_history) >= 5:
-                mean_price = np.mean(self.price_history[max(0, self.price_history_idx - 5):self.price_history_idx])
-                std_dev = np.std(self.price_history[max(0, self.price_history_idx - 5):self.price_history_idx])
-                volatility = std_dev / mean_price if mean_price > 0 else 0.0
-                volatility_pct = volatility * 100  # Convert to percentage
-                
-                # Use volatility threshold with fallback to default value
-                volatility_threshold = RISK_LIMITS.get("volatility_threshold", 0.05)
-                is_volatile = volatility_pct > volatility_threshold
-                
-                if is_volatile and not self.volatile_market_warning_sent:
-                    self.logger.warning(f"Volatile market detected: {volatility_pct:.2f}% > {volatility_threshold:.2f}%")
-                    self.volatile_market_warning_sent = True
-                elif not is_volatile:
-                    self.volatile_market_warning_sent = False
-            
-            # Notify quote task of price update
-            async with self.quote_cv:
-                self.condition_met = True
-                self.quote_cv.notify()
-            
-        except Exception as e:
-            self.logger.error(f"Error processing ticker update: {str(e)}", exc_info=True)
-
     async def handle_index_update(self, index_data: Dict):
         """Process index price updates"""
         try:
@@ -555,6 +1307,15 @@ class AvellanedaQuoter:
                     is_buy=order.direction == "buy"
                 )
                 
+                # Update risk manager with position information directly from fill
+                if hasattr(self.risk_manager, 'update_position_fill'):
+                    await self.risk_manager.update_position_fill(
+                        direction=order.direction,
+                        price=order.price,
+                        size=order.amount,
+                        timestamp=time.time()
+                    )
+                
                 # Update VAMP with order fill data if supported
                 if hasattr(self.market_maker, 'update_vamp'):
                     self.market_maker.update_vamp(
@@ -577,6 +1338,16 @@ class AvellanedaQuoter:
                     "fill_impact": 0.5 if order.amount >= significant_fill_threshold else 0.2  # Higher impact for significant fills
                 }
                 
+                # Try to use calculated volatility if available and valid
+                if "yz_volatility" in market_state and market_state["yz_volatility"] is not None and not np.isnan(market_state["yz_volatility"]):
+                    market_conditions["volatility"] = market_state["yz_volatility"]
+                elif "volatility" in market_state and market_state["volatility"] is not None and not np.isnan(market_state["volatility"]):
+                    market_conditions["volatility"] = market_state["volatility"]
+                
+                # Try to use calculated market impact if available
+                if "market_impact" in market_state and market_state["market_impact"] is not None and not np.isnan(market_state["market_impact"]):
+                    market_conditions["market_impact"] = market_state["market_impact"]
+                
                 if self.ticker:
                     if order.amount >= significant_fill_threshold:
                         # Create task with high priority for immediate update for significant fills
@@ -595,46 +1366,26 @@ class AvellanedaQuoter:
         except Exception as e:
             self.logger.error(f"Error handling order update: {str(e)}", exc_info=True)
 
-    def create_order_from_data(self, data: Dict) -> Order:
-        """Create an Order object from API response data"""
-        try:
-            # Extract essential fields with defaults
-            order_id = data.get("client_order_id", data.get("order_id", 0))
-            price = float(data.get("price", 0))
-            amount = float(data.get("amount", 0))
-            status_str = data.get("status", "pending")
-            direction = data.get("direction", "")
-            
-            # Convert status string to OrderStatus enum
-            try:
-                status = OrderStatus(status_str)
-            except (ValueError, KeyError):
-                self.logger.warning(f"Unknown order status: {status_str}, using PENDING")
-                status = OrderStatus.PENDING
-                
-            # Create and return Order object
-            return Order(
-                id=order_id,
-                price=price,
-                amount=amount,
-                status=status,
-                direction=direction
-            )
-        except Exception as e:
-            self.logger.error(f"Error creating order from data: {str(e)}")
-            # Return a minimal valid order to prevent further errors
-            return Order(id=0, price=0, amount=0)
-
     async def handle_portfolio_update(self, portfolio_data: List[Dict]):
-        """Handle a portfolio update notification"""
+        """Handle a portfolio update notification - now only tracking position size"""
         try:
             self.logger.info(f"Processing portfolio update")
             
-            # Default position size
+            # Initialize all variables that will be used to prevent "cannot access local variable" errors
             position_size = 0.0
+            avg_price = 0.0  # Initialize even if not used directly in this function
             
+            # Validate portfolio_data is a list
+            if not isinstance(portfolio_data, list):
+                self.logger.warning(f"Expected list for portfolio_data, got {type(portfolio_data)}")
+                return
+                
             # Iterate through portfolio items
             for item in portfolio_data:
+                if not isinstance(item, dict):
+                    self.logger.warning(f"Expected dict for portfolio item, got {type(item)}")
+                    continue
+                    
                 # Extract asset data - ensure it's a dictionary before using .get()
                 asset = item.get("asset", {})
                 if asset and isinstance(asset, dict):  # Check if asset is a dictionary
@@ -642,12 +1393,7 @@ class AvellanedaQuoter:
                     amount = asset.get("amount", 0.0)
                     
                     # Store in portfolio
-                    self.portfolio[asset_name] = float(amount)
-                    
-                    self.logger.debug(f"Updated asset {asset_name}: {float(amount):.8f}")
-                elif asset and not isinstance(asset, dict):  # Handle case where asset is not a dictionary
-                    # Log the unexpected format but don't crash
-                    self.logger.warning(f"Received asset in unexpected format: {type(asset)}, value: {asset}")
+                    self.portfolio[asset_name] = float(amount) if amount is not None else 0.0
                 
                 # Extract position data
                 position = item.get("position", {})
@@ -663,34 +1409,35 @@ class AvellanedaQuoter:
                 
                 # Only process our target instrument
                 if self.perp_name and instrument == self.perp_name:
-                    # Safely extract values with defaults
-                    size = float(position.get('size', 0.0) or 0.0)
-                    avg_price = float(position.get('average_price', 0.0) or 0.0)
+                    # Safely extract position size only
+                    size_value = position.get('size', 0.0)
+                    size = float(size_value) if size_value is not None else 0.0
+                    
+                    # Safely extract average price if available
+                    avg_price_value = position.get('average_price', 0.0)
+                    avg_price = float(avg_price_value) if avg_price_value is not None else 0.0
                     
                     # Update position tracking
                     position_size = size
-                    position_value = abs(size * avg_price) if avg_price > 0 else 0.0
                     
-                    # Update the risk manager with position information - use async call properly
-                    await self.risk_manager.update_position(
-                        size=size,
-                        price=avg_price,
-                        timestamp=time.time()
-                    )
+                    # Ensure instrument is set in market maker before updating position
+                    if not hasattr(self.market_maker, 'instrument') or self.market_maker.instrument is None or self.market_maker.instrument != self.perp_name:
+                        self.logger.warning(f"Instrument not set in market maker during portfolio update, setting to {self.perp_name}")
+                        if hasattr(self.market_maker, 'set_instrument'):
+                            self.market_maker.set_instrument(self.perp_name)
                     
-                    self.logger.info(
-                        f"Updated position for {instrument}: "
-                        f"Size={size:.8f}, "
-                        f"Avg Price={avg_price:.2f}, "
-                        f"Value={position_value:.2f}"
-                    )
+                    # Log position with average price information if available
+                    if avg_price > 0:
+                        self.logger.info(f"Updated position for {instrument}: Size={size:.8f}, Avg Price={avg_price:.2f}")
+                    else:
+                        self.logger.info(f"Updated position size for {instrument}: Size={size:.8f}")
                     
-            # Update market maker with position information for inventory management
-            if hasattr(self.market_maker, 'update_position'):
-                self.market_maker.update_position(position_size, avg_price)
+            # Update market maker with position size only
+            if hasattr(self.market_maker, 'update_position_size'):
+                self.market_maker.update_position_size(position_size)
                 
         except Exception as e:
-            self.logger.error(f"Error handling portfolio update: {str(e)}")
+            self.logger.error(f"Error handling portfolio update: {str(e)}", exc_info=True)
             
         # Trigger quote update after position change
         async with self.quote_cv:
@@ -698,88 +1445,92 @@ class AvellanedaQuoter:
             self.quote_cv.notify()
 
     async def handle_trade_update(self, trade_data: Dict):
-        """Handle a trade update notification"""
+        """Process trade updates and update market state"""
         try:
-            # Skip trades not related to our instrument
-            if 'symbol' not in trade_data or trade_data['symbol'] != self.perp_name:
-                return
-                
+            # Extract data
             price = float(trade_data.get('price', 0))
-            volume = float(trade_data.get('amount', 0))
-            side = trade_data.get('side', '').lower()
-            is_buyer_maker = trade_data.get('is_buyer_maker', False)
-            ts = trade_data.get('ts', time.time())
+            amount = float(trade_data.get('amount', 0))
+            direction = trade_data.get('direction', '')
+            instrument = trade_data.get('instrument', '')
             
-            # Determine if buy
-            is_buy = side == 'buy'
-            
-            # Skip invalid trades
-            if price <= 0 or volume <= 0:
+            # Check validity
+            if price <= 0 or amount <= 0 or not direction or not instrument:
+                self.logger.warning(f"Received invalid trade data: {trade_data}")
                 return
+            
+            # Only process if for our target instrument
+            if instrument != self.perp_name:
+                return
+            
+            # Convert direction to is_buy flag
+            is_buy = direction.lower() == 'buy'
+            
+            # Update market maker's market data
+            should_update_grid = self.market_maker.update_market_data(price, amount, is_buy, is_trade=True)
+            
+            # Update market data buffer with trade
+            self.market_data.add_trade(price, amount, is_buy)
+            
+            # If the volume candle buffer indicates we should update quotes, do so
+            if should_update_grid:
+                # Get current market conditions
+                market_conditions = self.get_market_conditions()
                 
-            # Update market data with trade
-            self.market_data.update(
-                price=price,
-                volume=volume,
-                timestamp=ts,
-                is_buy=is_buy
-            )
-            
-            # NEW: Update market maker's volume candle buffer
-            self.market_maker.update_market_data(
-                price=price,
-                volume=volume,
-                is_buy=is_buy,
-                is_trade=True
-            )
-            
-            # Update market_impact - this is expensive, so do it less frequently
-            if random.random() < 0.25:  # ~25% of trades
-                market_impact = self.market_data.get_market_impact() 
-                self.market_maker.market_impact = market_impact
-            
-            # Log significant trades (approximately 5% of trades or large sizes)
-            significant_trade = (
-                volume > 0.1 or  # Large trade
-                random.random() < 0.05  # ~5% sample
-            )
-            
-            if significant_trade:
-                # NEW: Get predictive signals if available
-                pred_signals = ""
-                if hasattr(self.market_maker, 'volume_buffer'):
-                    signals = self.market_maker.volume_buffer.get_signal_metrics().get('signals', {})
-                    if signals:
-                        pred_signals = f" | Pred[M:{signals.get('momentum', 0):.2f} R:{signals.get('reversal', 0):.2f}]"
+                # Get current ticker data
+                ticker = self.get_current_ticker()
                 
-                # Log trade with optional signal info
-                self.logger.info(
-                    f"Trade: {volume:.4f} @ {price:.2f} ({'BUY' if is_buy else 'SELL'}) "
-                    f"[{'Aggressive' if not is_buyer_maker else 'Passive'}]{pred_signals}"
-                )
+                if ticker:
+                    # Generate new quotes based on updated parameters
+                    bid_quotes, ask_quotes = self.market_maker.generate_quotes(ticker, market_conditions)
+                    
+                    # Place the quotes
+                    if bid_quotes or ask_quotes:
+                        await self.place_quotes(bid_quotes, ask_quotes)
+                        self.logger.info("Updated quotes based on trade-triggered volume candle prediction")
             
         except Exception as e:
-            self.logger.error(f"Error handling trade update: {str(e)}")
+            self.logger.error(f"Error processing trade update: {str(e)}")
 
     async def handle_result(self, result: Dict, cid: Optional[int]):
-        """Handle API call results"""
+        """
+        Handle result from API call
+        
+        Args:
+            result: Result data from API
+            cid: Call ID that generated this result
+        """
         try:
-            if cid is None:
-                return
+            # Instrument data returned from instruments call
+            if cid == CALL_IDS["instruments"] and isinstance(result, list):
+                self.logger.info(f"Received data for {len(result)} instruments")
                 
-            if cid == CALL_IDS["login"]:
+                # Initialize instrument data cache if needed
+                if not hasattr(self, 'instrument_data'):
+                    self.instrument_data = {}
+                
+                # Process each instrument
+                for instrument in result:
+                    if "instrument_name" in instrument:
+                        self.instrument_data[instrument["instrument_name"]] = instrument
+                
+                # Find specific instrument we're interested in
+                perp_name = MARKET_CONFIG.get("underlying", "BTC") + "-PERPETUAL"
+                
+                if perp_name in self.instrument_data:
+                    self.instrument_data = self.instrument_data[perp_name]
+                    self.logger.info(f"Found instrument data for {perp_name}")
+                    
+                    # Extract contract size
+                    if "contractSize" in self.instrument_data:
+                        self.contract_size = float(self.instrument_data["contractSize"])
+                        self.logger.info(f"Contract size: {self.contract_size}")
+                else:
+                    self.logger.warning(f"Could not find instrument data for {perp_name}")
+                    
+            # Handle other result types
+            elif cid == CALL_IDS["login"]:
                 self.logger.info("Login successful")
-            elif cid == CALL_IDS["subscribe"]:
-                self.logger.info("Subscription successful")
-            elif cid == CALL_IDS["mass_quote"]:
-                # Note: We're using individual limit orders now, but keeping this handler for backward compatibility
-                self.logger.info("Mass quote request successful (legacy handler)")
-                # Update the order manager with the mass quote result
-                if hasattr(self, 'order_manager') and self.order_manager is not None:
-                    await self.order_manager.handle_order_result(result, cid)
-            elif cid >= 100:  # Other order IDs
-                await self.order_manager.handle_order_result(result, cid)
-                
+            
         except Exception as e:
             self.logger.error(f"Error handling result: {str(e)}")
 
@@ -809,434 +1560,24 @@ class AvellanedaQuoter:
         except Exception as e:
             self.logger.error(f"Error handling error message: {str(e)}")
 
-    async def update_quotes(self, price_data: Dict, market_conditions: Dict):
-        """
-        Update quotes based on new market data
+    async def place_quotes(self, bid_quotes: List[Quote], ask_quotes: List[Quote]):
+        """Place quotes using limit orders
         
         Args:
-            price_data: Current ticker/price data
-            market_conditions: Current market conditions (volatility, market impact)
+            bid_quotes: List of bid quotes to place
+            ask_quotes: List of ask quotes to place
         """
         try:
-            if not self.market_maker:
-                self.logger.warning("Cannot update quotes: Market maker not initialized")
+            if not self.quoting_enabled:
+                self.logger.debug("Quoting is disabled, skipping quote placement")
                 return
                 
-            # Create ticker from price data if provided, otherwise use the stored ticker
-            ticker = None
-            if price_data:
-                # Make sure the price_data has the expected keys for Ticker
-                ticker_data = {
-                    "mark_price": price_data.get("mark_price", 0.0),
-                    "best_bid_price": price_data.get("best_bid_price", price_data.get("bid_price", 0.0)),
-                    "best_ask_price": price_data.get("best_ask_price", price_data.get("ask_price", 0.0)),
-                    "index": price_data.get("index_price", price_data.get("index", 0.0)),
-                    "mark_timestamp": price_data.get("timestamp", price_data.get("mark_timestamp", time.time())),
-                    "funding_rate": price_data.get("funding_rate", 0.0)
-                }
-                ticker = Ticker(ticker_data)
-            else:
-                ticker = self.ticker
-                
-            if not ticker or not ticker.mark_price or ticker.mark_price <= 0:
-                self.logger.warning("Cannot update quotes: Invalid ticker data")
-                return
-            
-            # Check and execute take profit if needed - do this before quoting
-            if ticker.mark_price > 0:
-                await self.manage_take_profit(ticker.mark_price)
-                
-            # Rate limiting - check time since last update
+            # Check cooldown
             current_time = time.time()
-            if hasattr(self, 'last_quote_update_time'):
-                time_since_last = current_time - self.last_quote_update_time
-                min_update_interval = 1.0  # Minimum 1 second between quote updates
-                if time_since_last < min_update_interval:
-                    self.logger.info(f"Skipping quote update - too soon since last update ({time_since_last:.1f}s < {min_update_interval:.1f}s)")
-                    return
-                    
-            # Check if we have any active orders in the order manager
-            active_orders_count = len(self.order_manager.active_bids) + len(self.order_manager.active_asks)
-            
-            # Reset current_quotes if no active orders exist in order manager
-            if active_orders_count == 0:
-                self.current_quotes = ([], [])
-                    
-            # Check if active quotes need updating
-            if len(self.current_quotes[0]) > 0 or len(self.current_quotes[1]) > 0:
-                # If we have active quotes, check if they need to be updated
-                should_update = self.market_maker.should_update_quotes(self.current_quotes, ticker.mark_price)
-                if not should_update:
-                    self.logger.info("Skipping quote update - current quotes still valid")
-                    return
-                
-            # Generate quotes using market maker
-            self.logger.info("Generating new quotes...")
-            bid_quotes, ask_quotes = self.market_maker.generate_quotes(ticker, market_conditions)
-            
-            if not bid_quotes and not ask_quotes:
-                self.logger.warning("No valid quotes generated")
+            if self.cooldown_active and current_time < self.cooldown_until:
+                self.logger.debug(f"Cooldown active for {self.cooldown_until - current_time:.2f}s more, skipping quote placement")
                 return
             
-            # Validate quotes before sending
-            bid_quotes, ask_quotes = self.market_maker.validate_quotes(bid_quotes, ask_quotes)
-            
-            # Extra validation after market maker validation
-            if self.tick_size > 0:
-                # Check and align all quote prices to tick size
-                aligned_bid_quotes = []
-                for quote in bid_quotes:
-                    aligned_price = round(quote.price / self.tick_size) * self.tick_size
-                    if aligned_price != quote.price:
-                        # Create a new quote with the aligned price
-                        aligned_quote = Quote(
-                            price=aligned_price,
-                            amount=quote.amount,
-                            instrument=quote.instrument,
-                            side=quote.side,
-                            timestamp=quote.timestamp
-                        )
-                        aligned_bid_quotes.append(aligned_quote)
-                        self.logger.debug(f"Aligned bid price from {quote.price} to {aligned_price}")
-                    else:
-                        aligned_bid_quotes.append(quote)
-                
-                aligned_ask_quotes = []
-                for quote in ask_quotes:
-                    aligned_price = round(quote.price / self.tick_size) * self.tick_size
-                    if aligned_price != quote.price:
-                        # Create a new quote with the aligned price
-                        aligned_quote = Quote(
-                            price=aligned_price,
-                            amount=quote.amount,
-                            instrument=quote.instrument,
-                            side=quote.side,
-                            timestamp=quote.timestamp
-                        )
-                        aligned_ask_quotes.append(aligned_quote)
-                        self.logger.debug(f"Aligned ask price from {quote.price} to {aligned_price}")
-                    else:
-                        aligned_ask_quotes.append(quote)
-                
-                # Replace with aligned quotes
-                bid_quotes = aligned_bid_quotes
-                ask_quotes = aligned_ask_quotes
-            
-            # Verify quote prices are valid
-            valid_bid_quotes = []
-            for quote in bid_quotes:
-                if quote.price <= 0 or quote.amount <= 0:
-                    self.logger.warning(f"Invalid bid quote: price={quote.price}, amount={quote.amount}")
-                    continue
-                valid_bid_quotes.append(quote)
-            
-            valid_ask_quotes = []
-            for quote in ask_quotes:
-                if quote.price <= 0 or quote.amount <= 0:
-                    self.logger.warning(f"Invalid ask quote: price={quote.price}, amount={quote.amount}")
-                    continue
-                valid_ask_quotes.append(quote)
-            
-            # Check if we have any valid quotes left
-            if not valid_bid_quotes and not valid_ask_quotes:
-                self.logger.error("No valid quotes after price alignment, skipping update")
-                return
-                
-            # Replace with validated quotes
-            bid_quotes = valid_bid_quotes
-            ask_quotes = valid_ask_quotes
-            
-            # Always update quotes if it's been too long since the last update
-            max_update_interval = 60.0  # Force update every 60 seconds 
-            if hasattr(self, 'last_quote_update_time') and current_time - self.last_quote_update_time >= max_update_interval:
-                self.logger.info(f"Forcing quote update - {current_time - self.last_quote_update_time:.1f}s elapsed since last update")
-                # Cancel existing quotes
-                await self.cancel_quotes()
-                # Brief pause to allow cancellations to process
-                await asyncio.sleep(0.5)
-                # Place new quotes
-                await self.place_quotes(bid_quotes, ask_quotes)
-                # Update last quote time
-                self.last_quote_time = current_time
-                self.last_quote_update_time = current_time
-                return
-            
-            # Check if order manager has active quotes before comparing prices
-            if active_orders_count == 0:
-                # No active orders in the order manager, force update
-                self.logger.info("No active orders in order manager - forcing quote placement")
-                await self.place_quotes(bid_quotes, ask_quotes)
-                self.last_quote_time = current_time
-                self.last_quote_update_time = current_time
-                return
-                
-            # Check if cancellation is really needed
-            should_cancel = True
-            
-            # Only do price comparison check if there are enough quotes on both sides
-            bid_prices = [q.price for q in bid_quotes]
-            ask_prices = [q.price for q in ask_quotes]
-            current_bid_prices = [q.price for q in self.current_quotes[0]]  
-            current_ask_prices = [q.price for q in self.current_quotes[1]]
-            
-            if (len(current_bid_prices) >= 3 and len(current_ask_prices) >= 3 and 
-                len(bid_prices) >= 3 and len(ask_prices) >= 3):
-                # Compare all quotes (not just the first level)
-                # Check first 3 levels which are most important
-                price_tolerance = 1.0  # Reduced from 2.0 to 1.0 - even more sensitive to changes
-                
-                # Count how many levels have significant changes
-                changed_levels = 0
-                
-                # Check the first 3 levels of bids
-                for i in range(min(3, len(bid_prices))):
-                    if i < len(current_bid_prices):
-                        if abs(bid_prices[i] - current_bid_prices[i]) > price_tolerance:
-                            changed_levels += 1
-                
-                # Check the first 3 levels of asks
-                for i in range(min(3, len(ask_prices))):
-                    if i < len(current_ask_prices):
-                        if abs(ask_prices[i] - current_ask_prices[i]) > price_tolerance:
-                            changed_levels += 1
-                
-                # Only skip update if less than 2 levels have significant changes
-                if changed_levels < 2:
-                    self.logger.info(f"Current quotes are close to desired prices (only {changed_levels} levels changed) - skipping update")
-                    self.last_quote_update_time = current_time
-                    return
-                else:
-                    self.logger.info(f"Updating quotes - {changed_levels} levels have significant price changes")
-            
-            # Cancel existing quotes if needed
-            if should_cancel:
-                self.logger.info("Cancelling existing quotes...")
-                await self.cancel_quotes()
-                
-                # Brief pause to allow cancellations to process
-                await asyncio.sleep(0.5)
-                
-                # Place new quotes
-                self.logger.info("Placing new quotes...")
-                await self.place_quotes(bid_quotes, ask_quotes)
-            
-            # Update last quote time
-            self.last_quote_time = current_time
-            self.last_quote_update_time = current_time
-                
-            # Record successful quote placement
-            self.last_quote_time = time.time()
-            
-            # Log quote summary
-            if bid_quotes or ask_quotes:
-                bid_count = len(bid_quotes)
-                ask_count = len(ask_quotes)
-                self.logger.info(f"Sending limit orders: {bid_count} bids, {ask_count} asks")
-                self.logger.info(f"Limit orders sent: {bid_count} bids, {ask_count} asks")
-                
-            # Verify order counts after placement to detect any potential tracking issues
-            await asyncio.sleep(0.5)  # Brief pause to allow orders to be processed
-            current_active_bids = len(self.order_manager.active_bids)
-            current_active_asks = len(self.order_manager.active_asks)
-            max_levels = TRADING_CONFIG["quoting"].get("levels", 6)
-            
-            if current_active_bids > max_levels or current_active_asks > max_levels:
-                self.logger.error(f"Order tracking issue detected! Active orders exceed max levels: {current_active_bids} bids, {current_active_asks} asks (max: {max_levels})")
-                self.logger.info(f"Initiating emergency cancellation to restore order consistency")
-                await self.cancel_quotes("Order tracking issue detected")
-                
-        except Exception as e:
-            self.logger.error(f"Error updating quotes: {str(e)}", exc_info=True)
-            # On error, try to cancel all quotes for safety
-            try:
-                await self.cancel_quotes()
-            except Exception as cancel_error:
-                self.logger.error(f"Error cancelling quotes after error: {str(cancel_error)}")
-
-    async def cancel_quotes(self, reason="Unknown"):
-        """Cancel all outstanding quotes"""
-        if not self.quoting_enabled:
-            self.logger.debug("Quoting disabled, not cancelling quotes")
-            return
-            
-        try:
-            # Cancel all orders for our instrument
-            self.logger.info(f"Cancelling all orders for {self.perp_name} - reason: {reason}")
-            
-            # Use the order_manager's cancel_all_orders method without parameters
-            await self.order_manager.cancel_all_orders()
-            
-            # Clear current quotes
-            self.current_quotes = ([], [])
-            
-        except Exception as e:
-            self.logger.error(f"Error cancelling quotes: {str(e)}", exc_info=True)
-
-    async def quote_task(self):
-        """Main quoting loop - periodically checks if quotes need updating"""
-        self.logger.info("Quote task started - waiting for updates")
-        
-        last_quote_time = 0
-        min_quote_interval = 1.0  # Reduced from 3.0 to 1.0 seconds for more frequent updates
-        
-        while True:
-            try:
-                # Wait for price updates
-                self.logger.debug("Quote task waiting for notification")
-                async with self.quote_cv:
-                    await self.quote_cv.wait()
-                
-                self.logger.info("Quote task received notification")
-                current_time = time.time()
-                
-                # Enforce minimum interval between quote updates
-                if current_time - last_quote_time < min_quote_interval:
-                    self.logger.info(f"Quote update too frequent - waiting {min_quote_interval}s between updates")
-                    continue
-                    
-                # Check if we're in cooldown
-                if self.cooldown_active and current_time < self.cooldown_until:
-                    self.logger.info(f"In cooldown period - {(self.cooldown_until - current_time):.1f}s remaining")
-                    continue
-                
-                # Skip if no ticker data
-                if not self.ticker:
-                    self.logger.warning("Cannot quote - no ticker data available")
-                    continue
-                
-                # Only proceed if we actually need to update quotes
-                if not self.market_maker.should_update_quotes(self.current_quotes, self.ticker.mark_price):
-                    self.logger.info("Market maker indicates no quote update needed")
-                    continue
-                
-                # Check if we have enough price history
-                min_samples = TRADING_PARAMS["volatility"]["min_samples"]
-                if len(self.price_history) < min_samples:
-                    self.logger.info(f"Need more price history before quoting: {len(self.price_history)}/{min_samples}")
-                    continue
-                
-                # Get market state and conditions
-                market_state = self.market_data.get_market_state()
-                market_conditions = {
-                    "volatility": market_state["yz_volatility"] if "yz_volatility" in market_state and not np.isnan(market_state["yz_volatility"]) else 
-                                 (market_state["volatility"] if not np.isnan(market_state["volatility"]) else TRADING_CONFIG["avellaneda"]["fixed_volatility"]),
-                    "market_impact": market_state.get("market_impact", 0.0)
-                }
-                        
-                # Check rate limit before attempting quote update
-                if not await self.check_rate_limit(priority="high"):
-                    self.logger.warning("Rate limit reached - delaying quote update")
-                    # Set a cooldown period to prevent hammering the API
-                    self.cooldown_active = True
-                    self.cooldown_until = current_time + 5.0  # 5 second cooldown
-                    continue
-                
-                # Update quotes
-                self.logger.info("Generating new quotes")
-                await self.update_quotes(None, market_conditions)
-                last_quote_time = current_time
-                self.logger.info("Quote update completed")
-                
-                # Add a delay after successfully updating quotes to prevent excessive updates
-                await asyncio.sleep(1.0)
-                    
-            except Exception as e:
-                self.logger.error(f"Error in quote task: {str(e)}", exc_info=True)
-                await asyncio.sleep(1)
-
-    async def heartbeat_task(self):
-        """Periodic heartbeat to ensure connection is alive"""
-        self.logger.info("Starting heartbeat task")
-        
-        while True:
-            try:
-                await self.send_heartbeat()
-                
-                # Add a small random jitter (up to ±20%) to prevent heartbeats from bunching up with other operations
-                jitter = random.uniform(0.8, 1.2)
-                wait_time = self.heartbeat_interval * jitter
-                
-                await asyncio.sleep(wait_time)
-            except Exception as e:
-                self.logger.error(f"Error in heartbeat task: {str(e)}")
-                await asyncio.sleep(5)  # Brief pause after error
-                
-    async def send_heartbeat(self):
-        """Send a heartbeat message to keep the connection alive"""
-        try:
-            # Check if connection is alive before attempting heartbeat
-            if hasattr(self.thalex, 'connected') and callable(self.thalex.connected) and not self.thalex.connected():
-                self.logger.warning("Connection lost before heartbeat, attempting to reconnect...")
-                try:
-                    await self.thalex.connect()
-                    self.logger.info("Successfully reconnected in heartbeat task")
-                except Exception as reconnect_err:
-                    self.logger.error(f"Failed to reconnect in heartbeat task: {str(reconnect_err)}")
-                    return False
-            
-            # Try different methods based on what's available in the client
-            heartbeat_sent = False
-            err_msg = None
-            
-            # Method 1: Try to use the ping method if available
-            if not heartbeat_sent and hasattr(self.thalex, 'ping') and callable(self.thalex.ping):
-                try:
-                    await self.thalex.ping(id=CALL_IDS.get("heartbeat", 1010))
-                    heartbeat_sent = True
-                except Exception as e:
-                    err_msg = f"Ping method failed: {str(e)}"
-            
-            # Method 2: Try to use the _send method with public/ping
-            if not heartbeat_sent and hasattr(self.thalex, '_send') and callable(self.thalex._send):
-                try:
-                    await self.thalex._send("public/ping", id=CALL_IDS.get("heartbeat", 1010))
-                    heartbeat_sent = True
-                except Exception as e:
-                    if err_msg:
-                        err_msg += f"; _send method failed: {str(e)}"
-                    else:
-                        err_msg = f"_send method failed: {str(e)}"
-            
-            # Method 3: Check if ws attribute exists and try to send a ping frame directly
-            if not heartbeat_sent and hasattr(self.thalex, 'ws') and self.thalex.ws:
-                try:
-                    # Send a WebSocket ping frame
-                    pong_waiter = await self.thalex.ws.ping()
-                    await asyncio.wait_for(pong_waiter, timeout=5.0)
-                    heartbeat_sent = True
-                except Exception as e:
-                    if err_msg:
-                        err_msg += f"; WebSocket ping failed: {str(e)}"
-                    else:
-                        err_msg = f"WebSocket ping failed: {str(e)}"
-            
-            if heartbeat_sent:
-                self.last_heartbeat = time.time()
-                self.logger.debug("Heartbeat sent successfully")
-                return True
-            else:
-                self.logger.warning(f"All heartbeat methods failed: {err_msg}")
-                return False
-                
-        except Exception as e:
-            self.logger.warning(f"Failed to send heartbeat: {str(e)}")
-            return False
-
-    async def place_quotes(self, bid_quotes: List[Quote], ask_quotes: List[Quote]):
-        """Place quotes using individual limit orders instead of mass_quote API
-        
-        This method deliberately uses individual limit orders rather than mass quotes
-        to avoid dependency on market maker protection configuration.
-        """
-        if not self.quoting_enabled:
-            self.logger.debug("Quoting disabled, not placing quotes")
-            return
-        
-        if self.cooldown_active and time.time() < self.cooldown_until:
-            self.logger.debug("Cooldown active, not placing quotes")
-            return
-            
-        try:
             # Enforce max order levels from config
             max_levels = TRADING_CONFIG["quoting"].get("levels", 6)
             if len(bid_quotes) > max_levels:
@@ -1355,6 +1696,11 @@ class AvellanedaQuoter:
 
     def get_market_conditions(self) -> Dict:
         """Get the current market conditions from market data buffer"""
+        # Check if cached conditions exist and are recent (within last 500ms)
+        current_time = time.time()
+        if hasattr(self, '_cached_market_conditions') and current_time - getattr(self, '_cached_market_time', 0) < 0.5:
+            return self._cached_market_conditions
+            
         market_state = self.market_data.get_market_state()
         
         # Get volatility - prefer Yang-Zhang volatility when available
@@ -1363,10 +1709,96 @@ class AvellanedaQuoter:
         else:
             volatility = market_state["volatility"] if not np.isnan(market_state["volatility"]) else TRADING_CONFIG["avellaneda"]["fixed_volatility"]
         
-        return {
+        conditions = {
             "volatility": volatility,
             "market_impact": market_state.get("market_impact", 0.0)
         }
+        
+        # Cache result
+        self._cached_market_conditions = conditions
+        self._cached_market_time = current_time
+        return conditions
+
+    async def heartbeat_task(self):
+        """
+        Send periodic heartbeats to maintain connection.
+        Also monitor connection health and attempt reconnection if needed.
+        """
+        while True:
+            try:
+                await asyncio.sleep(self.heartbeat_interval)
+                
+                # Check if we need to send a heartbeat
+                current_time = time.time()
+                if current_time - self.last_heartbeat >= self.heartbeat_interval:
+                    # Check if websocket is still connected
+                    if not self.thalex.connected():
+                        self.logger.warning("WebSocket disconnected, skipping heartbeat and waiting for reconnect")
+                        continue
+                    
+                    # Send the heartbeat
+                    try:
+                        await self.send_heartbeat()
+                        self.last_heartbeat = current_time
+                    except Exception as e:
+                        self.logger.error(f"Error sending heartbeat: {str(e)}")
+                        
+                        # Check if we need to force a reconnection
+                        if isinstance(e, websockets.exceptions.ConnectionClosedError) or \
+                           isinstance(e, websockets.exceptions.ConnectionClosedOK):
+                            self.logger.warning("Connection closed during heartbeat, marking for reconnection")
+                            # Mark connection as closed to trigger reconnection in listen task
+                            self.thalex.ws = None
+                
+                # Check overall quoter health
+                # If we haven't received a ticker update in a while, the connection might be stale
+                time_since_last_ticker = current_time - self.last_ticker_time if self.last_ticker_time > 0 else 0
+                if self.last_ticker_time > 0 and time_since_last_ticker > 60:  # 60 seconds without ticker
+                    self.logger.warning(f"No ticker updates for {time_since_last_ticker:.1f} seconds, connection may be stale")
+                    
+                    # Force a reconnection if WebSocket is still marked as connected
+                    if self.thalex.connected():
+                        self.logger.warning("Forcing reconnection due to stale market data")
+                        try:
+                            await self.thalex.disconnect()
+                        except Exception:
+                            pass  # Ignore errors during disconnect
+                        
+                        # Mark connection as closed to trigger reconnection in listen task
+                        self.thalex.ws = None
+            
+            except asyncio.CancelledError:
+                self.logger.info("Heartbeat task cancelled")
+                break
+            except Exception as e:
+                self.logger.error(f"Error in heartbeat task: {str(e)}")
+                await asyncio.sleep(1)  # Wait a moment before continuing
+
+    async def send_heartbeat(self):
+        """Send a heartbeat message to keep the connection alive"""
+        try:
+            # Check if connection is alive before attempting heartbeat
+            if not self.thalex.connected():
+                self.logger.warning("Connection lost before heartbeat, attempting to reconnect...")
+                try:
+                    await self.thalex.connect()
+                    self.logger.info("Successfully reconnected in heartbeat task")
+                except Exception as reconnect_err:
+                    self.logger.error(f"Failed to reconnect in heartbeat task: {str(reconnect_err)}")
+                    return False
+            
+            # Try to use the ping method if available
+            if hasattr(self.thalex, 'ping') and callable(self.thalex.ping):
+                await self.thalex.ping(id=CALL_IDS.get("heartbeat", 1010))
+                self.last_heartbeat = time.time()
+                return True
+            else:
+                self.logger.warning("Thalex client does not have a ping method")
+                return False
+                
+        except Exception as e:
+            self.logger.warning(f"Failed to send heartbeat: {str(e)}")
+            return False
 
     async def gamma_update_task(self):
         """Periodically update gamma based on market conditions"""
@@ -1375,58 +1807,20 @@ class AvellanedaQuoter:
         while True:
             try:
                 # Get current market conditions
-                market_impact = self.market_data.get_market_impact()
+                market_conditions = self.get_market_conditions()
+                volatility = market_conditions.get("volatility", 0.001)
                 
-                # Get volatility from market data buffer
-                if len(self.market_data.volatility) > 0:
-                    volatility = self.market_data.volatility[-1]
-                    if not np.isnan(volatility) and volatility > 0:
-                        # New: Get volatility adjustment from volume candle predictions
-                        vol_adj = 0.0
-                        if hasattr(self.market_maker, 'predictive_adjustments'):
-                            vol_adj = self.market_maker.predictive_adjustments.get('volatility_adjustment', 0.0)
-                            prediction_age = time.time() - self.market_maker.predictive_adjustments.get('last_update_time', 0)
-                            if prediction_age > 300:  # Predictions older than 5 minutes
-                                vol_adj = 0.0
-                                
-                        # Apply volatility adjustment
-                        adjusted_volatility = volatility * (1 + vol_adj)
-                        
-                        # Update market maker volatility
-                        self.market_maker.volatility = adjusted_volatility
-                        
-                        # Log volatility update with prediction info
-                        if abs(vol_adj) > 0.05:
-                            self.logger.info(
-                                f"Volatility updated: {volatility:.4f} -> {adjusted_volatility:.4f} "
-                                f"(adj: {vol_adj:+.2f})"
-                            )
-                
-                # Calculate dynamic gamma
-                new_gamma = self.market_maker.calculate_dynamic_gamma(
-                    self.market_maker.volatility, 
-                    market_impact
-                )
-                
-                # NEW: Apply gamma adjustment from volume candle predictions
-                gamma_adj = 0.0
-                if hasattr(self.market_maker, 'predictive_adjustments'):
-                    gamma_adj = self.market_maker.predictive_adjustments.get('gamma_adjustment', 0.0)
-                    prediction_age = time.time() - self.market_maker.predictive_adjustments.get('last_update_time', 0)
-                    if prediction_age <= 300 and abs(gamma_adj) > 0.1:  # Recent significant adjustment
-                        new_gamma *= (1 + gamma_adj)
-                        self.logger.info(f"Applying predictive gamma adjustment: {gamma_adj:+.3f}")
-                
-                # Update the gamma parameter
-                self.market_maker.update_gamma(new_gamma)
-                
-                # Gather and log prediction accuracy metrics periodically 
-                if random.random() < 0.2 and hasattr(self.market_maker, 'volume_buffer'):
-                    accuracy = self.market_maker.volume_buffer.evaluate_prediction_accuracy(
-                        self.ticker.mark_price if self.ticker else 0
+                # Calculate dynamic gamma if market maker supports it
+                if hasattr(self.market_maker, 'calculate_dynamic_gamma'):
+                    new_gamma = self.market_maker.calculate_dynamic_gamma(
+                        volatility, 
+                        market_conditions.get("market_impact", 0.0)
                     )
-                    if accuracy > 0:
-                        self.logger.info(f"Prediction accuracy: {accuracy:.2f}")
+                    
+                    # Update the gamma parameter if market maker supports it
+                    if hasattr(self.market_maker, 'update_gamma'):
+                        self.market_maker.update_gamma(new_gamma)
+                        self.logger.info(f"Updated gamma parameter to {new_gamma:.5f}")
                 
             except Exception as e:
                 self.logger.error(f"Error in gamma update task: {str(e)}")
@@ -1436,265 +1830,372 @@ class AvellanedaQuoter:
 
     async def log_status_task(self):
         """Periodically log bot status"""
-        await self.setup_complete.wait()
+        await self.setup_complete.wait()  # Wait for setup to complete
         
         while True:
             try:
-                # Get market maker metrics
-                metrics = self.market_maker.get_position_metrics()
-                position = metrics.get('position', 0)
-                realized = metrics.get('realized_pnl', 0)
-                unrealized = metrics.get('unrealized_pnl', 0)
-                entry = metrics.get('entry_price', 0)
+                # Get position metrics if available
+                position = 0.0
+                realized_pnl = 0.0
+                unrealized_pnl = 0.0
+                
+                # Try to get metrics from market maker if it supports it
+                if hasattr(self.market_maker, 'get_position_metrics'):
+                    metrics = self.market_maker.get_position_metrics()
+                    position = metrics.get('position', 0.0) if metrics else 0.0
+                    realized_pnl = metrics.get('realized_pnl', 0.0) if metrics else 0.0
+                    unrealized_pnl = metrics.get('unrealized_pnl', 0.0) if metrics else 0.0
                 
                 # Get current mark price
-                mark_price = self.ticker.mark_price if self.ticker else 0
+                mark_price = self.ticker.mark_price if self.ticker else 0.0
                 
-                # Calculate basic PnL
-                if position != 0 and mark_price > 0 and entry > 0:
-                    unrealized = position * (mark_price - entry)
-                total_pnl = realized + unrealized
+                # Calculate basic stats
+                active_orders = len(self.order_manager.active_bids) + len(self.order_manager.active_asks) if hasattr(self.order_manager, 'active_bids') else 0
                 
-                # Get VAMP value
-                vamp = metrics.get('vamp', 0)
-                
-                # NEW: Get volume candle prediction signals if available
-                pred_info = ""
-                if 'predictive_signals' in metrics:
-                    signals = metrics['predictive_signals']
-                    momentum = signals.get('momentum', 0)
-                    reversal = signals.get('reversal', 0)
-                    exhaustion = signals.get('exhaustion', 0)
-                    
-                    # Format predictive signals info
-                    pred_info = f" | Signals[M:{momentum:.2f} R:{reversal:.2f} E:{exhaustion:.2f}]"
-                    
-                    # Add prediction accuracy if available
-                    if 'prediction_accuracy' in metrics and metrics['prediction_accuracy'] > 0:
-                        pred_info += f" Acc:{metrics['prediction_accuracy']:.2f}"
-                
-                # Log complete status with predictions
+                # Log status with HFT optimization metrics
                 self.logger.info(
-                    f"Status: Pos={position:.4f} @ {entry:.2f} | "
-                    f"Mark={mark_price:.2f} | PnL=[R:{realized:.2f} U:{unrealized:.2f} T:{total_pnl:.2f}] | "
-                    f"VAMP={vamp:.4f}{pred_info}"
+                    f"Status: Pos={position:.3f} | PnL=[R:{realized_pnl:.2f} U:{unrealized_pnl:.2f}] | "
+                    f"Price={mark_price:.1f} | Orders={active_orders} | "
+                    f"HFT=[Pools:{len(self.order_pool.items)}/{len(self.quote_pool.items)}]"
                 )
                 
-                # Monitor rate limit usage
-                self.rate_limit_warning_sent = False
+                # Collect and log performance metrics every 5 minutes
+                if time.time() % 300 < 5:  # Every ~5 minutes
+                    if hasattr(self, 'performance_tracer'):
+                        perf_stats = self.performance_tracer.get_all_stats()
+                        perf_summary = " | ".join([f"{k}:{v['mean']:.2f}ms" for k, v in perf_stats.items()])
+                        self.logger.info(f"Performance metrics: {perf_summary}")
                 
             except Exception as e:
                 self.logger.error(f"Error in status task: {str(e)}")
                 
-            # Wait before next update
-            await asyncio.sleep(60)  # Log every minute
+            # Wait before next update (60 seconds)
+            await asyncio.sleep(60)
 
-    async def manage_take_profit(self, current_price: float) -> bool:
-        """
-        Advanced take profit management with layered take profits and trailing stops
+    async def quote_task(self):
+        """Main quoting loop - periodically checks if quotes need updating"""
+        self.logger.info("Quote task started - waiting for updates")
         
-        Args:
-            current_price: Current mark price
-            
-        Returns:
-            Boolean indicating if any take profit action was taken
-        """
-        # Only check take profit occasionally to avoid too frequent checks
-        current_time = time.time()
-        if current_time - self.last_take_profit_check < self.take_profit_cooldown:
-            return False
-            
-        self.last_take_profit_check = current_time
+        last_quote_time = 0
+        min_quote_interval = 1.0  # Reduced from 3.0 to 1.0 seconds for more frequent updates
+        force_quote_interval = 30.0  # Force new quotes every 30 seconds even without ticker updates
         
-        # Skip if no position
-        if not hasattr(self.risk_manager, 'position_size') or self.risk_manager.position_size == 0:
-            # Reset tracking variables for new positions
-            self.take_profit_levels_executed.clear()
-            self.highest_profit_levels.clear()
-            return False
-            
+        # Add a diagnostic heartbeat to ensure task is running
+        heartbeat_counter = 0
+        
+        # Wait for initial setup to complete
+        self.logger.info("Waiting for setup to complete before starting quote generation")
+        await self.setup_complete.wait()
+        
+        while True:
+            try:
+                # Add a diagnostic log every minute
+                heartbeat_counter += 1
+                if heartbeat_counter % 60 == 0:
+                    self.logger.info(f"Quote task heartbeat #{heartbeat_counter} - task is alive")
+                    if not self.ticker:
+                        self.logger.warning("No ticker data received yet")
+                    else:
+                        self.logger.info(f"Current ticker: mark_price={self.ticker.mark_price}")
+                
+                # Wait for price updates with timeout
+                try:
+                    async with self.quote_cv:
+                        # Wait with timeout to ensure we don't deadlock
+                        await asyncio.wait_for(
+                            self.quote_cv.wait_for(lambda: self.condition_met),
+                            timeout=10.0  # Don't wait indefinitely
+                        )
+                        self.condition_met = False
+                        self.logger.info("Quote task received notification")
+                except asyncio.TimeoutError:
+                    # If we timeout, still proceed with quote update if possible
+                    self.logger.warning("Quote task timed out waiting for notification, proceeding anyway")
+                
+                current_time = time.time()
+                
+                # Force periodic quote updates regardless of ticker changes
+                force_quote = (current_time - last_quote_time >= force_quote_interval)
+                if force_quote:
+                    self.logger.info(f"Forcing quote update after {current_time - last_quote_time:.1f}s since last update")
+                
+                # Enforce minimum interval between quote updates
+                if not force_quote and current_time - last_quote_time < min_quote_interval:
+                    self.logger.info(f"Quote update too frequent - waiting {min_quote_interval}s between updates")
+                    await asyncio.sleep(0.5)
+                    continue
+                    
+                # Check if we're in cooldown
+                if self.cooldown_active and current_time < self.cooldown_until:
+                    self.logger.info(f"In cooldown period - {(self.cooldown_until - current_time):.1f}s remaining")
+                    await asyncio.sleep(0.5)
+                    continue
+                
+                # Skip if no ticker data
+                if not self.ticker:
+                    self.logger.warning("Cannot quote - no ticker data available")
+                    await asyncio.sleep(1.0)  # Shorter sleep to check again soon
+                    continue
+                
+                # Generate default quotes with fallback values if needed
+                if force_quote and (not hasattr(self, 'market_data') or len(self.market_data.prices) < 10):
+                    self.logger.warning("Insufficient market data, using default values for quote generation")
+                    # Create basic market conditions with default values
+                    market_conditions = {
+                        "volatility": TRADING_CONFIG["avellaneda"].get("fixed_volatility", 0.01),
+                        "market_impact": 0.0
+                    }
+                    
+                    # Create basic ticker data
+                    ticker_data = {
+                        "mid_price": self.ticker.mark_price
+                    }
+                    
+                    # Generate quotes with default parameters
+                    self.logger.info("Generating quotes with default parameters")
+                    await self.update_quotes(ticker_data, market_conditions)
+                    last_quote_time = current_time
+                    continue
+                
+                # Check if we have enough price history
+                min_samples = TRADING_CONFIG["volatility"].get("min_samples", 20)
+                if not self.price_history_full and self.price_history_idx < min_samples:
+                    self.logger.info(f"Need more price history before quoting: {self.price_history_idx}/{min_samples}")
+                    continue
+                
+                # Get market conditions
+                market_conditions = self.get_market_conditions()
+                
+                # Get ticker data
+                ticker_data = {
+                    "mid_price": (self.ticker.best_bid_price + self.ticker.best_ask_price) / 2
+                    if hasattr(self.ticker, 'best_bid_price') and hasattr(self.ticker, 'best_ask_price')
+                    else self.ticker.mark_price
+                }
+                
+                # Update quotes
+                self.logger.info("Generating new quotes")
+                with self.performance_tracer.trace("quote_update"):
+                    try:
+                        await self.update_quotes(ticker_data, market_conditions)
+                    except Exception as e:
+                        if "Ticker.__init__() got an unexpected keyword argument 'timestamp'" in str(e):
+                            self.logger.error(f"Error generating quotes with market maker: {str(e)}")
+                            # Create a temporary, valid ticker without the timestamp parameter
+                            # that can be used by the market maker
+                            if hasattr(self, 'ticker') and self.ticker:
+                                ticker_dict = {
+                                    "mark_price": self.ticker.mark_price,
+                                    "best_bid_price": getattr(self.ticker, 'best_bid_price', self.ticker.mark_price * 0.999),
+                                    "best_ask_price": getattr(self.ticker, 'best_ask_price', self.ticker.mark_price * 1.001),
+                                    "mark_timestamp": time.time(),
+                                    "index": getattr(self.ticker, 'index', self.ticker.mark_price)
+                                }
+                                # Skip timestamp parameter when creating the ticker
+                                market_conditions["ticker"] = ticker_dict
+                                # Try again with the fixed ticker data
+                                await self.update_quotes(ticker_data, market_conditions)
+                            else:
+                                self.logger.error("Unable to create valid ticker for quote generation")
+                        else:
+                            # Re-raise other exceptions
+                            raise
+                
+                last_quote_time = current_time
+                self.logger.info("Quote update completed")
+                
+                # Add a delay after successfully updating quotes to prevent excessive updates
+                await asyncio.sleep(0.5)
+                    
+            except asyncio.CancelledError:
+                self.logger.info("Quote task cancelled")
+                break
+            except Exception as e:
+                self.logger.error(f"Error in quote task: {str(e)}", exc_info=True)
+                await asyncio.sleep(1.0)
+
+    # Signal quote update if needed based on market conditions
+    async def check_market_conditions_for_quote(self):
+        """Check if market conditions warrant a quote update and signal if needed"""
         try:
-            # Calculate current P&L percentage
-            current_pnl_pct = self.calculate_position_pnl(current_price)
+            current_time = time.time()
             
-            # Skip if not profitable
-            if current_pnl_pct <= 0:
+            # Don't update too frequently
+            min_interval = TRADING_CONFIG["quoting"].get("min_update_interval", 1.0)
+            if current_time - self.last_quote_update_time < min_interval:
                 return False
                 
-            # Track peak profit for trailing stops
-            if hasattr(self.risk_manager, 'peak_profit'):
-                if current_pnl_pct > self.risk_manager.peak_profit:
-                    self.risk_manager.peak_profit = current_pnl_pct
-            
-            # Check both strategies
-            executed_basic = await self.execute_basic_take_profit(current_price, current_pnl_pct)
-            executed_trailing = await self.execute_trailing_take_profit(current_price, current_pnl_pct)
-            
-            return executed_basic or executed_trailing
+            # Check if we have enough price history
+            if not self.price_history_full and self.price_history_idx < TRADING_CONFIG["volatility"].get("min_samples", 20):
+                return False
+                
+            # Signal the quote task that conditions have changed
+            async with self.quote_cv:
+                self.condition_met = True
+                self.quote_cv.notify()
+                
+            return True
             
         except Exception as e:
-            self.logger.error(f"Error in advanced take profit management: {str(e)}")
+            self.logger.error(f"Error checking market conditions: {str(e)}")
             return False
     
-    def calculate_position_pnl(self, current_price: float) -> float:
-        """Calculate current position P&L percentage"""
-        if not hasattr(self.risk_manager, 'position_size') or self.risk_manager.position_size == 0:
-            return 0.0
-            
-        if not hasattr(self.risk_manager, 'entry_price') or self.risk_manager.entry_price <= 0:
-            return 0.0
-            
-        # Calculate P&L percentage
-        if self.risk_manager.position_size > 0:  # Long position
-            return (current_price - self.risk_manager.entry_price) / self.risk_manager.entry_price
-        else:  # Short position
-            return (self.risk_manager.entry_price - current_price) / self.risk_manager.entry_price
-    
-    async def execute_basic_take_profit(self, current_price: float, current_pnl_pct: float) -> bool:
-        """Execute basic take profit strategy based on fixed percentage levels"""
+    async def _subscribe_to_websocket_topics(self):
+        """Subscribe to WebSocket topics with error handling"""
         try:
-            # Define take profit levels - we'll implement a 4-stage take profit strategy
-            # Each level will close 25% of the position
-            take_profit_levels = [
-                {"level": self.risk_manager.take_profit_pct, "portion": 0.25},
-                {"level": self.risk_manager.take_profit_pct * 1.5, "portion": 0.25},
-                {"level": self.risk_manager.take_profit_pct * 2.0, "portion": 0.25},
-                {"level": self.risk_manager.take_profit_pct * 3.0, "portion": 0.25}
-            ]
+            self.logger.info("Subscribing to WebSocket topics...")
             
-            # Check each level
-            for i, level_data in enumerate(take_profit_levels):
-                level = level_data["level"]
-                portion = level_data["portion"]
-                level_id = f"basic_{i+1}"
+            # Subscribe to public channels
+            if self.perp_name:
+                # Get underlying without USD suffix for index subscription
+                underlying = MARKET_CONFIG["underlying"].replace("USD", "")
                 
-                # Skip if this level was already executed
-                if level_id in self.take_profit_levels_executed:
-                    continue
-                    
-                # Check if P&L exceeds this level
-                if current_pnl_pct >= level:
-                    # Calculate amount to close
-                    amount_to_close = abs(self.risk_manager.position_size * portion)
-                    
-                    # Ensure minimum order size
-                    min_order_size = 0.001
-                    amount_to_close = max(min_order_size, round(amount_to_close, 8))
-                    
-                    # Skip if amount too small
-                    if amount_to_close < min_order_size:
-                        continue
-                        
-                    # Determine direction - sell if long, buy if short
-                    direction = "sell" if self.risk_manager.position_size > 0 else "buy"
-                    
-                    # Log the take profit decision
-                    reason = f"Take profit level {i+1}: {current_pnl_pct:.2%} >= {level:.2%}, closing {portion:.0%}"
-                    self.logger.info(f"EXECUTING TAKE PROFIT: {reason} - {direction} {amount_to_close:.8f} @ market")
-                    
-                    # Execute market order
-                    await self.order_manager.place_order(
-                        instrument=self.perp_name,
-                        direction=direction,
-                        price=None,  # Market order
-                        amount=amount_to_close,
-                        label=f"TakeProfit-L{i+1}",
-                        post_only=False
-                    )
-                    
-                    # Mark level as executed
-                    self.take_profit_levels_executed.add(level_id)
-                    
-                    # Add cooldown
-                    self.last_take_profit_check = time.time() + 120  # 2 minute cooldown
-                    
-                    # Cancel existing quotes to refresh
-                    await self.cancel_quotes("Take profit execution")
-                    
-                    return True
+                await self.thalex.public_subscribe(
+                    channels=[f"ticker.{self.perp_name}.raw", f"index.{underlying}"],
+                    id=CALL_ID_SUBSCRIBE
+                )
+                self.logger.info(f"Subscribed to public channels for {self.perp_name}")
+            else:
+                self.logger.warning("No instrument name available for public subscription")
             
-            return False
+            # Subscribe to private channels
+            await self.thalex.private_subscribe(
+                channels=["session.orders", "account.portfolio", "account.trade_history"],
+                id=CALL_ID_SUBSCRIBE
+            )
+            self.logger.info("Subscribed to private channels")
+            
+            return True
             
         except Exception as e:
-            self.logger.error(f"Error executing basic take profit: {str(e)}")
-            return False
-    
-    async def execute_trailing_take_profit(self, current_price: float, current_pnl_pct: float) -> bool:
-        """Execute trailing take profit strategy based on peak profit drawdown"""
+            self.logger.error(f"Error subscribing to WebSocket topics: {str(e)}")
+            raise
+
+    def align_prices_to_tick(self, quotes, is_bid=True):
+        """Align multiple quote prices to tick size in one vectorized operation
+        
+        This is a batch optimization that aligns multiple prices at once instead
+        of calling individual alignment functions repeatedly.
+        
+        Args:
+            quotes: List of Quote objects to align
+            is_bid: Boolean indicating if these are bid quotes (True) or ask quotes (False)
+            
+        Returns:
+            List of aligned Quote objects
+        """
+        if not quotes or self.tick_size <= 0:
+            return quotes
+            
+        aligned_quotes = []
+        direction = 'down' if is_bid else 'up'  # Bids round down, asks round up
+        
+        for quote in quotes:
+            # Round price to nearest tick
+            if direction == 'down':
+                # For bids, round down to avoid overpaying
+                aligned_price = math.floor(quote.price / self.tick_size) * self.tick_size
+            else:
+                # For asks, round up to avoid selling too cheaply
+                aligned_price = math.ceil(quote.price / self.tick_size) * self.tick_size
+            
+            # Create new quote with updated price (only if needed)
+            if abs(aligned_price - quote.price) > 1e-8:  # Use epsilon for float comparison
+                aligned_quote = Quote(
+                    price=aligned_price,
+                    amount=quote.amount,
+                    instrument=quote.instrument,
+                    side=quote.side,
+                    timestamp=quote.timestamp
+                )
+                aligned_quotes.append(aligned_quote)
+            else:
+                aligned_quotes.append(quote)  # Already aligned
+                
+        return aligned_quotes
+
+    async def validate_quotes(self, bid_quotes: List[Quote], ask_quotes: List[Quote]) -> Tuple[List[Quote], List[Quote]]:
+        """Validate quotes to ensure they meet market requirements"""
+        # Early return if no quotes
+        if not bid_quotes and not ask_quotes:
+            return [], []
+            
+        # Check if we have ticker data
+        if not self.ticker:
+            return [], []
+            
+        # Get current mark price
+        mid_price = self.ticker.mark_price
+        if mid_price <= 0:
+            return [], []
+            
+        # Get current best bid/ask from ticker if available
+        best_bid = getattr(self.ticker, 'best_bid_price', 0)
+        best_ask = getattr(self.ticker, 'best_ask_price', 0)
+        
+        # Validate bids - use batch alignment for better performance
+        valid_bids = [q for q in bid_quotes if q.price > 0 and q.amount > 0]
+        
+        # Validate asks - use batch alignment for better performance
+        valid_asks = [q for q in ask_quotes if q.price > 0 and q.amount > 0]
+        
+        # Apply price alignment in batches (faster)
+        if valid_bids:
+            valid_bids = self.align_prices_to_tick(valid_bids, is_bid=True)
+            
+        if valid_asks:
+            valid_asks = self.align_prices_to_tick(valid_asks, is_bid=False)
+            
+        # Ensure bid/ask spread is maintained
+        if valid_bids and valid_asks:
+            max_bid = max(q.price for q in valid_bids)
+            min_ask = min(q.price for q in valid_asks)
+            
+            # Check for crossed quotes and fix if needed
+            if max_bid >= min_ask:
+                # Use a simple middle point approach for speed
+                mid_point = (max_bid + min_ask) / 2
+                
+                # Adjust bids and asks to not cross
+                valid_bids = [
+                    Quote(
+                        price=min(q.price, mid_point - self.tick_size),
+                        amount=q.amount,
+                        instrument=q.instrument,
+                        side=q.side,
+                        timestamp=q.timestamp
+                    ) if q.price >= min_ask else q
+                    for q in valid_bids
+                ]
+                
+                valid_asks = [
+                    Quote(
+                        price=max(q.price, mid_point + self.tick_size),
+                        amount=q.amount,
+                        instrument=q.instrument,
+                        side=q.side,
+                        timestamp=q.timestamp
+                    ) if q.price <= max_bid else q
+                    for q in valid_asks
+                ]
+        
+        return valid_bids, valid_asks
+
+    async def cancel_quotes(self, reason: str):
+        """Cancel all existing quotes"""
         try:
-            # Define trailing stop levels - each with activation threshold and drawdown percentage
-            trailing_levels = [
-                {"activation": self.risk_manager.take_profit_pct * 2.0, "drawdown": 0.3},  # 30% drawdown from peak after 2x TP
-                {"activation": self.risk_manager.take_profit_pct * 3.0, "drawdown": 0.2}   # 20% drawdown from peak after 3x TP
-            ]
+            self.logger.info(f"Cancelling all orders: {reason}")
             
-            # Update peak profit for each level
-            for i, level in enumerate(trailing_levels):
-                activation = level["activation"]
-                drawdown = level["drawdown"]
-                level_id = f"trailing_{i+1}"
+            # Use the order manager to cancel all orders
+            if hasattr(self, 'order_manager') and self.order_manager:
+                await self.order_manager.cancel_all_orders()
+                self.logger.info("All orders cancelled successfully")
+            else:
+                self.logger.warning("Order manager not available, cannot cancel orders")
                 
-                # Skip if already triggered
-                if level_id in self.take_profit_levels_executed:
-                    continue
-                
-                # Check if P&L exceeds activation level
-                if current_pnl_pct >= activation:
-                    # Update peak profit for this level
-                    if level_id not in self.highest_profit_levels:
-                        self.highest_profit_levels[level_id] = current_pnl_pct
-                    elif current_pnl_pct > self.highest_profit_levels[level_id]:
-                        self.highest_profit_levels[level_id] = current_pnl_pct
-                    
-                    # Calculate drawdown from peak
-                    peak_profit = self.highest_profit_levels[level_id]
-                    profit_drawdown = (peak_profit - current_pnl_pct) / peak_profit if peak_profit > 0 else 0
-                    
-                    # Check if drawdown exceeds threshold
-                    if profit_drawdown >= drawdown:
-                        # Calculate amount to close - close entire position for trailing stop
-                        amount_to_close = abs(self.risk_manager.position_size)
-                        
-                        # Ensure minimum order size
-                        min_order_size = 0.001
-                        amount_to_close = max(min_order_size, round(amount_to_close, 8))
-                        
-                        # Skip if amount too small
-                        if amount_to_close < min_order_size:
-                            continue
-                            
-                        # Determine direction - sell if long, buy if short
-                        direction = "sell" if self.risk_manager.position_size > 0 else "buy"
-                        
-                        # Log the trailing take profit decision
-                        reason = f"Trailing stop: {profit_drawdown:.2%} drawdown from peak profit {peak_profit:.2%}"
-                        self.logger.info(f"EXECUTING TRAILING STOP: {reason} - {direction} {amount_to_close:.8f} @ market")
-                        
-                        # Execute market order
-                        await self.order_manager.place_order(
-                            instrument=self.perp_name,
-                            direction=direction,
-                            price=None,  # Market order
-                            amount=amount_to_close,
-                            label="TrailingStop",
-                            post_only=False
-                        )
-                        
-                        # Mark level as executed
-                        self.take_profit_levels_executed.add(level_id)
-                        
-                        # Add cooldown
-                        self.last_take_profit_check = time.time() + 120  # 2 minute cooldown
-                        
-                        # Cancel existing quotes to refresh
-                        await self.cancel_quotes("Trailing stop execution")
-                        
-                        return True
-            
-            return False
-            
+            return True
         except Exception as e:
-            self.logger.error(f"Error executing trailing take profit: {str(e)}")
+            self.logger.error(f"Error cancelling orders: {str(e)}")
             return False
 
 async def main():

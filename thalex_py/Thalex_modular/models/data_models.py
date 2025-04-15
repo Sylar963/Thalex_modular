@@ -47,6 +47,13 @@ ASK_SIZES = TRADING_CONFIG["order"]["ask_sizes"]
 # SIGNAL_CONFIG now comes from BOT_CONFIG["technical"]["signal"]
 # AVELLANEDA_CONFIG now comes from TRADING_CONFIG["avellaneda"]
 
+# Define convenience variables for imported configurations
+POSITION_LIMITS = RISK_CONFIG["limits"] if "limits" in RISK_CONFIG else {}
+QUOTING_CONFIG = TRADING_CONFIG["quoting"] if "quoting" in TRADING_CONFIG else {}
+INVENTORY_CONFIG = RISK_CONFIG["inventory"] if "inventory" in RISK_CONFIG else {}
+SIGNAL_CONFIG = BOT_CONFIG.get("technical", {}).get("signal", {})
+AVELLANEDA_CONFIG = TRADING_CONFIG["avellaneda"] if "avellaneda" in TRADING_CONFIG else {}
+
 # Performance metrics
 performance_metrics = {
     "successful_trades": 0,
@@ -67,6 +74,16 @@ CALL_ID_LOGIN = BOT_CONFIG["call_ids"].get("login", 3)
 CALL_ID_CANCEL_SESSION = BOT_CONFIG["call_ids"].get("cancel_all", 4)
 CALL_ID_SET_COD = BOT_CONFIG["call_ids"].get("set_cod", 5)
 
+# Define CALL_IDS for backward compatibility
+CALL_IDS = {
+    "instruments": CALL_ID_INSTRUMENTS,
+    "ticker": CALL_ID_INSTRUMENT,
+    "subscribe": CALL_ID_SUBSCRIBE,
+    "login": CALL_ID_LOGIN,
+    "cancel_all": CALL_ID_CANCEL_SESSION,
+    "set_cod": CALL_ID_SET_COD
+}
+
 # Order status enumeration
 class OrderStatus(Enum):
     """Order status enumeration"""
@@ -85,6 +102,16 @@ class Order:
     amount: float
     status: OrderStatus = OrderStatus.PENDING
     direction: Optional[str] = None
+    
+    def __post_init__(self):
+        """Initialize additional fields after constructor"""
+        self.creation_time: float = 0.0
+        self.last_update_time: float = 0.0
+        self.filled_amount: float = 0.0
+        self.average_fill_price: float = 0.0
+        self.client_id: Optional[str] = None
+        self.instrument_id: Optional[str] = None
+        self.type: Optional[str] = None
     
     def is_open(self) -> bool:
         """Check if order is still open"""
@@ -132,6 +159,8 @@ class Ticker:
         self.funding_rate: float = float(data["funding_rate"]) if "funding_rate" in data else 0.0
         self.volume: float = float(data.get("volume", 0.0))
         self.open_interest: float = float(data.get("open_interest", 0.0))
+        # Add timestamp field with default value to avoid the error
+        self.timestamp: float = float(data.get("timestamp", time.time()))
 
     def to_dict(self) -> Dict:
         return {

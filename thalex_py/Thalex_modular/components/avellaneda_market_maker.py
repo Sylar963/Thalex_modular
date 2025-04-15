@@ -50,6 +50,7 @@ class AvellanedaMarketMaker:
         self.last_mid_price = 0.0
         self.last_update_time = 0.0
         self.volatility_grid = []
+        self.price_history = deque(maxlen=TRADING_CONFIG["volatility"]["window"])
         
         # VAMP (Volume Adjusted Market Pressure) tracking
         self.vamp_window = deque(maxlen=TRADING_CONFIG["vamp"]["window"])
@@ -67,7 +68,7 @@ class AvellanedaMarketMaker:
             max_time_seconds=TRADING_CONFIG.get("volume_candle", {}).get("max_time_seconds", 300)
         )
         
-        # NEW: Predictive state tracking
+        # NEW: Predictive state tracking - initialize at the start to avoid None issues
         self.predictive_adjustments = {
             "gamma_adjustment": 0.0,
             "kappa_adjustment": 0.0,
@@ -76,6 +77,13 @@ class AvellanedaMarketMaker:
             "volatility_adjustment": 0.0,
             "last_update_time": 0
         }
+        
+        # Add parameters for real-time grid updates
+        self.last_prediction_time = time.time()
+        self.prediction_interval = TRADING_CONFIG.get("volume_candle", {}).get("prediction_update_interval", 10.0)
+        self.last_grid_update_time = time.time()
+        self.grid_update_interval = 3.0  # Update grid every 3 seconds
+        self.force_grid_update = False
         
         self.logger.info("Avellaneda market maker initialized")
         
@@ -124,20 +132,28 @@ class AvellanedaMarketMaker:
 
         # Hedge manager integration
         self.hedge_manager = None
-        self.use_hedging = TRADING_CONFIG.get("hedging", {}).get("enabled", False)
-        if self.use_hedging:
+        self.use_hedging = False  # Always disable hedging
+        
+        # Skip the hedge manager initialization to avoid the exchange_api_key error
+        if False and self.use_hedging:  # Force this to never execute
             from .hedge import create_hedge_manager
             # Create hedge manager with default settings and the exchange client
+            hedge_config_dict = {}
+            hedge_strategy = TRADING_CONFIG.get("hedging", {}).get("strategy", "notional")
+            # Add strategy to config dict if specified
+            if hedge_strategy:
+                hedge_config_dict["strategy"] = hedge_strategy
+                
             self.hedge_manager = create_hedge_manager(
                 config_path=TRADING_CONFIG.get("hedging", {}).get("config_path"),
-                exchange_client=self.exchange_client,
-                strategy_type=TRADING_CONFIG.get("hedging", {}).get("strategy", "notional")
+                config_dict=hedge_config_dict if hedge_config_dict else None,
+                exchange_client=self.exchange_client
             )
             # Start the hedge manager's background thread for rebalancing
             self.hedge_manager.start()
             self.logger.info("Hedge manager initialized and started")
         else:
-            self.logger.info("Hedging is disabled in configuration")
+            self.logger.info("Hedging is disabled")
 
     def set_tick_size(self, tick_size: float):
         """Set the tick size for the instrument"""
@@ -182,30 +198,75 @@ class AvellanedaMarketMaker:
         # Calculate PnL as percentage for reference
         pnl_percentage = 0.0
         if self.position_value > 0 and self.unrealized_pnl != 0:
-            pnl_percentage = self.unrealized_pnl / self.position_value
+            pnl_percentage = (self.unrealized_pnl / self.position_value) * 100
         
-        # If position flipped from long to short or vice versa, reset entry price and track as new position
-        if (old_position > 0 and size < 0) or (old_position < 0 and size > 0):
-            self.entry_price = price
-            self.position_start_time = time.time()
-            self.logger.info(f"Position flipped from {old_position} to {size}, resetting tracking")
+        # Log position update with PnL info
+        if old_position != size:
+            self.logger.info(
+                f"Position updated: {old_position:.4f} -> {size:.4f} @ {price:.2f} "
+                f"(PnL: {self.unrealized_pnl:.2f} USD, {pnl_percentage:.2f}%)"
+            )
         
-        # If position closed completely, reset position tracking
-        if size == 0 and old_position != 0:
-            self.position_start_time = 0
+        # Update position tracker for advanced metrics
+        self.position_tracker.update_position(size, price)
+        
+        # If hedging is enabled, update the hedge manager with new position information
+        if self.use_hedging and self.hedge_manager is not None:
+            # The try/except is important here as the hedge manager might not be ready
+            try:
+                self.hedge_manager.update_position(self.instrument or "unknown", size, price)
+            except Exception as e:
+                self.logger.error(f"Error updating hedge manager: {str(e)}")
+                
+        # Calculate the monetary position based on position size
+        self.update_monetary_position()
+
+    def update_position_size(self, size: float):
+        """
+        Update only the position size without changing entry price
+        (Fast method to be used with fill-based position tracking)
+        
+        Args:
+            size: Current position size
+        """
+        if size == self.position_size:
+            return  # No change
+            
+        old_position = self.position_size
+        self.position_size = size
+        
+        # If position is reset to zero, clear entry price
+        if size == 0:
             self.entry_price = 0
-            self.unrealized_pnl = 0.0
-            self.position_value = 0.0
+            self.unrealized_pnl = 0
+            self.position_value = 0
+            self.logger.info(f"Position reset to zero (from {old_position:.4f})")
+        else:
+            # Calculate position value (if we have a price)
+            current_price = getattr(self, 'last_mid_price', 0)
+            if current_price > 0:
+                self.position_value = abs(size * current_price)
+                
+                # Calculate unrealized PnL if we have an entry price
+                if hasattr(self, 'entry_price') and self.entry_price and self.entry_price > 0:
+                    if size > 0:  # Long position
+                        self.unrealized_pnl = (current_price - self.entry_price) * size
+                    elif size < 0:  # Short position
+                        self.unrealized_pnl = (self.entry_price - current_price) * abs(size)
+                
+                self.logger.info(f"Position size updated: {old_position:.4f} -> {size:.4f} @ {current_price:.2f}")
+            else:
+                self.logger.info(f"Position size updated: {old_position:.4f} -> {size:.4f} (no price info)")
         
-        # Extended logging with more metrics
-        self.logger.info(
-            f"Position updated: {old_position:.4f} -> {size:.4f} @ {price:.2f} | "
-            f"Value: {self.position_value:.2f} | PnL: {self.unrealized_pnl:.2f} ({pnl_percentage:.2%})"
-        )
+        # Update position tracker for advanced metrics
+        self.position_tracker.update_position_size(size)
+        
+        # Calculate the monetary position based on position size
+        self.update_monetary_position()
 
     def update_market_conditions(self, volatility: float, market_impact: float):
-        """Update market conditions"""
-        self.volatility = max(volatility, TRADING_CONFIG["volatility"]["floor"])
+        """Update the market conditions used for quote generation"""
+        self.volatility = volatility
         self.market_impact = market_impact
         self.logger.debug(f"Market conditions updated: vol={self.volatility:.6f}, impact={market_impact:.6f}")
     
@@ -273,6 +334,12 @@ class AvellanedaMarketMaker:
         try:
             # Start with a minimum spread baseline based on tick size
             min_spread_ticks = ORDERBOOK_CONFIG.get("min_spread", 5)
+            
+            # Ensure tick_size is valid
+            if self.tick_size <= 0:
+                self.logger.warning("Invalid tick_size detected in calculate_optimal_spread. Using default of 1.0")
+                self.tick_size = 1.0
+                
             min_spread = min_spread_ticks * self.tick_size
             
             # Get volatility with safety fallback, ensure minimum is reasonable
@@ -294,6 +361,11 @@ class AvellanedaMarketMaker:
             # 1. Gamma/risk aversion component
             base_gamma = self.gamma
             
+            # Ensure gamma is positive to avoid negative spread components
+            if base_gamma <= 0:
+                self.logger.warning(f"Invalid gamma value {base_gamma}, using default of 0.1")
+                base_gamma = 0.1
+            
             # Apply predictive gamma adjustment
             original_gamma = base_gamma
             if prediction_age < 300:
@@ -306,13 +378,29 @@ class AvellanedaMarketMaker:
             
             # 2. Volatility-based component (more volatile = wider spread)
             volatility_term = volatility * self.volatility_multiplier
+            
+            # Ensure time horizon is not zero to prevent division by zero
+            if not hasattr(self, 'position_fade_time') or self.position_fade_time <= 0:
+                self.position_fade_time = TRADING_CONFIG["avellaneda"].get("position_fade_time", 3600)
+                self.logger.warning(f"Invalid position_fade_time, using default: {self.position_fade_time}")
+                
             volatility_component = volatility_term * math.sqrt(self.position_fade_time)
             
             # 3. Market impact adjustment (high impact = wider spread)
+            # Ensure market_impact is not negative
+            market_impact = max(0, market_impact)
+            
             # Scale market impact by both volatility and order flow intensity for more responsive spreads
             market_impact_component = market_impact * self.market_impact_factor * (1 + volatility)
             
             # 4. Position/inventory risk component (larger position = wider spread)
+            # Ensure position_limit is not zero to prevent division by zero
+            if not hasattr(self, 'position_limit') or self.position_limit <= 0:
+                self.position_limit = TRADING_CONFIG["avellaneda"].get("position_limit", 0.1)
+                if self.position_limit <= 0:
+                    self.position_limit = 0.1  # Minimum valid value
+                    self.logger.warning(f"Invalid position_limit, using minimum: {self.position_limit}")
+            
             inventory_risk = abs(self.position_size) / max(self.position_limit, 0.001)
             inventory_component = self.inventory_factor * inventory_risk * volatility_term
             
@@ -362,9 +450,12 @@ class AvellanedaMarketMaker:
                 
             return final_spread
         except Exception as e:
-            self.logger.error(f"Error calculating optimal spread: {str(e)}")
+            self.logger.error(f"Error calculating optimal spread: {str(e)}", exc_info=True)
             # Return safe default spread on error
-            return 5 * self.tick_size
+            min_spread_ticks = ORDERBOOK_CONFIG.get("min_spread", 5)
+            if self.tick_size <= 0:
+                self.tick_size = 1.0
+            return min_spread_ticks * self.tick_size
 
     def calculate_skewed_prices(self, mid_price: float, spread: float) -> Tuple[float, float]:
         """Calculate skewed bid and ask prices based on inventory"""
@@ -519,132 +610,268 @@ class AvellanedaMarketMaker:
         """Check if we can decrease our position (sell some)"""
         return self.position_size > -self.position_limit
 
-    def generate_quotes(self, ticker: Ticker, market_conditions: Dict) -> Tuple[List[Quote], List[Quote]]:
-        """
-        Generate quotes based on current market conditions and inventory
-        
-        Args:
-            ticker: Current ticker data
-            market_conditions: Dictionary containing market conditions
-            
-        Returns:
-            Tuple of (bid_quotes, ask_quotes)
-        """
+    def generate_quotes(self, ticker: Ticker, market_conditions: Dict, max_orders: int = None) -> Tuple[List[Quote], List[Quote]]:
+        """Generate quotes using Avellaneda-Stoikov market making model with dynamic grid updates"""
         try:
+            # Validate tick size before generating quotes
+            if self.tick_size <= 0:
+                self.logger.warning("Invalid tick size detected in generate_quotes. Setting default value of 1.0")
+                self.tick_size = 1.0
+                
+            # Extract ticker data
+            timestamp = getattr(ticker, 'timestamp', time.time())
+            
+            # Debug: Log all ticker attributes
+            self.logger.debug(f"Ticker data: {vars(ticker) if hasattr(ticker, '__dict__') else 'No ticker data'}")
+            
+            # Make sure mark_price is not zero before calculations
+            mark_price = getattr(ticker, 'mark_price', 0)
+            if mark_price <= 0:
+                self.logger.error(f"Invalid mark price: {mark_price}")
+                return [], []
+                
+            # Debug all calculations to find division by zero
+            try:
+                bid_price = ticker.best_bid_price if hasattr(ticker, 'best_bid_price') and ticker.best_bid_price else mark_price * 0.999
+                self.logger.debug(f"Calculated bid_price: {bid_price}")
+            except Exception as e:
+                self.logger.error(f"Error calculating bid_price: {str(e)}")
+                return [], []
+                
+            try:
+                ask_price = ticker.best_ask_price if hasattr(ticker, 'best_ask_price') and ticker.best_ask_price else mark_price * 1.001
+                self.logger.debug(f"Calculated ask_price: {ask_price}")
+            except Exception as e:
+                self.logger.error(f"Error calculating ask_price: {str(e)}")
+                return [], []
+            
+            # Safety check for zero prices
+            if not bid_price or not ask_price or bid_price <= 0 or ask_price <= 0:
+                self.logger.error(f"Invalid prices: bid={bid_price}, ask={ask_price}")
+                # Return empty quotes
+                return [], []
+                
+            try:
+                # Extra validation to ensure both prices are numeric and positive
+                bid_price = float(bid_price)
+                ask_price = float(ask_price)
+                
+                # Ensure we're not using zero or negative values
+                if bid_price <= 0:
+                    self.logger.warning(f"Invalid bid price {bid_price}, using fallback")
+                    bid_price = mark_price * 0.999 if mark_price > 0 else 1.0
+                
+                if ask_price <= 0:
+                    self.logger.warning(f"Invalid ask price {ask_price}, using fallback")
+                    ask_price = mark_price * 1.001 if mark_price > 0 else 1.01
+                
+                # Now calculate mid price with validated values
+                mid_price = (bid_price + ask_price) / 2
+                self.logger.debug(f"Calculated mid_price: {mid_price}")
+            except Exception as e:
+                self.logger.error(f"Error calculating mid_price: {str(e)}")
+                return [], []
+            
+            # Update market mid price
+            self.last_mid_price = mid_price
+            
+            # Extract volatility
+            try:
+                volatility = market_conditions.get("volatility", self.volatility)
+                self.logger.debug(f"Extracted volatility: {volatility}")
+                market_impact = market_conditions.get("market_impact", 0.0)
+                self.logger.debug(f"Extracted market_impact: {market_impact}")
+            except Exception as e:
+                self.logger.error(f"Error extracting market conditions: {str(e)}")
+                return [], []
+            
+            # Update market conditions
+            try:
+                self.update_market_conditions(volatility, market_impact)
+                self.logger.debug("Market conditions updated successfully")
+            except Exception as e:
+                self.logger.error(f"Error updating market conditions: {str(e)}")
+                return [], []
+            
+            # Calculate optimal spread using Avellaneda-Stoikov model
+            try:
+                spread = self.calculate_optimal_spread(market_impact)
+                self.logger.debug(f"Calculated spread: {spread}")
+            except Exception as e:
+                self.logger.error(f"Error calculating optimal spread: {str(e)}")
+                return [], []
+            
+            # Apply reservation price offset from volume candle prediction if available
+            try:
+                reservation_offset = self.reservation_price_offset
+                if abs(reservation_offset) > 0.00001:
+                    # Apply as a percentage offset to the mid price
+                    offset_amount = mid_price * reservation_offset
+                    self.logger.debug(f"Applying reservation price offset: {offset_amount:.2f} ({reservation_offset:.6f})")
+                    mid_price += offset_amount
+            except Exception as e:
+                self.logger.error(f"Error applying reservation price offset: {str(e)}")
+                # Continue as this is not critical
+            
+            # Calculate base bid and ask prices with inventory skew
+            try:
+                base_bid_price, base_ask_price = self.calculate_skewed_prices(mid_price, spread)
+                self.logger.debug(f"Calculated base prices: bid={base_bid_price}, ask={base_ask_price}")
+            except Exception as e:
+                self.logger.error(f"Error calculating skewed prices: {str(e)}")
+                return [], []
+            
+            # Calculate optimal sizes for base bid and ask
+            try:
+                base_bid_size, base_ask_size = self.calculate_quote_sizes(mid_price)
+                self.logger.debug(f"Calculated base sizes: bid={base_bid_size}, ask={base_ask_size}")
+            except Exception as e:
+                self.logger.error(f"Error calculating quote sizes: {str(e)}")
+                return [], []
+            
+            # Round prices to tick size
+            try:
+                base_bid_price = self.round_to_tick(base_bid_price)
+                base_ask_price = self.round_to_tick(base_ask_price)
+                self.logger.debug(f"Rounded prices: bid={base_bid_price}, ask={base_ask_price}")
+            except Exception as e:
+                self.logger.error(f"Error rounding prices to tick size: {str(e)}")
+                return [], []
+            
+            # Enforce minimum spread 
+            try:
+                min_spread_ticks = ORDERBOOK_CONFIG.get("min_spread", 2)
+                min_spread = min_spread_ticks * self.tick_size
+                actual_spread = base_ask_price - base_bid_price
+                
+                if actual_spread < min_spread:
+                    # Adjust prices to ensure minimum spread
+                    half_min_spread = min_spread / 2
+                    base_bid_price = self.round_to_tick(mid_price - half_min_spread)
+                    base_ask_price = self.round_to_tick(mid_price + half_min_spread)
+                    self.logger.debug(f"Enforcing minimum spread: {min_spread} ticks, adjusted spread: {base_ask_price - base_bid_price}")
+            except Exception as e:
+                self.logger.error(f"Error enforcing minimum spread: {str(e)}")
+                # Continue as this is not critical
+            
+            # Generate quotes at multiple price levels
             bid_quotes = []
             ask_quotes = []
             
-            # Skip if invalid ticker
-            if not ticker or not hasattr(ticker, 'mark_price') or ticker.mark_price <= 0:
-                self.logger.warning("Cannot generate quotes: Invalid ticker")
-                return [], []
+            # Maximum number of levels to quote
+            try:
+                levels = min(self.quote_levels, ORDERBOOK_CONFIG.get("levels", 6))
+                self.logger.debug(f"Using {levels} quote levels")
+            except Exception as e:
+                self.logger.error(f"Error determining quote levels: {str(e)}")
+                levels = 1  # Default to 1 level
             
-            # 1. Extract price data with fallbacks
-            # Determine valid mark price (with safety checks)
-            mark_price = getattr(ticker, "mark_price", None)
-            if not mark_price or mark_price <= 0:
-                self.logger.warning("Invalid mark price, falling back to mid price")
-                mark_price = None
+            # Get appropriate step sizes for grid spacing
+            try:
+                bid_step = ORDERBOOK_CONFIG.get("bid_step", 10) * self.tick_size
+                ask_step = ORDERBOOK_CONFIG.get("ask_step", 10) * self.tick_size
+                self.logger.debug(f"Base step sizes: bid={bid_step}, ask={ask_step}")
+            except Exception as e:
+                self.logger.error(f"Error calculating step sizes: {str(e)}")
+                # Use reasonable defaults
+                bid_step = self.tick_size * 10
+                ask_step = self.tick_size * 10
             
-            # Get bid/ask prices with validation
-            best_bid = getattr(ticker, "best_bid_price", None)
-            best_ask = getattr(ticker, "best_ask_price", None)
-            
-            # Validate bid/ask prices
-            if not best_bid or best_bid <= 0:
-                self.logger.warning("Invalid best bid price")
-                best_bid = None
+            # Dynamic step size adjustment based on volatility
+            try:
+                # Need to handle possible division by zero
+                default_vol = max(TRADING_CONFIG["volatility"]["default"], 0.001)
+                # Add additional safeguard against division by zero
+                if default_vol <= 0:
+                    default_vol = 0.001
+                    self.logger.warning("Default volatility was zero or negative, using 0.001 as fallback")
                 
-            if not best_ask or best_ask <= 0:
-                self.logger.warning("Invalid best ask price")
-                best_ask = None
-            
-            # Calculate mid price (with fallbacks)
-            mid_price = None
-            if best_bid and best_ask and best_bid < best_ask:
-                mid_price = (best_bid + best_ask) / 2
-                self.logger.debug(f"Using orderbook mid price: {mid_price}")
-            
-            # Determine reference price - prioritize VAMP if available
-            reference_price = None
-            
-            # Try to use VAMP (volume-adjusted mid price) if suitable
-            vamp = None
-            if hasattr(self, 'calculate_vamp'):
-                vamp = self.calculate_vamp()
-                if vamp and vamp > 0:
-                    reference_price = vamp
-                    self.logger.debug(f"Using VAMP as reference: {reference_price}")
-            
-            # Fallback to mid price
-            if not reference_price and mid_price:
-                reference_price = mid_price
-                self.logger.debug(f"Using mid price as reference: {reference_price}")
-            
-            # Last resort: mark price
-            if not reference_price and mark_price:
-                reference_price = mark_price
-                self.logger.debug(f"Using mark price as reference: {reference_price}")
+                # Ensure volatility is also positive
+                volatility = max(volatility, 0.0001)
                 
-            # If we still don't have a reference price, we can't generate quotes
-            if not reference_price or reference_price <= 0:
-                self.logger.error("Could not determine valid reference price for quote generation")
-                return [], []
-                
-            # 2. Calculate optimal spread with market impact factor
-            market_impact = market_conditions.get("market_impact", 0)
-            spread = self.calculate_optimal_spread(market_impact)
+                # Calculate with safeguard against division by zero
+                volatility_factor = min(3.0, max(0.5, volatility / default_vol))
+                self.logger.debug(f"Volatility factor calculation: {volatility} / {default_vol} = {volatility_factor}")
+            except Exception as e:
+                self.logger.error(f"Error calculating volatility factor: {str(e)}")
+                volatility_factor = 1.0  # Use safe default
             
-            # 3. Calculate skewed prices based on inventory
-            base_bid_price, base_ask_price = self.calculate_skewed_prices(reference_price, spread)
+            # Apply volume candle prediction to step size if available
+            try:
+                if hasattr(self, 'predictive_adjustments'):
+                    vol_adj = self.predictive_adjustments.get('volatility_adjustment', 0.0)
+                    if abs(vol_adj) > 0.05:
+                        old_factor = volatility_factor
+                        volatility_factor *= (1 + vol_adj)
+                        self.logger.debug(f"Applied predictive volatility adjustment: {old_factor} * (1 + {vol_adj}) = {volatility_factor}")
+            except Exception as e:
+                self.logger.error(f"Error applying volume prediction to volatility: {str(e)}")
+                # No adjustment needed, continue with existing volatility_factor
             
-            # 4. Safety check: ensure bid < ask and prices are positive
-            if base_bid_price >= base_ask_price or base_bid_price <= 0 or base_ask_price <= 0:
-                self.logger.warning(
-                    f"Invalid prices calculated: bid={base_bid_price}, ask={base_ask_price}, " 
-                    f"ref={reference_price}, spread={spread}"
-                )
-                # Recalculate with safe defaults
-                min_spread_ticks = ORDERBOOK_CONFIG.get("min_spread", 5)
-                safe_spread = min_spread_ticks * self.tick_size
-                base_bid_price = reference_price - (safe_spread / 2)
-                base_ask_price = reference_price + (safe_spread / 2)
+            # Adjust step size based on volatility factor
+            try:
+                bid_step *= volatility_factor
+                ask_step *= volatility_factor
+                self.logger.debug(f"Final grid spacing: bid_step={bid_step:.2f}, ask_step={ask_step:.2f}, volatility factor={volatility_factor:.2f}")
+            except Exception as e:
+                self.logger.error(f"Error adjusting step sizes: {str(e)}")
+                # Reset to reasonable values
+                bid_step = self.tick_size * 10
+                ask_step = self.tick_size * 10
             
-            # 5. Align prices to tick size
-            base_bid_price = self.align_price_to_tick(base_bid_price)
-            base_ask_price = self.align_price_to_tick(base_ask_price)
+            # Get minimum quote size from config
+            try:
+                min_size = ORDERBOOK_CONFIG.get("min_size", 0.001)
+                self.logger.debug(f"Minimum quote size: {min_size}")
+            except Exception as e:
+                self.logger.error(f"Error getting minimum quote size: {str(e)}")
+                min_size = 0.001  # Safe default
             
-            # 6. Calculate base quote sizes
-            base_bid_size, base_ask_size = self.calculate_quote_sizes(reference_price)
-            
-            # Ensure sizes aren't too small
-            min_size = ORDERBOOK_CONFIG.get("min_order_size", 0.001)
-            if base_bid_size < min_size or base_ask_size < min_size:
-                self.logger.warning(f"Quote sizes too small: bid={base_bid_size}, ask={base_ask_size}, using min size {min_size}")
-                base_bid_size = max(base_bid_size, min_size)
-                base_ask_size = max(base_ask_size, min_size)
-                
-            # 7. Create quote objects for multiple levels
-            timestamp = datetime.now().timestamp()
-            levels = self.quote_levels
-            
-            # Get the bid/ask step sizes for additional levels
-            bid_step = ORDERBOOK_CONFIG.get("bid_step", 25) * self.tick_size
-            ask_step = ORDERBOOK_CONFIG.get("ask_step", 25) * self.tick_size
-            
-            # Get the size multipliers for different levels - using Fibonacci-based sizing
+            # Get size multipliers for grid levels using Fibonacci sequence
             size_multipliers = self._calculate_fibonacci_size_multipliers(levels)
             
-            # Create bid quotes at multiple levels if we have capacity to buy
+            # Track used prices to avoid duplicates
+            bid_price_set = set()
+            ask_price_set = set()
+            
+            # Create bid quotes at multiple levels if we have position to add
             if self.can_increase_position():
                 for level in range(levels):
                     # Calculate price for this level (further from mid for higher levels)
                     level_price = self._calculate_level_price(base_bid_price, level, bid_step, is_bid=True)
                     
+                    # Calculate minimum price difference based on level - higher levels need more separation
+                    min_price_diff = self.tick_size * (1 + level // 2)  # Scales with level
+                    
+                    # Skip if this price is a duplicate or too close to existing prices
+                    duplicate = False
+                    closest_existing = None
+                    min_distance = float('inf')
+                    
+                    for existing_price in bid_price_set:
+                        distance = abs(level_price - existing_price)
+                        if distance < min_distance:
+                            min_distance = distance
+                            closest_existing = existing_price
+                            
+                        if distance <= min_price_diff:
+                            duplicate = True
+                            self.logger.debug(f"Skipping duplicate bid price at level {level}: {level_price} "
+                                              f"(too close to {existing_price}, diff={distance}, min required={min_price_diff})")
+                            break
+                            
+                    if duplicate:
+                        self.logger.info(f"Level {level} bid price {level_price:.2f} too close to existing price {closest_existing:.2f} "
+                                        f"(diff={min_distance:.2f}, min required={min_price_diff:.2f})")
+                        continue
+                    
+                    # Add to set of used prices
+                    bid_price_set.add(level_price)
+                    
                     # Calculate size for this level (use multiplier)
                     level_size = base_bid_size * size_multipliers[level] if level < len(size_multipliers) else base_bid_size * 0.1
                     
-                    # Ensure minimum size
+                    # Ensure minimum size (at least 0.01)
                     if level_size < min_size:
                         level_size = min_size
                     
@@ -660,7 +887,7 @@ class AvellanedaMarketMaker:
                     
                     self.logger.debug(f"Created level {level} bid: {level_size:.4f} @ {level_price:.2f}")
             else:
-                self.logger.info("Skipping bid quotes: position limit reached")
+                self.logger.info("Skipping bid quotes: at position limit or no capacity to buy")
                 
             # Create ask quotes at multiple levels if we have position to sell
             if self.can_decrease_position():
@@ -668,10 +895,38 @@ class AvellanedaMarketMaker:
                     # Calculate price for this level (further from mid for higher levels)
                     level_price = self._calculate_level_price(base_ask_price, level, ask_step, is_bid=False)
                     
+                    # Calculate minimum price difference based on level - higher levels need more separation
+                    min_price_diff = self.tick_size * (1 + level // 2)  # Scales with level
+                    
+                    # Skip if this price is a duplicate or too close to existing prices
+                    duplicate = False
+                    closest_existing = None
+                    min_distance = float('inf')
+                    
+                    for existing_price in ask_price_set:
+                        distance = abs(level_price - existing_price)
+                        if distance < min_distance:
+                            min_distance = distance
+                            closest_existing = existing_price
+                            
+                        if distance <= min_price_diff:
+                            duplicate = True
+                            self.logger.debug(f"Skipping duplicate ask price at level {level}: {level_price} "
+                                              f"(too close to {existing_price}, diff={distance}, min required={min_price_diff})")
+                            break
+                            
+                    if duplicate:
+                        self.logger.info(f"Level {level} ask price {level_price:.2f} too close to existing price {closest_existing:.2f} "
+                                        f"(diff={min_distance:.2f}, min required={min_price_diff:.2f})")
+                        continue
+                    
+                    # Add to set of used prices
+                    ask_price_set.add(level_price)
+                    
                     # Calculate size for this level (use multiplier)
                     level_size = base_ask_size * size_multipliers[level] if level < len(size_multipliers) else base_ask_size * 0.1
                     
-                    # Ensure minimum size
+                    # Ensure minimum size (at least 0.01)
                     if level_size < min_size:
                         level_size = min_size
                     
@@ -695,7 +950,7 @@ class AvellanedaMarketMaker:
             self.logger.info(
                 f"Generated quotes: {len(bid_quotes)} bids and {len(ask_quotes)} asks, "
                 f"base bid={base_bid_price:.2f}, base ask={base_ask_price:.2f}, "
-                f"ref={reference_price:.2f}, spread={spread_display}"
+                f"ref={mid_price:.2f}, spread={spread_display}"
             )
             
             return bid_quotes, ask_quotes
@@ -706,7 +961,7 @@ class AvellanedaMarketMaker:
 
     def _calculate_level_price(self, base_price: float, level: int, step: float, is_bid: bool) -> float:
         """
-        Calculate price for a specific quote level using Fibonacci grid spacing
+        Calculate price for a specific quote level using improved Fibonacci grid spacing
         
         Args:
             base_price: Base price for level 0
@@ -717,25 +972,78 @@ class AvellanedaMarketMaker:
         Returns:
             float: Price for this level
         """
+        # Ensure base price is valid
+        if base_price <= 0:
+            self.logger.warning(f"Invalid base_price {base_price} in _calculate_level_price. Using fallback of 1.0")
+            base_price = 1.0
+            
+        # Ensure tick size is valid    
+        if self.tick_size <= 0:
+            self.logger.warning(f"Invalid tick_size {self.tick_size} in _calculate_level_price. Using default of 1.0")
+            self.tick_size = 1.0
+        
+        # Early return for level 0
         if level == 0:
             return base_price
-            
-        # Fibonacci sequence: 1, 1, 2, 3, 5, 8, 13, 21, 34, ...
-        # We'll use a simplified approach with pre-computed Fibonacci multipliers
-        fib_multipliers = [1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89]
+        
+        # Modified Fibonacci sequence to avoid duplicates at early levels
+        # Start at 1, 2, 3, 5, 8, 13, 21, 34, 55, 89
+        fib_multipliers = [1, 2, 3, 5, 8, 13, 21, 34, 55, 89]
         
         # Use the appropriate multiplier based on level
-        # For levels beyond our pre-computed list, use the last multiplier
-        fib_multiplier = fib_multipliers[level] if level < len(fib_multipliers) else fib_multipliers[-1]
+        # For levels beyond our pre-computed list, use exponential growth
+        if level < len(fib_multipliers):
+            fib_multiplier = fib_multipliers[level-1]  # level-1 since we handle level 0
+        else:
+            # Use much more aggressive exponential growth for higher levels
+            # Previously: fib_multipliers[-1] * (1.5 ** (level - len(fib_multipliers)))
+            # New: Steeper exponential growth with base 2.0 instead of 1.5
+            fib_multiplier = fib_multipliers[-1] * (2.0 ** (level - len(fib_multipliers) + 1))
         
+        # Ensure step is positive
+        if step <= 0:
+            self.logger.warning(f"Invalid step size {step} in _calculate_level_price. Using default of {self.tick_size * 10}")
+            step = self.tick_size * 10
+            
         # Adjust step size with Fibonacci multiplier
         fib_step = step * fib_multiplier
         
+        # Ensure minimum step distance is at least 2 ticks to avoid duplicates
+        min_step = 2 * self.tick_size
+        if fib_step < min_step:
+            fib_step = min_step
+        
+        # Add additional spacing between levels based on level number to prevent duplicates
+        # Use exponential spacing for higher levels to prevent duplicates
+        if level <= 10:
+            level_spacing_factor = 1 + (level * 0.05)  # 5% increase per level for first 10 levels
+        else:
+            # More aggressive spacing for higher levels (15% increase per level after level 10)
+            level_spacing_factor = 1.5 + ((level - 10) * 0.15)
+        
+        fib_step *= level_spacing_factor
+        
+        # Ensure the step is a multiple of tick size to avoid rounding issues
+        # Use a higher multiple for higher levels to prevent rounding to the same price
+        tick_multiple = max(2, level // 2)  # At least 2, increases with level
+        
+        # Prevent division by zero in the calculation below
+        if self.tick_size * tick_multiple <= 0:
+            self.logger.warning(f"Invalid tick multiple calculation: tick_size={self.tick_size}, multiple={tick_multiple}")
+            tick_multiple = 2  # Safe default
+            
+        fib_step = max(round(fib_step / (self.tick_size * tick_multiple)) * (self.tick_size * tick_multiple), min_step)
+        
         # Bids get lower as level increases, asks get higher
         if is_bid:
-            return self.align_price_to_tick(base_price - fib_step)
+            new_price = base_price - fib_step
+            # Ensure we don't go negative or too close to zero
+            if new_price <= self.tick_size * 2:
+                new_price = self.tick_size * 2
+            return self.align_price_to_tick(new_price)
         else:
-            return self.align_price_to_tick(base_price + fib_step)
+            new_price = base_price + fib_step
+            return self.align_price_to_tick(new_price)
 
     def should_update_quotes(self, current_quotes: Tuple[List[Quote], List[Quote]], mid_price: float) -> bool:
         """Enhanced quote update decision logic with comprehensive checks"""
@@ -853,8 +1161,8 @@ class AvellanedaMarketMaker:
         except (KeyError, TypeError):
             self.logger.warning("Could not get min_size from config, using default of 0.01")
         
-        # Calculate maximum price deviation from ticker (3% by default)
-        max_deviation_pct = 0.03
+        # Calculate maximum price deviation from ticker (5% by default, increased from 3%)
+        max_deviation_pct = 0.05
         
         # Get the market price from the bid/ask quotes if available
         market_price = 0
@@ -918,7 +1226,8 @@ class AvellanedaMarketMaker:
     def round_to_tick(self, value: float) -> float:
         """Round price to nearest tick size"""
         if self.tick_size <= 0:
-            return value
+            self.logger.warning(f"Invalid tick size ({self.tick_size}) in round_to_tick. Using default of 1.0")
+            self.tick_size = 1.0
         return round(value / self.tick_size) * self.tick_size
 
     def on_order_filled(self, order_id: str, fill_price: float, fill_size: float, is_buy: bool) -> None:
@@ -950,8 +1259,24 @@ class AvellanedaMarketMaker:
             # Update monetary position (which will trigger hedge updates if needed)
             self.update_monetary_position()
             
-            # Check if we're using the hedge manager
+            # Check if we're using the hedge manager and have a valid instrument
             if self.use_hedging and self.hedge_manager is not None:
+                # Ensure we have a valid instrument before processing for hedging
+                if not self.instrument or self.instrument == "unknown":
+                    # Try one more time to determine the instrument from exchange client
+                    if self.exchange_client and hasattr(self.exchange_client, 'get_current_instrument'):
+                        current_instrument = self.exchange_client.get_current_instrument()
+                        if current_instrument:
+                            self.instrument = current_instrument
+                            self.logger.info(f"Setting instrument from current exchange context: {self.instrument}")
+                        else:
+                            self.logger.error(f"No instrument set for fill - cannot process trade. Aborting fill processing.")
+                            return  # Stop processing if no instrument is set
+                    else:
+                        self.logger.error(f"No instrument set for fill and no way to determine it - cannot process trade. Aborting fill processing.")
+                        return  # Stop processing if no instrument is set
+                
+                # Now process the fill for hedging
                 self._process_fill_for_hedging(order_id, fill_price, fill_size, is_buy)
             
             self.logger.info(
@@ -973,6 +1298,21 @@ class AvellanedaMarketMaker:
             is_buy: Whether it was a buy (True) or sell (False)
         """
         try:
+            # Make sure we have a valid instrument
+            if not self.instrument or self.instrument == "unknown":
+                # Try one more time to determine the instrument from exchange client
+                if self.exchange_client and hasattr(self.exchange_client, 'get_current_instrument'):
+                    current_instrument = self.exchange_client.get_current_instrument()
+                    if current_instrument:
+                        self.instrument = current_instrument
+                        self.logger.info(f"Setting instrument from current exchange context: {self.instrument}")
+                    else:
+                        self.logger.error(f"No instrument set for fill - cannot process trade. Aborting fill processing.")
+                        return  # Stop processing if no instrument is set
+                else:
+                    self.logger.error(f"No instrument set for fill and no way to determine it - cannot process trade. Aborting fill processing.")
+                    return  # Stop processing if no instrument is set
+            
             # Create a fill object suitable for the hedge manager
             class HedgeFill:
                 def __init__(self, instrument, price, size, is_buy, order_id):
@@ -982,12 +1322,7 @@ class AvellanedaMarketMaker:
                     self.is_buy = is_buy
                     self.fill_id = order_id
             
-            # Make sure we have a valid instrument
-            if not self.instrument or self.instrument == "unknown":
-                self.logger.warning(f"No instrument set for fill, using BTC-PERPETUAL as default")
-                instrument = "BTC-PERPETUAL"
-            else:
-                instrument = self.instrument
+            instrument = self.instrument
                 
             # Create the fill object
             fill = HedgeFill(
@@ -1047,8 +1382,18 @@ class AvellanedaMarketMaker:
         Returns:
             float: Price aligned to the instrument's tick size
         """
+        # Ensure price is positive
+        if price <= 0:
+            self.logger.warning(f"Invalid price {price} in align_price_to_tick. Using minimum tick size.")
+            return self.tick_size  # Return minimum valid price
+            
         if not self.tick_size or self.tick_size <= 0:
             self.logger.warning("Invalid tick size, using default alignment")
+            # Store previous tick size for logging
+            old_tick_size = self.tick_size
+            # Set a valid tick size for future use
+            self.tick_size = 1.0
+            self.logger.info(f"Updated tick size from {old_tick_size} to {self.tick_size}")
             return round(price, 2)  # Default to 2 decimal places
             
         # Round to nearest tick
@@ -1058,7 +1403,7 @@ class AvellanedaMarketMaker:
         min_price = self.tick_size
         aligned_price = max(aligned_price, min_price)
         
-        return aligned_price 
+        return aligned_price
 
     def set_instrument(self, instrument: str):
         """Set the instrument name"""
@@ -1084,7 +1429,7 @@ class AvellanedaMarketMaker:
             
             # Higher volatility = higher gamma (wider spreads to compensate for risk)
             # Lower volatility = lower gamma (tighter spreads to capture more flow)
-            volatility_factor = volatility / TRADING_CONFIG["volatility"]["default"]
+            volatility_factor = volatility / max(TRADING_CONFIG["volatility"]["default"], 0.001)
             volatility_factor = min(2.0, max(0.5, volatility_factor))
             
             # Higher market impact = higher gamma (wider spreads to compensate for market impact)
@@ -1176,118 +1521,109 @@ class AvellanedaMarketMaker:
         self.logger.info(f"Updated gamma: {old_gamma:.3f} -> {self.gamma:.3f}") 
 
     def update_market_data(self, price: float, volume: float = 0, is_buy: Optional[bool] = None, is_trade: bool = False) -> None:
-        """
-        Update market data with new information
+        """Update market data with new price and potentially volume information"""
+        current_time = time.time()
         
-        Args:
-            price: Current price
-            volume: Volume of trade or order
-            is_buy: Whether it's a buy (True) or sell (False)
-            is_trade: Whether this is a trade (True) or other market data (False)
-        """
-        try:
-            # Update last price
-            if price > 0:
+        # Always update price history
+        if price > 0:
+            self.price_history.append(price)
+            if not self.last_mid_price:
                 self.last_mid_price = price
+            
+            # Only update mid price if it's a significant change (avoid noise)
+            if abs(price - self.last_mid_price) / self.last_mid_price > 0.0001:
+                self.last_mid_price = price
+        
+        # Update volume-based indicators if trade data is provided
+        if is_trade and volume > 0 and is_buy is not None:
+            # Update VAMP
+            self.update_vamp(price, volume, is_buy)
+            
+            # Update volume candle buffer if available
+            if self.volume_buffer:
+                # Convert to milliseconds for the volume candle buffer
+                timestamp = int(current_time * 1000)
+                candle = self.volume_buffer.update(price, volume, is_buy, timestamp)
                 
-            # Update VAMP if this is a trade
-            if is_trade and volume > 0 and is_buy is not None:
-                self.update_vamp(price, volume, is_buy, False)
-                
-                # Update volume candles for predictive analysis
-                completed_candle = self.volume_buffer.update(price, volume, is_buy, int(time.time() * 1000))
-                if completed_candle:
-                    # Get updated predictions when a candle completes
+                # If a candle was completed, update predictive parameters
+                if candle and candle.is_complete:
                     self._update_predictive_parameters()
-                    
-                    # Log completion of new candle with its delta ratio
-                    self.logger.debug(
-                        f"Volume candle completed: V={completed_candle.volume:.3f}, "
-                        f"Δ={completed_candle.delta_ratio:.2f}, "
-                        f"P={completed_candle.close_price:.2f}"
-                    )
+                    self.force_grid_update = True  # Force grid update when new candle is complete
+        
+        # Periodically update predictive parameters
+        if self.volume_buffer and current_time - self.last_prediction_time > self.prediction_interval:
+            self._update_predictive_parameters()
+            self.last_prediction_time = current_time
             
-            # Update last update time
-            self.last_update_time = time.time()
+        # Check if we should update the grid (based on time or forced update)
+        if self.force_grid_update or current_time - self.last_grid_update_time > self.grid_update_interval:
+            self.last_grid_update_time = current_time
+            self.force_grid_update = False
             
-        except Exception as e:
-            self.logger.error(f"Error updating market data: {str(e)}")
+            # Log the update
+            self.logger.debug(f"Triggering grid update due to market data update")
+            
+            # This will signal that grids should be updated on the next quote generation
+            return True
+        
+        return False
 
     def _update_predictive_parameters(self) -> None:
-        """Update predictive parameters based on volume candle analysis"""
+        """Update predictive parameters from volume candle buffer"""
+        if not self.volume_buffer:
+            return
+        
         try:
             # Get predictions from volume candle buffer
             predictions = self.volume_buffer.get_predicted_parameters()
             
-            # Save old values for logging changes
-            old_predictions = self.predictive_adjustments.copy()
-            
-            # Apply sensitivity multipliers from config
-            sensitivity = TRADING_CONFIG.get("volume_candle", {}).get("sensitivity", {})
-            
-            # Apply sensitivity multipliers to each adjustment
-            if sensitivity:
-                if "momentum" in sensitivity and "reservation_price" in sensitivity:
-                    momentum_factor = sensitivity.get("momentum", 1.0)
-                    price_factor = sensitivity.get("reservation_price", 1.0)
-                    predictions["reservation_price_offset"] *= momentum_factor * price_factor
+            if predictions:
+                # Store the adjustments for use in other components
+                self.predictive_adjustments = predictions
+                self.predictive_adjustments["last_update_time"] = time.time()
                 
-                if "volatility" in sensitivity:
-                    volatility_factor = sensitivity.get("volatility", 1.0)
-                    predictions["volatility_adjustment"] *= volatility_factor
+                # Update Avellaneda parameters based on predictions
+                
+                # 1. Adjust gamma (risk aversion) based on prediction
+                gamma_adjustment = predictions.get("gamma_adjustment", 0)
+                if abs(gamma_adjustment) > 0.05:  # Only apply significant adjustments
+                    new_gamma = self.gamma * (1 + gamma_adjustment)
+                    self.update_gamma(new_gamma)
+                    self.logger.info(f"Adjusted gamma from {self.gamma:.3f} to {new_gamma:.3f} based on volume candle prediction")
                     
-                if "reversal" in sensitivity:
-                    reversal_factor = sensitivity.get("reversal", 1.0)
-                    predictions["gamma_adjustment"] *= reversal_factor
-            
-            # Set minimum thresholds for adjustments to prevent noise
-            if abs(predictions["gamma_adjustment"]) < 0.05:
-                predictions["gamma_adjustment"] = 0.0
+                # 2. Adjust kappa (market depth) based on prediction
+                kappa_adjustment = predictions.get("kappa_adjustment", 0)
+                if abs(kappa_adjustment) > 0.05:  # Only apply significant adjustments
+                    self.kappa = self.k_default * (1 + kappa_adjustment)
+                    self.logger.info(f"Adjusted kappa to {self.kappa:.3f} based on volume candle prediction")
+                    
+                # 3. Set reservation price offset based on prediction
+                self.reservation_price_offset = predictions.get("reservation_price_offset", 0)
+                if abs(self.reservation_price_offset) > 0.00001:
+                    self.logger.info(f"Set reservation price offset to {self.reservation_price_offset:.6f} based on prediction")
+                    
+                # 4. Track trend direction for grid spacing adjustment
+                trend_direction = predictions.get("trend_direction", 0)
                 
-            if abs(predictions["kappa_adjustment"]) < 0.05:
-                predictions["kappa_adjustment"] = 0.0
-                
-            if abs(predictions["reservation_price_offset"]) < 0.00005:
-                predictions["reservation_price_offset"] = 0.0
-                
-            if abs(predictions["volatility_adjustment"]) < 0.05:
-                predictions["volatility_adjustment"] = 0.0
-            
-            # Update predictive adjustments
-            self.predictive_adjustments = predictions
-            self.predictive_adjustments["last_update_time"] = time.time()
-            
-            # Log all significant parameter changes
-            changes = []
-            if old_predictions.get("gamma_adjustment", 0) != predictions["gamma_adjustment"]:
-                changes.append(f"γ_adj: {old_predictions.get('gamma_adjustment', 0):.3f}->{predictions['gamma_adjustment']:.3f}")
-                
-            if old_predictions.get("kappa_adjustment", 0) != predictions["kappa_adjustment"]:
-                changes.append(f"κ_adj: {old_predictions.get('kappa_adjustment', 0):.3f}->{predictions['kappa_adjustment']:.3f}")
-                
-            if old_predictions.get("reservation_price_offset", 0) != predictions["reservation_price_offset"]:
-                changes.append(f"r_offset: {old_predictions.get('reservation_price_offset', 0):.6f}->{predictions['reservation_price_offset']:.6f}")
-                
-            if old_predictions.get("trend_direction", 0) != predictions["trend_direction"]:
-                changes.append(f"trend: {old_predictions.get('trend_direction', 0)}->{predictions['trend_direction']}")
-                
-            if old_predictions.get("volatility_adjustment", 0) != predictions["volatility_adjustment"]:
-                changes.append(f"vol_adj: {old_predictions.get('volatility_adjustment', 0):.3f}->{predictions['volatility_adjustment']:.3f}")
-            
-            # Log changes if any adjustments were made
-            if changes:
-                self.logger.info(f"Applied predictive adjustments: {', '.join(changes)}")
-                
-                # If significant changes were made, log the signals that led to them
-                if len(changes) > 1 or abs(predictions["gamma_adjustment"]) > 0.2 or abs(predictions["reservation_price_offset"]) > 0.0002:
-                    signals = self.volume_buffer.signals
+                # 5. Apply volatility adjustment
+                vol_adjustment = predictions.get("volatility_adjustment", 0)
+                if abs(vol_adjustment) > 0.05:
+                    adjusted_vol = self.volatility * (1 + vol_adjustment)
+                    # Clamp to reasonable bounds
+                    adjusted_vol = max(min(adjusted_vol, TRADING_CONFIG["volatility"]["ceiling"]), TRADING_CONFIG["volatility"]["floor"])
+                    self.volatility = adjusted_vol
+                    self.logger.info(f"Adjusted volatility to {self.volatility:.4f} based on prediction")
+                    
+                # Log the signals from volume candles
+                signals = self.volume_buffer.signals if hasattr(self.volume_buffer, 'signals') else {}
+                if signals:
                     self.logger.info(
                         f"Signal basis: momentum={signals['momentum']:.2f}, reversal={signals['reversal']:.2f}, "
                         f"volatility={signals['volatility']:.2f}, exhaustion={signals['exhaustion']:.2f}"
                     )
                     
         except Exception as e:
-            self.logger.error(f"Error updating predictive parameters: {str(e)}") 
+            self.logger.error(f"Error updating predictive parameters: {str(e)}")
 
     def _calculate_fibonacci_size_multipliers(self, levels: int) -> List[float]:
         """
@@ -1299,33 +1635,36 @@ class AvellanedaMarketMaker:
         Returns:
             List of size multipliers for each level
         """
-        # Start with default config multipliers
-        default_multipliers = ORDERBOOK_CONFIG.get("bid_sizes", [1.0, 0.8, 0.6, 0.4, 0.2, 0.1])
+        # Use the configured size multipliers directly from ORDERBOOK_CONFIG
+        configured_multipliers = ORDERBOOK_CONFIG.get("bid_sizes", [0.3, 0.5, 0.7, 0.9, 1.0, 1.2])
         
-        # If we don't need many levels, just return the defaults
-        if levels <= len(default_multipliers):
-            return default_multipliers[:levels]
-            
-        # For Fibonacci-based sizing, we use the inverse of the Fibonacci ratios
-        # This makes orders closer to the mid price larger, and orders further away smaller
+        # If we don't need many levels, just return the configured values
+        if levels <= len(configured_multipliers):
+            return configured_multipliers[:levels]
+        
+        # For additional levels beyond config, use Fibonacci sequence
         fib_sequence = [1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89]
         
-        # Calculate multipliers based on inverse Fibonacci ratios
-        fib_multipliers = []
-        max_fib = max(fib_sequence[:levels]) if levels < len(fib_sequence) else max(fib_sequence)
+        # Initialize multipliers with configured values
+        fib_multipliers = configured_multipliers.copy()
         
-        for i in range(levels):
-            # Use actual Fibonacci number if available, otherwise use the last one
-            fib_value = fib_sequence[i] if i < len(fib_sequence) else fib_sequence[-1]
-            # Invert and normalize to get multiplier (higher for lower levels)
-            multiplier = 1.0 - (fib_value / max_fib * 0.9)  # Allow minimum of 0.1
+        # Calculate scaling factor to ensure smooth transition
+        base_scale = configured_multipliers[-1] / 0.7  # Scale to match the last configured multiplier
+        
+        # Add additional multipliers for levels beyond configuration
+        for i in range(len(configured_multipliers), levels):
+            idx = min(i - len(configured_multipliers) + 2, len(fib_sequence) - 1)
+            fib_value = fib_sequence[idx]
+            # Scale based on both the fibonacci value and base scale
+            multiplier = base_scale * (fib_value / 8)  # Normalized by fib(6) = 8
             fib_multipliers.append(round(multiplier, 2))
-            
-        # Ensure the first level is always 1.0
-        if fib_multipliers:
-            fib_multipliers[0] = 1.0
-            
-        return fib_multipliers 
+        
+        # Make sure the base level is not too small
+        if fib_multipliers and fib_multipliers[0] < 0.1:
+            fib_multipliers[0] = 0.1
+        
+        # Ensure we have exactly the number of levels requested
+        return fib_multipliers[:levels]
 
     def cleanup(self):
         """Clean up resources when shutting down"""
@@ -1404,3 +1743,8 @@ class AvellanedaMarketMaker:
             
             # Report hedge status
             self.report_hedge_status() 
+
+    def set_volume_candle_buffer(self, volume_candle_buffer):
+        """Set the volume candle buffer for real-time predictions"""
+        self.volume_buffer = volume_candle_buffer
+        self.logger.info("Volume candle buffer connected for real-time predictions") 

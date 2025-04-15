@@ -79,6 +79,28 @@ class OrderbookManager:
             
             return True
             
+        except ValueError as e:
+            if "Sequence gap detected" in str(e):
+                self.logger.warning(f"Sequence gap detected in orderbook update: {str(e)}")
+                self.snapshot_requested = True
+                self.sequence_mismatches += 1
+                # This will trigger a snapshot request on the next tick
+                return False
+            else:
+                self.logger.error(f"Error processing orderbook update: {str(e)}", exc_info=True)
+                # Log more details about the message
+                type_str = message.get('type', 'unknown')
+                data = message.get('data', {})
+                sequence = data.get('sequence', 'unknown')
+                self.logger.error(f"Problem update details - type: {type_str}, sequence: {sequence}")
+                if 'bids' in data and data['bids']:
+                    self.logger.error(f"First bid: {data['bids'][0]}")
+                if 'asks' in data and data['asks']:
+                    self.logger.error(f"First ask: {data['asks'][0]}")
+                return False
+        except RuntimeWarning as e:
+            self.logger.warning(f"RuntimeWarning in orderbook update: {str(e)}")
+            return False
         except Exception as e:
             self.logger.error(f"Error processing orderbook update: {str(e)}", exc_info=True)
             return False

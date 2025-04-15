@@ -144,22 +144,30 @@ class HedgeExecution:
             log_file="execution.log"  # Will be placed in logs/hedge/ directory
         )
         
-        # Initialize exchange client if not provided
-        if exchange_client is None and config.exchange_api_key and config.exchange_api_secret:
-            try:
-                from ...exchange_clients.thalex_client import ThalexClient
-                self.logger.info("Creating Thalex exchange client")
-                self.exchange_client = ThalexClient(
-                    api_key=config.exchange_api_key,
-                    api_secret=config.exchange_api_secret,
-                    testnet=config.use_testnet
-                )
-                self.logger.info("Thalex exchange client created successfully")
-            except Exception as e:
-                self.logger.error(f"Failed to create exchange client: {e}")
-                self.exchange_client = None
+        # Store the provided exchange client without creating a new one
+        self.exchange_client = exchange_client
+        
+        # Log if exchange client was provided
+        if exchange_client is not None:
+            self.logger.info(f"Using provided exchange client of type {type(exchange_client).__name__}")
         else:
-            self.exchange_client = exchange_client
+            # Only create a new client if none was provided and we have credentials
+            if config.exchange_api_key and config.exchange_api_secret:
+                try:
+                    from ...exchange_clients.thalex_client import ThalexClient
+                    self.logger.info("Creating Thalex exchange client")
+                    self.exchange_client = ThalexClient(
+                        api_key=config.exchange_api_key,
+                        api_secret=config.exchange_api_secret,
+                        testnet=config.use_testnet
+                    )
+                    self.logger.info("Thalex exchange client created successfully")
+                except Exception as e:
+                    self.logger.error(f"Failed to create exchange client: {e}")
+                    self.exchange_client = None
+            else:
+                self.logger.warning("No exchange client provided and no API credentials configured")
+                self.exchange_client = None
             
         # Active orders and fill history
         self.active_orders: Dict[str, HedgeOrder] = {}
@@ -399,22 +407,22 @@ class HedgeExecution:
     
     def _place_exchange_order(self, order: HedgeOrder) -> Optional[Dict]:
         """
-        Place order on the exchange
+        Place an order on the exchange
         
         Args:
-            order: HedgeOrder object
+            order: Order to place
             
         Returns:
-            Exchange response or None if simulation
+            Exchange response or None if failed
         """
         self.logger.info(f"Attempting to place order: {order.symbol} {order.side.value} {order.size} {order.order_type.value}")
         
+        # Check if exchange client is available
         if self.exchange_client is None:
-            self.logger.warning(f"SIMULATION MODE: Exchange client is None, cannot execute real order for {order.symbol}")
-            self.logger.warning(f"Order will be simulated but NOT sent to exchange: {order.symbol} {order.side.value} {order.size}")
+            self.logger.warning("No exchange client available for order execution")
             return None
         
-        # Log exchange client type and details
+        # Log the exchange client type for debugging
         self.logger.info(f"Exchange client type: {type(self.exchange_client).__name__}")
         
         # Implement exchange-specific order placement
@@ -433,146 +441,164 @@ class HedgeExecution:
                 else:
                     thalex_client = self.exchange_client
                 
-                # Prepare async execution
-                loop = asyncio.get_event_loop()
-                
-                # Use Thalex client to place order
+                # Use Thalex client to place order asynchronously
                 if order.order_type == OrderType.MARKET:
                     # Place using appropriate method based on client type
                     if hasattr(thalex_client, 'place_market_order') and callable(thalex_client.place_market_order):
-                        response = loop.run_until_complete(thalex_client.place_market_order(
-                            symbol=order.symbol,
-                            side=order.side.value,
-                            size=order.size
-                        ))
-                        self.logger.info(f"REAL ORDER EXECUTED: Thalex market order response: {response}")
-                        return response
+                        # Create an async function to call the place_market_order method
+                        async def execute_order():
+                            return await thalex_client.place_market_order(
+                                symbol=order.symbol,
+                                side=order.side.value,
+                                size=order.size
+                            )
+                        
+                        # Use asyncio.run or get event loop based on context
+                        try:
+                            # Try to get the current event loop
+                            loop = asyncio.get_event_loop()
+                            
+                            # Check if we're in an event loop already
+                            if loop.is_running():
+                                # We're already in an event loop, create a task
+                                future = asyncio.create_task(execute_order())
+                                response = asyncio.run_coroutine_threadsafe(execute_order(), loop).result(timeout=10)
+                            else:
+                                # We're not in an event loop, run one
+                                response = loop.run_until_complete(execute_order())
+                            
+                            self.logger.info(f"REAL ORDER EXECUTED: Thalex market order response: {response}")
+                            return response
+                        except Exception as e:
+                            self.logger.error(f"Error executing order: {e}")
+                            return None
                     # Fallback to native Thalex client methods
                     else:
-                        # Call either buy or sell based on direction
-                        if order.side == OrderSide.BUY:
-                            response = loop.run_until_complete(thalex_client.buy(
-                                instrument_name=order.symbol,
-                                amount=order.size,
-                                order_type="market"
-                            ))
-                        else:
-                            response = loop.run_until_complete(thalex_client.sell(
-                                instrument_name=order.symbol,
-                                amount=order.size,
-                                order_type="market"
-                            ))
+                        # Create an async function to call buy or sell
+                        async def execute_native_order():
+                            if order.side == OrderSide.BUY:
+                                return await thalex_client.buy(
+                                    instrument_name=order.symbol,
+                                    amount=order.size,
+                                    order_type="market"
+                                )
+                            else:
+                                return await thalex_client.sell(
+                                    instrument_name=order.symbol,
+                                    amount=order.size,
+                                    order_type="market"
+                                )
                         
-                        self.logger.info(f"REAL ORDER EXECUTED: Thalex market order response: {response}")
-                        return {
-                            "status": "filled",
-                            "filled_size": order.size,
-                            "filled_price": response.get("price", 0.0)
-                        }
-                    
-                else:  # Limit order
-                    # Place using appropriate method based on client type
+                        # Use asyncio.run or get event loop based on context
+                        try:
+                            # Try to get the current event loop
+                            loop = asyncio.get_event_loop()
+                            
+                            # Check if we're in an event loop already
+                            if loop.is_running():
+                                # We're already in an event loop, create a task
+                                response = asyncio.run_coroutine_threadsafe(execute_native_order(), loop).result(timeout=10)
+                            else:
+                                # We're not in an event loop, run one
+                                response = loop.run_until_complete(execute_native_order())
+                            
+                            self.logger.info(f"REAL ORDER EXECUTED: Thalex market order response: {response}")
+                            return {
+                                "status": "filled",
+                                "filled_size": order.size,
+                                "filled_price": response.get("price", 0.0)
+                            }
+                        except Exception as e:
+                            self.logger.error(f"Error executing native order: {e}")
+                            return None
+                
+                elif order.order_type == OrderType.LIMIT:
+                    # Similar pattern for limit orders
                     if hasattr(thalex_client, 'place_limit_order') and callable(thalex_client.place_limit_order):
-                        response = loop.run_until_complete(thalex_client.place_limit_order(
-                            symbol=order.symbol,
-                            side=order.side.value,
-                            size=order.size,
-                            price=order.price
-                        ))
-                        self.logger.info(f"REAL ORDER EXECUTED: Thalex limit order response: {response}")
-                        return response
-                    # Fallback to native Thalex client methods
-                    else:
-                        # Call either buy or sell based on direction
-                        if order.side == OrderSide.BUY:
-                            response = loop.run_until_complete(thalex_client.buy(
-                                instrument_name=order.symbol,
-                                amount=order.size,
-                                price=order.price,
-                                order_type="limit"
-                            ))
-                        else:
-                            response = loop.run_until_complete(thalex_client.sell(
-                                instrument_name=order.symbol,
-                                amount=order.size,
-                                price=order.price,
-                                order_type="limit"
-                            ))
+                        # Create an async function for limit orders
+                        async def execute_limit_order():
+                            return await thalex_client.place_limit_order(
+                                symbol=order.symbol,
+                                side=order.side.value,
+                                size=order.size,
+                                price=order.price
+                            )
                         
-                        self.logger.info(f"REAL ORDER EXECUTED: Thalex limit order response: {response}")
-                        return {
-                            "status": "open",
-                            "filled_size": 0.0,
-                            "filled_price": 0.0,
-                            "order_id": response.get("order_id", "")
-                        }
+                        try:
+                            # Try to get the current event loop
+                            loop = asyncio.get_event_loop()
+                            
+                            # Check if we're in an event loop already
+                            if loop.is_running():
+                                # We're already in an event loop, create a task
+                                response = asyncio.run_coroutine_threadsafe(execute_limit_order(), loop).result(timeout=10)
+                            else:
+                                # We're not in an event loop, run one
+                                response = loop.run_until_complete(execute_limit_order())
+                            
+                            self.logger.info(f"REAL ORDER EXECUTED: Thalex limit order response: {response}")
+                            return response
+                        except Exception as e:
+                            self.logger.error(f"Error executing limit order: {e}")
+                            return None
+                    # Fallback to native Thalex client methods for limit orders
+                    else:
+                        # Implementation for native limit orders
+                        pass
             
-            # Execute actual order based on order type using generic method
-            elif order.order_type == OrderType.MARKET:
-                # Place market order using the exchange client
-                if hasattr(self.exchange_client, 'place_market_order') and callable(self.exchange_client.place_market_order):
-                    self.logger.info(f"REAL ORDER: Using exchange client's place_market_order for {order.symbol} {order.side.value} {order.size}")
-                    response = self.exchange_client.place_market_order(
-                        symbol=order.symbol,
-                        side=order.side.value,
-                        size=order.size
-                    )
-                    self.logger.info(f"REAL ORDER EXECUTED: Market order response: {response}")
-                    return response
+            # Add support for other exchange types here
             else:
-                # Place limit order using the exchange client
-                if hasattr(self.exchange_client, 'place_limit_order') and callable(self.exchange_client.place_limit_order):
-                    self.logger.info(f"REAL ORDER: Using exchange client's place_limit_order for {order.symbol} {order.side.value} {order.size} @ {order.price}")
-                    response = self.exchange_client.place_limit_order(
-                        symbol=order.symbol,
-                        side=order.side.value,
-                        size=order.size,
-                        price=order.price
-                    )
-                    self.logger.info(f"REAL ORDER EXECUTED: Limit order response: {response}")
-                    return response
-            
-            # Fallback to simulation if exchange client doesn't have proper methods
-            self.logger.warning(f"SIMULATION MODE: Exchange client doesn't have proper order execution methods, simulating order instead")
-            
-            simulated_response = {
-                "status": "filled" if order.order_type == OrderType.MARKET else "open",
-                "filled_size": order.size if order.order_type == OrderType.MARKET else 0.0,
-                "filled_price": order.price or 0.0
-            }
-            
-            self.logger.warning(f"SIMULATED ORDER (NOT SENT TO EXCHANGE): {order.symbol} {order.side.value} {order.size}, response: {simulated_response}")
-            return simulated_response
-            
+                self.logger.warning(f"Unsupported exchange client type: {type(self.exchange_client)}")
+                return None
+                
         except Exception as e:
             self.logger.error(f"ERROR PLACING ORDER: Error placing order on exchange: {e}")
-            return {
-                "status": "error",
-                "error": str(e)
-            }
+            return None
     
     def _cancel_exchange_order(self, order: HedgeOrder) -> bool:
         """
-        Cancel order on the exchange
+        Cancel an order on the exchange
         
         Args:
-            order: HedgeOrder object
+            order: Order to cancel
             
         Returns:
-            True if cancellation was successful
+            True if successful, False otherwise
         """
+        self.logger.info(f"Attempting to cancel order: {order.order_id}")
+        
+        # Check if exchange client is available
         if self.exchange_client is None:
-            return True
-            
+            self.logger.warning("No exchange client available for order cancellation")
+            return False
+        
         # Implement exchange-specific order cancellation
         try:
             # Check if exchange client has cancel_order method
             if hasattr(self.exchange_client, 'cancel_order') and callable(self.exchange_client.cancel_order):
                 # For async clients
                 if asyncio.iscoroutinefunction(self.exchange_client.cancel_order):
-                    loop = asyncio.get_event_loop()
-                    response = loop.run_until_complete(self.exchange_client.cancel_order(order_id=order.order_id))
-                    return response
+                    # Create an async function to call cancel_order
+                    async def execute_cancel():
+                        return await self.exchange_client.cancel_order(order_id=order.order_id)
+                    
+                    try:
+                        # Try to get the current event loop
+                        loop = asyncio.get_event_loop()
+                        
+                        # Check if we're in an event loop already
+                        if loop.is_running():
+                            # We're already in an event loop, create a task
+                            response = asyncio.run_coroutine_threadsafe(execute_cancel(), loop).result(timeout=10)
+                        else:
+                            # We're not in an event loop, run one
+                            response = loop.run_until_complete(execute_cancel())
+                        
+                        self.logger.info(f"Cancel order response: {response}")
+                        return True
+                    except Exception as e:
+                        self.logger.error(f"Error cancelling order: {e}")
+                        return False
                 # For sync clients
                 else:
                     response = self.exchange_client.cancel_order(order_id=order.order_id)
@@ -580,10 +606,27 @@ class HedgeExecution:
                     
             # Check if it's a Thalex client with native cancel method
             elif hasattr(self.exchange_client, 'cancel') and callable(self.exchange_client.cancel):
-                loop = asyncio.get_event_loop()
-                response = loop.run_until_complete(self.exchange_client.cancel(order_id=order.order_id))
-                self.logger.info(f"Thalex cancel response: {response}")
-                return True
+                # Create an async function to call cancel
+                async def execute_thalex_cancel():
+                    return await self.exchange_client.cancel(order_id=order.order_id)
+                
+                try:
+                    # Try to get the current event loop
+                    loop = asyncio.get_event_loop()
+                    
+                    # Check if we're in an event loop already
+                    if loop.is_running():
+                        # We're already in an event loop, create a task
+                        response = asyncio.run_coroutine_threadsafe(execute_thalex_cancel(), loop).result(timeout=10)
+                    else:
+                        # We're not in an event loop, run one
+                        response = loop.run_until_complete(execute_thalex_cancel())
+                    
+                    self.logger.info(f"Thalex cancel response: {response}")
+                    return True
+                except Exception as e:
+                    self.logger.error(f"Error cancelling Thalex order: {e}")
+                    return False
                 
             # For now, simulate successful cancellation if no method is found
             self.logger.warning("No cancel method found on exchange client, simulating successful cancellation")
