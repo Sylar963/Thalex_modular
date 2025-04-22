@@ -65,7 +65,12 @@ class AvellanedaMarketMaker:
         self.volume_buffer = VolumeBasedCandleBuffer(
             volume_threshold=TRADING_CONFIG.get("volume_candle", {}).get("threshold", 1.0),
             max_candles=TRADING_CONFIG.get("volume_candle", {}).get("max_candles", 100),
-            max_time_seconds=TRADING_CONFIG.get("volume_candle", {}).get("max_time_seconds", 300)
+            max_time_seconds=TRADING_CONFIG.get("volume_candle", {}).get("max_time_seconds", 300),
+            exchange_client=exchange_client,
+            instrument=None,  # Will be set via set_instrument method
+            use_exchange_data=TRADING_CONFIG.get("volume_candle", {}).get("use_exchange_data", False),
+            fetch_interval_seconds=TRADING_CONFIG.get("volume_candle", {}).get("fetch_interval_seconds", 60),
+            lookback_hours=TRADING_CONFIG.get("volume_candle", {}).get("lookback_hours", 1)
         )
         
         # NEW: Predictive state tracking - initialize at the start to avoid None issues
@@ -1495,9 +1500,14 @@ class AvellanedaMarketMaker:
         return aligned_price
 
     def set_instrument(self, instrument: str):
-        """Set the instrument name"""
+        """Set the instrument being traded"""
         self.instrument = instrument
-        self.logger.info(f"Instrument set to {instrument}") 
+        self.logger.info(f"Setting instrument to {instrument}")
+        
+        # Update instrument in volume candle buffer if available
+        if hasattr(self, 'volume_buffer') and self.volume_buffer:
+            self.volume_buffer.instrument = instrument
+            self.logger.info(f"Updated volume candle buffer instrument to {instrument}")
 
     def calculate_dynamic_gamma(self, volatility: float, market_impact: float) -> float:
         """
@@ -1821,12 +1831,18 @@ class AvellanedaMarketMaker:
 
     def cleanup(self):
         """Clean up resources when shutting down"""
-        # Stop hedge manager if it's running
-        if self.use_hedging and self.hedge_manager is not None:
-            self.hedge_manager.stop()
-            self.logger.info("Hedge manager stopped")
+        self.logger.info("Cleaning up Avellaneda market maker resources")
         
-        # Add other cleanup tasks as needed 
+        # Clean up hedge manager if active
+        if self.use_hedging and self.hedge_manager:
+            self.hedge_manager.stop()
+            
+        # Clean up volume candle buffer
+        if hasattr(self, 'volume_buffer') and self.volume_buffer:
+            if hasattr(self.volume_buffer, 'stop'):
+                self.volume_buffer.stop()
+                
+        self.logger.info("Cleanup complete")
 
     def update_monetary_position(self):
         """Update and log the monetary position value"""
@@ -1899,5 +1915,15 @@ class AvellanedaMarketMaker:
 
     def set_volume_candle_buffer(self, volume_candle_buffer):
         """Set the volume candle buffer for real-time predictions"""
+        # Clean up existing buffer if it exists
+        if hasattr(self, 'volume_buffer') and self.volume_buffer:
+            if hasattr(self.volume_buffer, 'stop'):
+                self.volume_buffer.stop()
+                
         self.volume_buffer = volume_candle_buffer
-        self.logger.info("Volume candle buffer connected for real-time predictions") 
+        
+        # Update instrument in the new buffer if we have it set
+        if self.instrument and hasattr(self.volume_buffer, 'instrument'):
+            self.volume_buffer.instrument = self.instrument
+            
+        self.logger.info("Volume candle buffer connected for real-time predictions")

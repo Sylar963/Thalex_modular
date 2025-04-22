@@ -276,6 +276,9 @@ TRADING_CONFIG = {
         "max_candles": 100,             # Maximum candles to keep in buffer
         "max_time_seconds": 300,        # Maximum time before forcing candle completion
         "prediction_update_interval": 10.0, # How often to update predictions (seconds)
+        "use_exchange_data": True,      # Enable exchange API integration for complete data
+        "fetch_interval_seconds": 60,   # How often to fetch exchange data (seconds)
+        "lookback_hours": 1,            # How far back to look for historical data
         "sensitivity": {
             "momentum": 1.0,            # Sensitivity multiplier for momentum signals
             "reversal": 1.0,            # Sensitivity multiplier for reversal signals

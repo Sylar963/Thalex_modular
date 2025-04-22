@@ -124,6 +124,36 @@ vol_floor = TRADING_PARAMS["volatility"]["vol_floor"]
 - **Auto-Recovery**: Automatic reconnection and state recovery
 - **Rate Limiting**: Intelligent handling of exchange rate limits with cooldown periods
 
+## Volume-Based Candle Buffer
+
+The market maker includes an enhanced volume-based candle buffer system that builds predictive signals based on trade volume and price action:
+
+- **Volume-Based Candles**: Creates candles based on traded volume thresholds rather than fixed time intervals
+- **Exchange API Integration**: Can fetch market data directly from Thalex Exchange API for complete data
+- **Hybrid Processing**: Processes both direct trades from the bot and exchange data with deduplication
+- **Predictive Signals**: Generates signals for momentum, reversals, volatility, and exhaustion
+- **Dynamic Parameter Adjustment**: Automatically adjusts Avellaneda model parameters based on signals
+- **Thread Safety**: Implements proper locking and resource management for multi-threaded operation
+
+To enable the exchange data integration feature, adjust the following settings in `market_config.py`:
+
+```python
+TRADING_CONFIG = {
+    # ... other settings ...
+    "volume_candle": {
+        "threshold": 1.0,             # Volume required to complete a candle (BTC)
+        "max_candles": 100,           # Maximum candles to store
+        "max_time_seconds": 300,      # Maximum time before closing a candle
+        "use_exchange_data": True,    # Enable exchange API integration
+        "fetch_interval_seconds": 60, # How often to fetch exchange data
+        "lookback_hours": 1,          # How far back to look for historical data
+        "prediction_update_interval": 10.0  # How often to update predictions
+    }
+}
+```
+
+See the example in `examples/enhanced_candle_buffer_example.py` for a standalone demonstration of the enhanced volume candle buffer.
+
 ## Configuration
 
 The market maker behavior can be customized through the unified configuration in `market_config.py`:
