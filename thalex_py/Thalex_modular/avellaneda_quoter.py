@@ -974,7 +974,7 @@ class AvellanedaQuoter:
                     # Update shared memory for IPC with other processes
                     if hasattr(self, 'shared_market_data') and self.shared_market_data is not None:
                         try:
-                            # Create a properly sized data array
+                            # Create a dictionary with data matching SharedMarketData fields
                             market_data_dict = {
                                 'timestamp': time.time(),
                                 'mid_price': mid_price,
@@ -982,18 +982,40 @@ class AvellanedaQuoter:
                                 'best_ask': ticker.best_ask_price,
                                 'bid_quantity': ticker.best_bid_amount,
                                 'ask_quantity': ticker.best_ask_amount,
-                                'volatility': 0.0  # Calculate volatility if needed
+                                'volatility': 0.0,  # Calculate volatility if needed
+                                'status': 1 # 1 for active/updated
                             }
                             
-                            # Update only the first array element to avoid index errors
-                            self.shared_market_data.np_array[0] = market_data_dict.get('timestamp', 0.0)
+                            # Write directly to the shared memory buffer using ctypes structure
+                            # Ensure the target buffer exists and is accessible
+                            if self.shared_market_data.shm.buf:
+                                # Create a ctypes structure instance from the shared memory buffer
+                                data_struct = SharedMarketData.from_buffer(self.shared_market_data.shm.buf)
+                                
+                                # Update fields - handle potential type errors
+                                for field_name, field_type in SharedMarketData._fields_:
+                                    value = market_data_dict.get(field_name)
+                                    if value is not None:
+                                        try:
+                                            # Cast value to the expected ctypes type
+                                            setattr(data_struct, field_name, field_type(value))
+                                        except (TypeError, ValueError) as type_err:
+                                            self.logger.error(f"Type error setting shared memory field '{field_name}': {type_err}. Value: {value}")
+                                    else:
+                                         self.logger.warning(f"Missing value for shared memory field: {field_name}")
+
+                            # # Old incorrect logic - removed:
+                            # # Update only the first array element to avoid index errors
+                            # self.shared_market_data.np_array[0] = market_data_dict.get('timestamp', 0.0)
+                        except AttributeError as ae:
+                             # Handle cases where from_buffer might not be available directly on the class
+                            if "'type' object has no attribute 'from_buffer'" in str(ae):
+                                 self.logger.error("Cannot use from_buffer directly on SharedMarketData class. Need instance or different approach.")
+                            else:
+                                 self.logger.error(f"Attribute error updating shared memory: {str(ae)}")
                         except Exception as shared_memory_error:
                             # More specific error handling to identify the issue
-                            if "index" in str(shared_memory_error):
-                                # This is an index bounds error, so the array is not sized properly
-                                self.logger.error(f"SharedMarketData array size issue: {self.shared_market_data.np_array.shape}")
-                            else:
-                                self.logger.error(f"Error updating shared memory: {str(shared_memory_error)}")
+                            self.logger.error(f"Error updating shared memory: {str(shared_memory_error)}", exc_info=True)
                 else:
                     if instrument_id:
                         self.logger.info(f"Skipping ticker for irrelevant instrument: {instrument_id}, expected: {self.perp_name}")
@@ -1613,57 +1635,94 @@ class AvellanedaQuoter:
             placed_bids = 0
             placed_asks = 0
             
+            # --- BEGIN INVENTORY CHECK FOR ONE-SIDED QUOTING ---
+            current_inventory = 0.0
+            if hasattr(self.market_maker, 'position_size'):
+                current_inventory = self.market_maker.position_size
+            else:
+                self.logger.warning("Market maker object or 'position_size' attribute not found. Inventory check will use 0 inventory.")
+
+            max_inventory_deviation = TRADING_PARAMS.get("max_allowed_inventory_deviation", float('inf'))
+            if not isinstance(max_inventory_deviation, (int, float)) or max_inventory_deviation < 0:
+                self.logger.warning(f"Invalid 'max_allowed_inventory_deviation' ({max_inventory_deviation}). Using infinity (feature disabled).")
+                max_inventory_deviation = float('inf')
+            
+            can_place_bids_inventory_wise = True
+            if current_inventory > max_inventory_deviation:  # Inventory is too long
+                can_place_bids_inventory_wise = False
+                self.logger.info(
+                    f"Inventory ({current_inventory:.4f}) exceeds +max_allowed_inventory_deviation ({max_inventory_deviation:.4f}). "
+                    f"Temporarily stopping new bid orders."
+                )
+            
+            can_place_asks_inventory_wise = True
+            if current_inventory < -max_inventory_deviation:  # Inventory is too short
+                can_place_asks_inventory_wise = False
+                self.logger.info(
+                    f"Inventory ({current_inventory:.4f}) is less than -max_allowed_inventory_deviation ({-max_inventory_deviation:.4f}). "
+                    f"Temporarily stopping new ask orders."
+                )
+            # --- END INVENTORY CHECK ---
+            
             # Place bid quotes as individual limit orders
-            for quote in bid_quotes:
-                if quote.price <= 0 or quote.amount <= 0:
-                    self.logger.warning(f"Invalid bid quote detected: {quote.price}@{quote.amount} - skipping")
-                    continue
-                
-                # Check if we reached the max limit for this side
-                if placed_bids >= max_levels:
-                    self.logger.warning(f"Maximum bid levels ({max_levels}) reached - skipping remaining bids")
-                    break
+            if can_place_bids_inventory_wise:
+                for quote in bid_quotes:
+                    if quote.price <= 0 or quote.amount <= 0:
+                        self.logger.warning(f"Invalid bid quote detected: {quote.price}@{quote.amount} - skipping")
+                        continue
                     
-                # Use the order manager to place a limit order
-                try:
-                    await self.order_manager.place_order(
-                        instrument=self.perp_name,
-                        direction="buy",
-                        price=quote.price,
-                        amount=quote.amount,
-                        label="AvellanedaQuoter",
-                        post_only=True
-                    )
-                    self.logger.info(f"Placed bid: {quote.amount:.3f}@{quote.price:.2f}")
-                    placed_bids += 1
-                except Exception as e:
-                    self.logger.error(f"Error placing bid: {str(e)}")
+                    # Check if we reached the max limit for this side
+                    if placed_bids >= max_levels:
+                        self.logger.warning(f"Maximum bid levels ({max_levels}) reached - skipping remaining bids")
+                        break
+                        
+                    # Use the order manager to place a limit order
+                    try:
+                        await self.order_manager.place_order(
+                            instrument=self.perp_name,
+                            direction="buy",
+                            price=quote.price,
+                            amount=quote.amount,
+                            label="AvellanedaQuoter",
+                            post_only=True
+                        )
+                        self.logger.info(f"Placed bid: {quote.amount:.3f}@{quote.price:.2f}")
+                        placed_bids += 1
+                    except Exception as e:
+                        self.logger.error(f"Error placing bid: {str(e)}")
+                else:
+                    if bid_quotes: # Only log if there were bids to place
+                        self.logger.info("Skipping all bid placements due to inventory limit.")
             
             # Place ask quotes as individual limit orders
-            for quote in ask_quotes:
-                if quote.price <= 0 or quote.amount <= 0:
-                    self.logger.warning(f"Invalid ask quote detected: {quote.price}@{quote.amount} - skipping")
-                    continue
-                
-                # Check if we reached the max limit for this side
-                if placed_asks >= max_levels:
-                    self.logger.warning(f"Maximum ask levels ({max_levels}) reached - skipping remaining asks")
-                    break
+            if can_place_asks_inventory_wise:
+                for quote in ask_quotes:
+                    if quote.price <= 0 or quote.amount <= 0:
+                        self.logger.warning(f"Invalid ask quote detected: {quote.price}@{quote.amount} - skipping")
+                        continue
                     
-                # Use the order manager to place a limit order
-                try:
-                    await self.order_manager.place_order(
-                        instrument=self.perp_name,
-                        direction="sell",
-                        price=quote.price,
-                        amount=quote.amount,
-                        label="AvellanedaQuoter",
-                        post_only=True
-                    )
-                    self.logger.info(f"Placed ask: {quote.amount:.3f}@{quote.price:.2f}")
-                    placed_asks += 1
-                except Exception as e:
-                    self.logger.error(f"Error placing ask: {str(e)}")
+                    # Check if we reached the max limit for this side
+                    if placed_asks >= max_levels:
+                        self.logger.warning(f"Maximum ask levels ({max_levels}) reached - skipping remaining asks")
+                        break
+                        
+                    # Use the order manager to place a limit order
+                    try:
+                        await self.order_manager.place_order(
+                            instrument=self.perp_name,
+                            direction="sell",
+                            price=quote.price,
+                            amount=quote.amount,
+                            label="AvellanedaQuoter",
+                            post_only=True
+                        )
+                        self.logger.info(f"Placed ask: {quote.amount:.3f}@{quote.price:.2f}")
+                        placed_asks += 1
+                    except Exception as e:
+                        self.logger.error(f"Error placing ask: {str(e)}")
+                else:
+                    if ask_quotes: # Only log if there were asks to place
+                        self.logger.info("Skipping all ask placements due to inventory limit.")
             
             # Record successful quote placement
             self.last_quote_time = time.time()
