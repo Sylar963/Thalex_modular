@@ -445,11 +445,15 @@ class AvellanedaMarketMaker:
             # Original volatility for logging
             original_volatility = volatility
             
-            if prediction_age < 300:  # Only use predictions less than 5 minutes old
+            # Fetch thresholds from config
+            pa_prediction_max_age_seconds = TRADING_CONFIG["avellaneda"].get("pa_prediction_max_age_seconds", 300)
+            pa_volatility_adj_threshold = TRADING_CONFIG["avellaneda"].get("pa_volatility_adj_threshold", 0.05)
+
+            if prediction_age < pa_prediction_max_age_seconds:  # Only use predictions less than configured max age
                 volatility_adjustment = self.predictive_adjustments.get("volatility_adjustment", 0)
-                if abs(volatility_adjustment) > 0.05:  # Only apply if significant
+                if abs(volatility_adjustment) > pa_volatility_adj_threshold:  # Only apply if significant
                     volatility *= (1 + volatility_adjustment)
-                    self.logger.debug(f"Adjusted volatility: {original_volatility:.4f} -> {volatility:.4f} (factor: {1 + volatility_adjustment:.2f})")
+                    self.logger.debug(f"Adjusted volatility: {original_volatility:.4f} -> {volatility:.4f} (factor: {1 + volatility_adjustment:.2f}, threshold: {pa_volatility_adj_threshold:.2f})")
             
             # Base Avellaneda-Stoikov spread calculation components
             # 1. Gamma/risk aversion component
@@ -462,11 +466,14 @@ class AvellanedaMarketMaker:
             
             # Apply predictive gamma adjustment
             original_gamma = base_gamma
-            if prediction_age < 300:
+            # Fetch threshold from config
+            pa_gamma_adj_threshold = TRADING_CONFIG["avellaneda"].get("pa_gamma_adj_threshold", 0.05)
+
+            if prediction_age < pa_prediction_max_age_seconds: # Already fetched pa_prediction_max_age_seconds
                 gamma_adjustment = self.predictive_adjustments.get("gamma_adjustment", 0)
-                if abs(gamma_adjustment) > 0.05:  # Only apply if significant
+                if abs(gamma_adjustment) > pa_gamma_adj_threshold:  # Only apply if significant
                     base_gamma = max(0.1, base_gamma * (1 + gamma_adjustment))
-                    self.logger.debug(f"Adjusted gamma: {original_gamma:.3f} -> {base_gamma:.3f} (factor: {1 + gamma_adjustment:.2f})")
+                    self.logger.debug(f"Adjusted gamma: {original_gamma:.3f} -> {base_gamma:.3f} (factor: {1 + gamma_adjustment:.2f}, threshold: {pa_gamma_adj_threshold:.2f})")
             
             gamma_component = 1.0 + base_gamma
             
@@ -482,10 +489,21 @@ class AvellanedaMarketMaker:
             
             # 3. Market impact adjustment (high impact = wider spread)
             # Ensure market_impact is not negative
-            market_impact = max(0, market_impact)
+            market_impact_arg = max(0, market_impact) # Renamed original market_impact to avoid confusion
             
+            # VAMP integration for spread adjustment
+            vamp_spread_sensitivity = TRADING_CONFIG["avellaneda"].get("vamp_spread_sensitivity", 0.0) # Default to 0 if not found
+            vamp_effect_on_spread = abs(self.vamp_impact) * vamp_spread_sensitivity
+            effective_market_impact = market_impact_arg + vamp_effect_on_spread
+
+            self.logger.debug(
+                f"VAMP effect on spread: base_impact_arg={market_impact_arg:.4f}, "
+                f"vamp_impact_abs={abs(self.vamp_impact):.4f}, sensitivity={vamp_spread_sensitivity:.2f}, "
+                f"vamp_effect={vamp_effect_on_spread:.4f}, effective_impact={effective_market_impact:.4f}"
+            )
+
             # Scale market impact by both volatility and order flow intensity for more responsive spreads
-            market_impact_component = market_impact * self.market_impact_factor * (1 + volatility)
+            market_impact_component = effective_market_impact * self.market_impact_factor * (1 + volatility)
             
             # 4. Position/inventory risk component (larger position = wider spread)
             # Ensure position_limit is not zero to prevent division by zero
@@ -502,7 +520,8 @@ class AvellanedaMarketMaker:
             market_state_factor = 1.0
             
             # Use predictive trend direction if available
-            if prediction_age < 300:
+            # pa_prediction_max_age_seconds already fetched
+            if prediction_age < pa_prediction_max_age_seconds:
                 trend_direction = self.predictive_adjustments.get("trend_direction", 0)
                 if trend_direction != 0:
                     # Only update market state if different from current
@@ -538,8 +557,8 @@ class AvellanedaMarketMaker:
             if random.random() < 0.05:  # Log occasionally to avoid spam
                 self.logger.info(
                     f"Spread calc: base={base_spread:.2f}, volatility={volatility_component:.2f}, "
-                    f"impact={market_impact_component:.2f}, inventory={inventory_component:.2f}, "
-                    f"market_state={market_state_factor:.2f}, final={final_spread:.2f}"
+                    f"impact_arg={market_impact_arg:.2f}, vamp_effect={vamp_effect_on_spread:.2f}, effective_impact_comp={market_impact_component:.2f}, "
+                    f"inventory={inventory_component:.2f}, market_state_factor={market_state_factor:.2f}, final={final_spread:.2f}"
                 )
                 
             return final_spread
@@ -567,18 +586,36 @@ class AvellanedaMarketMaker:
             prediction_age = time.time() - self.predictive_adjustments.get("last_update_time", 0)
             reservation_offset = 0.0
             
-            if prediction_age < 300:  # Only use predictions less than 5 minutes old
+            # Fetch thresholds from config
+            pa_prediction_max_age_seconds = TRADING_CONFIG["avellaneda"].get("pa_prediction_max_age_seconds", 300)
+            pa_res_price_offset_adj_threshold = TRADING_CONFIG["avellaneda"].get("pa_res_price_offset_adj_threshold", 0.00005)
+
+            if prediction_age < pa_prediction_max_age_seconds:  # Only use predictions less than configured max age
                 reservation_offset = self.predictive_adjustments.get("reservation_price_offset", 0.0)
                 
                 # Apply offset to mid price directly if significant
-                if abs(reservation_offset) > 0.00005:
+                if abs(reservation_offset) > pa_res_price_offset_adj_threshold:
                     adjusted_mid = mid_price + reservation_offset * mid_price
                     self.logger.debug(
                         f"Adjusted reservation price: {original_mid_price:.2f} -> {adjusted_mid:.2f} "
-                        f"(offset: {reservation_offset:.6f}, value: {reservation_offset * mid_price:.2f})"
+                        f"(offset: {reservation_offset:.6f}, value: {reservation_offset * mid_price:.2f}, threshold: {pa_res_price_offset_adj_threshold:.6f})"
                     )
                     mid_price = adjusted_mid
             
+            # VAMP integration for skew adjustment
+            vamp_skew_sensitivity = TRADING_CONFIG["avellaneda"].get("vamp_skew_sensitivity", 0.0) # Default to 0 if not found
+            if abs(self.vamp_impact) > 1e-9: # Apply only if vamp_impact is non-trivial
+                vamp_induced_price_offset = self.vamp_impact * vamp_skew_sensitivity
+                original_mid_price_before_vamp_skew = mid_price
+                mid_price += vamp_induced_price_offset
+                self.logger.debug(
+                    f"VAMP effect on skew: vamp_impact={self.vamp_impact:.4f}, sensitivity={vamp_skew_sensitivity:.6f}, "
+                    f"vamp_induced_offset={vamp_induced_price_offset:.4f}, "
+                    f"mid_price: {original_mid_price_before_vamp_skew:.2f} -> {mid_price:.2f}"
+                )
+            else:
+                self.logger.debug(f"Skipping VAMP skew adjustment due to near-zero vamp_impact: {self.vamp_impact:.4f}")
+
             # Calculate half spread
             half_spread = spread / 2
             
@@ -603,7 +640,8 @@ class AvellanedaMarketMaker:
             # Add more detail to skew logging
             self.logger.info(
                 f"Skewed prices: bid={bid_price:.2f}, ask={ask_price:.2f}, "
-                f"skew={inventory_skew:.4f}, reservation_offset={reservation_offset:.6f}"
+                f"inventory_skew={inventory_skew:.4f}, pred_reservation_offset={reservation_offset:.6f}, "
+                f"vamp_induced_offset={vamp_induced_price_offset if 'vamp_induced_price_offset' in locals() else 0.0:.4f}"
             )
             
             return bid_price, ask_price
@@ -1716,32 +1754,39 @@ class AvellanedaMarketMaker:
                 # Track changes to summarize at the end
                 changes_made = []
                 
+                # Fetch thresholds from config
+                pa_gamma_adj_threshold = TRADING_CONFIG["avellaneda"].get("pa_gamma_adj_threshold", 0.05)
+                pa_kappa_adj_threshold = TRADING_CONFIG["avellaneda"].get("pa_kappa_adj_threshold", 0.05)
+                # As discussed, using the same threshold as calculate_optimal_spread/calculate_skewed_prices for consistency here.
+                pa_res_price_offset_adj_threshold = TRADING_CONFIG["avellaneda"].get("pa_res_price_offset_adj_threshold", 0.00005) 
+                pa_volatility_adj_threshold = TRADING_CONFIG["avellaneda"].get("pa_volatility_adj_threshold", 0.05)
+
                 # 1. Adjust gamma (risk aversion) based on prediction
                 gamma_adjustment = predictions.get("gamma_adjustment", 0)
-                if abs(gamma_adjustment) > 0.05:  # Only apply significant adjustments
+                if abs(gamma_adjustment) > pa_gamma_adj_threshold:  # Only apply significant adjustments
                     old_gamma = self.gamma
                     new_gamma = self.gamma * (1 + gamma_adjustment)
                     self.update_gamma(new_gamma)
                     changes_made.append(f"gamma: {old_gamma:.3f} → {new_gamma:.3f} (adj: {gamma_adjustment:+.3f})")
                 else:
-                    self.logger.debug(f"Skipping gamma adjustment: {gamma_adjustment:.3f} (below threshold)")
+                    self.logger.debug(f"Skipping gamma adjustment: {gamma_adjustment:.3f} (below threshold {pa_gamma_adj_threshold:.2f})")
                     
                 # 2. Adjust kappa (market depth) based on prediction
                 kappa_adjustment = predictions.get("kappa_adjustment", 0)
                 old_kappa = self.kappa
-                if abs(kappa_adjustment) > 0.05:  # Only apply significant adjustments
+                if abs(kappa_adjustment) > pa_kappa_adj_threshold:  # Only apply significant adjustments
                     self.kappa = self.k_default * (1 + kappa_adjustment)
                     changes_made.append(f"kappa: {old_kappa:.3f} → {self.kappa:.3f} (adj: {kappa_adjustment:+.3f})")
                 else:
-                    self.logger.debug(f"Skipping kappa adjustment: {kappa_adjustment:.3f} (below threshold)")
+                    self.logger.debug(f"Skipping kappa adjustment: {kappa_adjustment:.3f} (below threshold {pa_kappa_adj_threshold:.2f})")
                     
                 # 3. Set reservation price offset based on prediction
                 old_offset = getattr(self, 'reservation_price_offset', 0)
                 self.reservation_price_offset = predictions.get("reservation_price_offset", 0)
-                if abs(self.reservation_price_offset) > 0.00001:
+                if abs(self.reservation_price_offset) > pa_res_price_offset_adj_threshold: # Changed from 0.00001 to configured value
                     changes_made.append(f"res_price_offset: {old_offset:.6f} → {self.reservation_price_offset:.6f}")
                 else:
-                    self.logger.debug(f"Reservation price offset: {self.reservation_price_offset:.6f} (minor adjustment)")
+                    self.logger.debug(f"Reservation price offset: {self.reservation_price_offset:.6f} (minor adjustment, below threshold {pa_res_price_offset_adj_threshold:.6f})")
                     
                 # 4. Track trend direction for grid spacing adjustment
                 old_trend = getattr(self, 'trend_direction', 0)
@@ -1753,14 +1798,14 @@ class AvellanedaMarketMaker:
                 # 5. Apply volatility adjustment
                 vol_adjustment = predictions.get("volatility_adjustment", 0)
                 old_vol = self.volatility
-                if abs(vol_adjustment) > 0.05:
+                if abs(vol_adjustment) > pa_volatility_adj_threshold:
                     adjusted_vol = self.volatility * (1 + vol_adjustment)
                     # Clamp to reasonable bounds
                     adjusted_vol = max(min(adjusted_vol, TRADING_CONFIG["volatility"]["ceiling"]), TRADING_CONFIG["volatility"]["floor"])
                     self.volatility = adjusted_vol
                     changes_made.append(f"volatility: {old_vol:.4f} → {adjusted_vol:.4f} (adj: {vol_adjustment:+.3f})")
                 else:
-                    self.logger.debug(f"Skipping volatility adjustment: {vol_adjustment:.3f} (below threshold)")
+                    self.logger.debug(f"Skipping volatility adjustment: {vol_adjustment:.3f} (below threshold {pa_volatility_adj_threshold:.2f})")
                 
                 # Log the signals from volume candles
                 signals = self.volume_buffer.signals if hasattr(self.volume_buffer, 'signals') else {}

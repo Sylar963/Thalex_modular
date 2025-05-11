@@ -35,40 +35,37 @@ thalex_py/Thalex_modular/
 
 ## Configuration Structure
 
-The market maker uses a layered configuration approach in `market_config.py`:
+The market maker uses a layered configuration approach defined in `thalex_py/Thalex_modular/config/market_config.py`:
 
-1. **Primary Configuration (`BOT_CONFIG`)**:
-   - Single source of truth for all settings
-   - All changes should be made here
+1.  **Primary Configuration (`BOT_CONFIG`)**:
+    *   This is the single source of truth for all settings, defined within `market_config.py`.
+    *   All custom strategy and risk parameters should be configured here.
 
-2. **Consolidated Configurations**:
-   - `TRADING_CONFIG`: Order parameters, quoting settings, and Avellaneda model
-   - `RISK_CONFIG`: Risk limits and inventory management
-   - `PERFORMANCE_CONFIG`: Performance metrics and thresholds
-   - Simple pass-through configs: `MARKET_CONFIG`, `TECHNICAL_PARAMS`, `CALL_IDS`
+2.  **Modern Configuration Structures (`TRADING_CONFIG`, `RISK_LIMITS`)**:
+    *   `TRADING_CONFIG`: Contains parameters related to trading strategy execution, Avellaneda model specifics, quote timing, market impact, and volatility settings. It is derived directly from `BOT_CONFIG`.
+    *   `RISK_LIMITS`: Contains core risk parameters like maximum position, notional limits, stop-loss, and take-profit percentages. It is also derived directly from `BOT_CONFIG`.
+    *   Other direct aliases like `MARKET_CONFIG` (for underlying, label, network) and `CONNECTION_CONFIG` (for connection retry delays) also exist, sourcing from `BOT_CONFIG`.
 
-3. **Legacy Configurations** (backward compatibility):
-   - Original variable names used throughout the codebase
-   - These now reference the consolidated configs rather than `BOT_CONFIG` directly
+3.  **Legacy Configurations (Removed)**:
+    *   Previously, several intermediate and proxy configurations (e.g., `ORDERBOOK_CONFIG`, `TRADING_PARAMS`, `RISK_CONFIG`, `QUOTING_CONFIG`, `PERFORMANCE_CONFIG`) existed for backward compatibility.
+    *   These have been **removed**. All modules should now access configuration parameters through `BOT_CONFIG` (for fundamental settings) or the modern derived structures `TRADING_CONFIG` and `RISK_LIMITS`.
 
-For new code, prefer to use the consolidated configurations:
+Modules should now directly import and use these modern structures:
 ```python
-# Preferred approach (consolidated configs)
-from thalex_py.Thalex_modular.config.market_config import TRADING_CONFIG
+# Example of accessing modern configurations:
+from thalex_py.Thalex_modular.config.market_config import TRADING_CONFIG, RISK_LIMITS, BOT_CONFIG
 
-# Access settings
-spread = TRADING_CONFIG["order"]["spread"]
-vol_floor = TRADING_CONFIG["volatility"]["vol_floor"]
-```
+# Access Avellaneda model parameters from TRADING_CONFIG
+gamma = TRADING_CONFIG["avellaneda"]["gamma"]
+vol_floor = TRADING_CONFIG["volatility"]["floor"] # Volatility settings are nested under TRADING_CONFIG
 
-Legacy code can continue using the original configuration variables:
-```python
-# Legacy approach (still supported)
-from thalex_py.Thalex_modular.config.market_config import ORDERBOOK_CONFIG, TRADING_PARAMS
+# Access risk parameters from RISK_LIMITS
+max_position = RISK_LIMITS["max_position"]
 
-# Access settings
-spread = ORDERBOOK_CONFIG["spread"]
-vol_floor = TRADING_PARAMS["volatility"]["vol_floor"]
+# Access fundamental settings directly from BOT_CONFIG if needed
+# (though most operational parameters are in TRADING_CONFIG or RISK_LIMITS)
+# e.g., if a specific bot behavior flag was in BOT_CONFIG["custom_flags"]
+# custom_flag_value = BOT_CONFIG["custom_flags"]["my_flag"] 
 ```
 
 ## Execution Flow
@@ -156,32 +153,17 @@ See the example in `examples/enhanced_candle_buffer_example.py` for a standalone
 
 ## Configuration
 
-The market maker behavior can be customized through the unified configuration in `market_config.py`:
+The market maker behavior is customized through the `BOT_CONFIG` dictionary within `thalex_py/Thalex_modular/config/market_config.py`. This primary configuration object is then used to populate the `TRADING_CONFIG` and `RISK_LIMITS` structures used by the bot's components.
 
-- **BOT_CONFIG**: General bot settings and connection parameters
-- **MARKET_CONFIG**: Market-specific settings
-- **TRADING_CONFIG**: Trading parameters (order, quoting, Avellaneda model)
-- **RISK_CONFIG**: Risk management settings
-- **TECHNICAL_PARAMS**: Technical analysis parameters
+Refer to `thalex_py/Thalex_modular/config/market_config.py` for the detailed structure of `BOT_CONFIG` and how `TRADING_CONFIG` and `RISK_LIMITS` are derived. Key parameters within `BOT_CONFIG` that influence trading and risk include (but are not limited to):
 
-Key parameters include:
+*   `BOT_CONFIG["trading_strategy"]["avellaneda"]`: For Avellaneda-Stoikov model parameters like `gamma`, `kappa`, `time_horizon`, `inventory_weight`, `min_spread`, `max_spread`, `base_size`, `max_levels`, `level_spacing`, etc.
+*   `BOT_CONFIG["risk"]`: For risk parameters like `max_position`, `max_notional`, `stop_loss_pct`, `take_profit_pct`, `max_drawdown`, etc.
+*   `BOT_CONFIG["trading_strategy"]["execution"]`: For execution details like `min_size`, `max_size`, `price_decimals`, `size_decimals`.
+*   `BOT_CONFIG["trading_strategy"]["quote_timing"]`: For quote behavior like `min_interval`, `max_lifetime`.
+*   `BOT_CONFIG["volatility_config"]` (if defined at `BOT_CONFIG` root, or typically `DEFAULT_VOLATILITY_CONFIG` is used within `TRADING_CONFIG`): For volatility calculation parameters like `window`, `floor`, `ceiling`.
 
-```python
-TRADING_PARAMS = {
-    "position_management": {
-        "gamma": 0.1,               # Risk aversion
-        "inventory_weight": 0.5,    # Inventory impact
-        "position_fade_time": 300,  # Position mean reversion time
-        "order_flow_intensity": 1.5 # Order arrival rate
-    },
-    "volatility": {
-        "window": 100,        # Volatility calculation window
-        "min_samples": 20,    # Minimum samples required
-        "vol_floor": 0.001,   # Minimum volatility
-        "vol_ceiling": 5.0    # Maximum volatility
-    }
-}
-```
+Please see `market_config.py` for the exact paths and default values.
 
 ## Usage
 

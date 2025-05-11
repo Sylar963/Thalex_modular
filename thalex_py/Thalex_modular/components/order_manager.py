@@ -35,7 +35,7 @@ class OrderManager:
         self.order_id_lock = asyncio.Lock()
         
         # Operation control
-        self.operation_semaphore = asyncio.Semaphore(TRADING_CONFIG["quoting"]["max_pending_operations"])
+        self.operation_semaphore = asyncio.Semaphore(TRADING_CONFIG["quoting"]["max_pending"])
         self.pending_operations = set()
         
         # Order metrics

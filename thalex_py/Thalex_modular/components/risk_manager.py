@@ -4,7 +4,7 @@ from collections import deque
 import time
 
 from ..config.market_config import (
-    RISK_CONFIG,
+    RISK_LIMITS,
     TRADING_CONFIG
 )
 from ..models.data_models import Ticker, Order
@@ -38,11 +38,11 @@ class RiskManager:
         self.notional_utilization = 0.0
         
         # Core risk limits from config
-        self.max_position = RISK_CONFIG["limits"]["max_position"]
-        self.max_notional = RISK_CONFIG["limits"]["max_notional"]
-        self.max_drawdown_pct = RISK_CONFIG["limits"]["max_drawdown"]
-        self.stop_loss_pct = RISK_CONFIG["limits"]["stop_loss_pct"]
-        self.take_profit_pct = RISK_CONFIG["limits"]["take_profit_pct"]
+        self.max_position = RISK_LIMITS["max_position"]
+        self.max_notional = RISK_LIMITS["max_notional"]
+        self.max_drawdown_pct = RISK_LIMITS["max_drawdown"]
+        self.stop_loss_pct = RISK_LIMITS["stop_loss_pct"]
+        self.take_profit_pct = RISK_LIMITS["take_profit_pct"]
         
         # Tracking for reporting
         self.limit_breaches = {
@@ -311,43 +311,91 @@ class RiskManager:
             
         return False, "", 0.0
 
-    async def check_risk_limits(self) -> bool:
+    async def check_risk_limits(self, current_market_price: Optional[float] = None) -> bool:
         """
-        Check all risk limits and return whether trading should continue
+        Check all risk limits and return whether trading should continue.
+        Uses provided current_market_price for more accurate checks if available.
         
+        Args:
+            current_market_price: Optional current market price for up-to-date calculations.
+            
         Returns:
-            Boolean indicating if risk limits are within acceptable range
+            Boolean indicating if risk limits are within acceptable range (True = OK, False = Breach)
         """
         # Skip if no position
         if self.position_size == 0:
-            return True
+            return True # True means OK, no limits breached
             
+        price_for_check = current_market_price
+        source_of_price = "provided current_market_price"
+
+        if current_market_price is None or current_market_price <= 0:
+            self.logger.warning(
+                "current_market_price not provided or invalid for check_risk_limits. "
+                "Falling back to potentially stale internal self.position_value and self.current_drawdown."
+            )
+            price_for_check = self.entry_price # Or some other fallback like last known price if entry_price is 0
+            if hasattr(self, 'last_known_price') and self.last_known_price > 0: # Assuming self.last_known_price could be a thing
+                 price_for_check = self.last_known_price
+            elif self.entry_price <= 0 and self.position_size != 0: # Critical fallback if no price info
+                 self.logger.error("Cannot perform accurate risk check without a valid price. Breaching for safety.")
+                 if self.on_risk_limit_breached:
+                     self.on_risk_limit_breached("Critical: No valid price for risk check", 0.0)
+                 return False # Breach for safety
+            source_of_price = "internal last known/entry price"
+
+
+        calculated_position_value = abs(self.position_size * price_for_check)
+        
+        # Recalculate PnL and drawdown potential with the price_for_check
+        pnl_pct_at_check_price = self.calculate_pnl_percentage(price_for_check)
+        drawdown_at_check_price = abs(pnl_pct_at_check_price) if pnl_pct_at_check_price < 0 else 0.0
+        
         try:
-            # 1. Position size limit
+            # 1. Position size limit (independent of current_market_price)
             if abs(self.position_size) > self.max_position:
-                self.logger.warning(f"Position size limit exceeded: {abs(self.position_size):.3f} > {self.max_position:.3f}")
+                reason = f"Position size limit exceeded: {abs(self.position_size):.3f} > {self.max_position:.3f}"
+                self.logger.warning(reason)
                 self.limit_breaches["position_size"] += 1
-                return False
+                if self.on_risk_limit_breached:
+                    self.on_risk_limit_breached(reason, price_for_check) # Pass the price used for context
+                return False # False means breach
                 
-            # 2. Notional value limit
-            if self.position_value > self.max_notional:
-                self.logger.warning(f"Notional value limit exceeded: {self.position_value:.2f} > {self.max_notional:.2f}")
+            # 2. Notional value limit (uses calculated_position_value)
+            if calculated_position_value > self.max_notional:
+                reason = (
+                    f"Notional value limit exceeded: {calculated_position_value:.2f} (using {source_of_price} @ {price_for_check:.2f}) "
+                    f"> {self.max_notional:.2f}"
+                )
+                self.logger.warning(reason)
                 self.limit_breaches["notional_value"] += 1
+                if self.on_risk_limit_breached:
+                    self.on_risk_limit_breached(reason, price_for_check)
                 return False
                 
-            # 3. Drawdown limit
-            if self.current_drawdown > self.max_drawdown_pct:
-                self.logger.warning(f"Drawdown limit exceeded: {self.current_drawdown:.2%} > {self.max_drawdown_pct:.2%}")
+            # 3. Drawdown limit (uses drawdown_at_check_price)
+            # Note: self.current_drawdown is historical. drawdown_at_check_price is 'what if' at current price.
+            # The limit self.max_drawdown_pct should apply to the potential drawdown at current market conditions.
+            if drawdown_at_check_price > self.max_drawdown_pct:
+                reason = (
+                    f"Potential drawdown limit exceeded: {drawdown_at_check_price:.2%} (using {source_of_price} @ {price_for_check:.2f}) "
+                    f"> {self.max_drawdown_pct:.2%}"
+                )
+                self.logger.warning(reason)
                 self.limit_breaches["drawdown"] += 1
+                if self.on_risk_limit_breached:
+                    self.on_risk_limit_breached(reason, price_for_check)
                 return False
                 
-            return True
+            return True # True means OK
             
         except Exception as e:
             self.logger.error(f"Error checking risk limits: {str(e)}")
-            return False  # Default to safety in case of errors
+            if self.on_risk_limit_breached:
+                self.on_risk_limit_breached(f"Error during risk check: {str(e)}", price_for_check if price_for_check else 0.0)
+            return False  # Default to safety (breach) in case of errors
 
-    def register_callback(self, event_type: str, callback: Callable) -> None:
+    def register_callback(self, event_type: str, callback: Callable[[str, float], Any]) -> None:
         """Register a callback function for risk limit breaches"""
         if event_type == "risk_limit":
             self.on_risk_limit_breached = callback

@@ -10,7 +10,6 @@ from collections import deque
 import random
 import math
 import logging
-import mmap
 import ctypes
 import numpy as np
 import websockets
@@ -27,7 +26,6 @@ from thalex_py.Thalex_modular.config.market_config import (
     MARKET_CONFIG, 
     CALL_IDS, 
     RISK_LIMITS,
-    TRADING_PARAMS,
     TRADING_CONFIG
 )
 from thalex_py.Thalex_modular.models.data_models import Ticker, Order, OrderStatus, Quote
@@ -92,9 +90,9 @@ class LockFreeQueue:
         self.head = (self.head + 1) % self.maxsize
         return item
 
-# Memory-mapped structure for IPC
-class SharedMarketData:
-    """Memory-mapped structure for sharing market data between processes"""
+# Memory-mapped structure for IPC - SIMPLIFIED DEFINITION
+class SharedMarketData(ctypes.Structure):
+    """Memory-mapped ctypes.Structure for sharing market data between processes."""
     _fields_ = [
         ('timestamp', ctypes.c_double),
         ('mid_price', ctypes.c_double),
@@ -105,33 +103,6 @@ class SharedMarketData:
         ('volatility', ctypes.c_double),
         ('status', ctypes.c_int)
     ]
-    
-    def __init__(self, name="thalex_market_data", size=1024):
-        try:
-            self.shm = shared_memory.SharedMemory(name=name, create=True, size=size)
-        except FileExistsError:
-            # Connect to existing shared memory
-            self.shm = shared_memory.SharedMemory(name=name, create=False)
-        
-        # Create numpy array backed by shared memory
-        self.np_array = np.ndarray((1,), dtype=np.float64, buffer=self.shm.buf)
-        
-    def update(self, data_dict):
-        """Update shared memory with market data"""
-        offset = 0
-        for key, value in data_dict.items():
-            if key in ['timestamp', 'mid_price', 'best_bid', 'best_ask', 'bid_quantity', 
-                      'ask_quantity', 'volatility']:
-                self.np_array[offset] = float(value)
-                offset += 1
-                
-    def close(self):
-        """Close shared memory"""
-        self.shm.close()
-        
-    def unlink(self):
-        """Unlink shared memory"""
-        self.shm.unlink()
 
 class AvellanedaQuoter:
     def __init__(self, thalex: th.Thalex):
@@ -149,6 +120,13 @@ class AvellanedaQuoter:
         self.order_manager = OrderManager(self.thalex)
         self.risk_manager = RiskManager()
         self.performance_monitor = PerformanceMonitor()
+        
+        # Register risk breach handler
+        self.risk_manager.register_callback("risk_limit", self._handle_risk_breach)
+        self.active_trading = True # Flag to control trading activity based on risk
+        
+        # Risk monitoring task interval
+        self.risk_monitoring_interval = TRADING_CONFIG.get("risk_monitoring_interval_seconds", 2.0) # Default to 2s
         
         # Market data
         self.ticker = None
@@ -255,17 +233,206 @@ class AvellanedaQuoter:
         self.instrument_data_cache = {}
         
         # Create shared memory for IPC
+        self.shm_obj = None
+        self.shared_market_data_struct = None
         try:
-            self.shared_market_data = SharedMarketData(name="thalex_market_data", size=1024)
-        except Exception as e:
-            self.logger.warning(f"Failed to create shared memory: {str(e)}")
-            self.shared_market_data = None
+            shm_size = ctypes.sizeof(SharedMarketData)
+            # Try to create the shared memory segment
+            self.shm_obj = shared_memory.SharedMemory(name="thalex_market_data", create=True, size=shm_size)
+            self.logger.info(f"Created shared memory segment 'thalex_market_data' with size {shm_size}")
+        except FileExistsError:
+            # If it already exists, connect to it
+            try:
+                shm_size = ctypes.sizeof(SharedMarketData) # Recalculate size just in case
+                self.shm_obj = shared_memory.SharedMemory(name="thalex_market_data", create=False, size=shm_size)
+                self.logger.info(f"Connected to existing shared memory segment 'thalex_market_data' size {shm_size}")
+            except Exception as e_conn:
+                self.logger.error(f"Failed to connect to existing shared memory 'thalex_market_data': {e_conn}")
+                self.shm_obj = None # Ensure it's None on failure
+        except Exception as e_create:
+            self.logger.error(f"Failed to create shared memory 'thalex_market_data': {e_create}")
+            self.shm_obj = None # Ensure it's None on failure
+
+        if self.shm_obj:
+            try:
+                # Map the shared memory buffer to the ctypes structure
+                self.shared_market_data_struct = SharedMarketData.from_buffer(self.shm_obj.buf)
+                self.logger.info("Successfully mapped shared memory buffer to SharedMarketData structure.")
+            except Exception as e_map:
+                self.logger.error(f"Failed to map shared memory buffer: {e_map}")
+                self.shared_market_data_struct = None
+                # If mapping fails, close and unlink the shm_obj as it's unusable by this instance
+                try:
+                    self.shm_obj.close()
+                    self.shm_obj.unlink() # Attempt to unlink, might fail if not creator or permissions issue
+                except FileNotFoundError:
+                    pass # It might have been unlinked by another process or never fully created
+                except Exception as e_cleanup:
+                    self.logger.error(f"Error cleaning up shm_obj after mapping failure: {e_cleanup}")
+                self.shm_obj = None
         
         # Performance tracing
         self.performance_tracer = PerformanceTracer()
         
         self.logger.info("Avellaneda quoter initialized with HFT optimizations")
         
+        # NEW: Volume candle buffer for predictive analysis
+        self.volume_buffer = None # Initialize to None, set up in start()
+        
+    async def _handle_risk_breach(self, reason: str, price_at_breach: Optional[float]):
+        """Handles actions to take when a risk limit is breached."""
+        self.logger.critical(f"RISK LIMIT BREACHED: {reason}. Price at check: {price_at_breach:.2f if price_at_breach is not None else 'N/A'}")
+        if not self.active_trading:
+            self.logger.info("Trading already halted, risk breach handling skipped further action to prevent re-entry.")
+            return
+
+        self.active_trading = False # Stop further trading/quoting activity
+        self.logger.critical("Trading has been HALTED due to risk limit breach.")
+        
+        # Cancel all open orders
+        self.logger.info("Attempting to cancel all open orders due to risk breach...")
+        try:
+            # Ensure cancel_quotes can be called even if some parts of order_manager might be affected
+            if hasattr(self, 'order_manager') and self.order_manager is not None:
+                 await self.cancel_quotes(f"Risk limit breach: {reason}")
+                 self.logger.info("Successfully requested cancellation of all orders via cancel_quotes.")
+            elif hasattr(self, 'thalex') and self.thalex is not None: # Fallback
+                 await self.thalex.cancel_all_orders(id=CALL_IDS.get("cancel_all", random.randint(10000, 20000)))
+                 self.logger.info("Successfully requested cancellation of all orders via direct thalex client call.")
+            else:
+                self.logger.warning("No valid order_manager or thalex client to cancel orders during risk breach.")
+
+        except Exception as e:
+            self.logger.error(f"Error attempting to cancel all orders after risk breach: {str(e)}", exc_info=True)
+        
+        # Further actions could be added here, e.g., sending notifications, trying to manually hedge, etc.
+
+    async def _risk_monitoring_task(self):
+        """Periodically checks risk limits, stop-loss, and take-profit conditions."""
+        self.logger.info(f"Starting risk monitoring task with interval: {self.risk_monitoring_interval}s")
+        await self.setup_complete.wait() # Ensure setup is done before starting
+        
+        while self.active_trading and self.thalex.connected():
+            try:
+                await asyncio.sleep(self.risk_monitoring_interval)
+                if not self.active_trading: # Re-check after sleep
+                    self.logger.info("Risk monitoring task: active_trading is false. Exiting.")
+                    break
+                if not self.thalex.connected():
+                    self.logger.info("Risk monitoring task: thalex not connected. Exiting.")
+                    break
+
+                current_price = None
+                if self.ticker and hasattr(self.ticker, 'mark_price') and self.ticker.mark_price > 0:
+                    current_price = self.ticker.mark_price
+                elif self.market_data and self.market_data.get_last_price() > 0: # Fallback to market_data buffer
+                    current_price = self.market_data.get_last_price()
+                else:
+                    self.logger.warning("Risk monitoring: No valid current_price available (ticker or market_data). Skipping this check cycle.")
+                    if self.risk_manager.position_size != 0: # If in position without price, this is risky
+                        self.logger.error("CRITICAL: In position but no current price for risk checks. Consider manual intervention or halting.")
+                        # Potentially call _handle_risk_breach here if no price is a critical failure
+                        # await self._handle_risk_breach("Critical: No price for risk check while in position", None)
+                    continue
+
+                # If trading is no longer active (e.g. due to a breach in another task), exit
+                if not self.active_trading:
+                    self.logger.info("Risk monitoring task: active_trading became false during cycle. Exiting.")
+                    break
+
+                # Check overall limits first, as this might halt trading
+                if not await self.risk_manager.check_risk_limits(current_market_price=current_price):
+                    self.logger.warning(f"Overall risk limits breached during periodic check at price {current_price:.2f}. _handle_risk_breach was invoked.")
+                    # _handle_risk_breach sets active_trading = False, loop will terminate.
+                    continue # Allow _handle_risk_breach to stop activity
+
+                if self.risk_manager.position_size == 0: # No position, no stop-loss or take-profit to check
+                    continue
+
+                # 1. Check Stop Loss
+                if self.risk_manager.check_stop_loss(current_price):
+                    position_size_at_stop = self.risk_manager.position_size
+                    self.logger.warning(f"STOP-LOSS triggered at price {current_price:.2f}. Position: {position_size_at_stop:.4f}. Attempting to close entire position.")
+                    
+                    if abs(position_size_at_stop) > 0:
+                        close_direction = "sell" if position_size_at_stop > 0 else "buy"
+                        close_size = abs(position_size_at_stop)
+                        
+                        # Round size to minimum step (assuming 0.001 for now, should ideally come from config/instrument data)
+                        # This should align with OrderManager's own rounding or instrument spec
+                        min_size_increment = TRADING_CONFIG.get("execution", {}).get("size_increment", 0.001)
+                        close_size = round(close_size / min_size_increment) * min_size_increment
+                        
+                        if close_size >= min_size_increment: # Ensure we are closing a valid amount
+                            self.logger.info(f"Stop-Loss: Placing MARKET {close_direction} order for {close_size:.4f} of {self.perp_name}")
+                            try:
+                                order_id = await self.order_manager.place_order(
+                                    instrument=self.perp_name,
+                                    direction=close_direction,
+                                    price=None, # Indicates Market Order
+                                    amount=close_size,
+                                    label="StopLossMarketClose",
+                                    post_only=False
+                                )
+                                if order_id:
+                                    self.logger.info(f"Stop-Loss: Market close order ({order_id}) placed successfully.")
+                                else:
+                                    self.logger.error("Stop-Loss: Failed to place market close order (order_id is None).")
+                            except Exception as e:
+                                self.logger.error(f"Stop-Loss: Exception placing market close order: {str(e)}", exc_info=True)
+                        else:
+                            self.logger.warning(f"Stop-Loss: Calculated close size {close_size:.4f} is less than min increment {min_size_increment}. Cannot place market order.")
+                    
+                    await self._handle_risk_breach(f"Stop-loss triggered at {current_price:.2f}. Closed position.", current_price)
+                    continue # Stop-loss hit, _handle_risk_breach will stop trading
+
+                # 2. Check Take Profit (Full position closure)
+                take_profit_triggered, tp_reason, _ = self.risk_manager.check_take_profit(current_price) # portion_to_close is ignored
+                if take_profit_triggered:
+                    position_size_at_tp = self.risk_manager.position_size
+                    self.logger.info(f"TAKE-PROFIT triggered: {tp_reason}. Position: {position_size_at_tp:.4f}. Attempting to close entire position.")
+
+                    if abs(position_size_at_tp) > 0:
+                        close_direction = "sell" if position_size_at_tp > 0 else "buy"
+                        close_size = abs(position_size_at_tp)
+
+                        min_size_increment = TRADING_CONFIG.get("execution", {}).get("size_increment", 0.001)
+                        close_size = round(close_size / min_size_increment) * min_size_increment
+
+                        if close_size >= min_size_increment:
+                            self.logger.info(f"Take-Profit: Placing MARKET {close_direction} order for {close_size:.4f} of {self.perp_name}")
+                            try:
+                                order_id = await self.order_manager.place_order(
+                                    instrument=self.perp_name,
+                                    direction=close_direction,
+                                    price=None, # Indicates Market Order
+                                    amount=close_size,
+                                    label="TakeProfitMarketClose",
+                                    post_only=False
+                                )
+                                if order_id:
+                                    self.logger.info(f"Take-Profit: Market close order ({order_id}) placed successfully.")
+                                else:
+                                    self.logger.error("Take-Profit: Failed to place market close order (order_id is None).")
+                            except Exception as e:
+                                self.logger.error(f"Take-Profit: Exception placing market close order: {str(e)}", exc_info=True)
+                        else:
+                            self.logger.warning(f"Take-Profit: Calculated close size {close_size:.4f} is less than min increment {min_size_increment}. Cannot place market order.")
+                    
+                    # For take-profit, we also halt trading as per implication of full close.
+                    await self._handle_risk_breach(f"Take-profit triggered ({tp_reason}). Closed position.", current_price)
+                    continue # Take-profit hit, _handle_risk_breach will stop trading
+                
+            except asyncio.CancelledError:
+                self.logger.info("Risk monitoring task was cancelled.")
+                break
+            except Exception as e:
+                self.logger.error(f"Error in risk monitoring task: {str(e)}", exc_info=True)
+                # Potentially add a short cooldown to prevent rapid error loops
+                await asyncio.sleep(self.risk_monitoring_interval * 2) 
+        
+        self.logger.info("Risk monitoring task finished.")
+
     async def start(self):
         """Start the quoter"""
         try:
@@ -374,7 +541,8 @@ class AvellanedaQuoter:
                 'heartbeat': asyncio.create_task(self.heartbeat_task()),
                 'status': asyncio.create_task(self.log_status_task()),
                 'profile': asyncio.create_task(self.profile_optimization_task()),
-                'quote': asyncio.create_task(self.quote_task())
+                'quote': asyncio.create_task(self.quote_task()),
+                'risk_monitor': asyncio.create_task(self._risk_monitoring_task()) # Add new task
             })
             
             # Extra debug logging to track initialization
@@ -409,7 +577,20 @@ class AvellanedaQuoter:
         """Shutdown the quoter and cleanup resources"""
         try:
             self.logger.info("Starting quoter shutdown sequence...")
-            
+            self.active_trading = False # Signal all loops to stop
+
+            # Cancel risk monitoring task first if it exists
+            if 'risk_monitor' in self.tasks and self.tasks['risk_monitor'] is not None:
+                self.logger.info("Cancelling risk monitoring task...")
+                self.tasks['risk_monitor'].cancel()
+                try:
+                    await self.tasks['risk_monitor']
+                except asyncio.CancelledError:
+                    self.logger.info("Risk monitoring task successfully cancelled.")
+                except Exception as e:
+                    self.logger.error(f"Error during risk_monitor task cancellation: {e}")
+                del self.tasks['risk_monitor']
+
             # Cancel all orders
             try:
                 self.logger.info("Cancelling all orders...")
@@ -425,25 +606,32 @@ class AvellanedaQuoter:
             except Exception as e:
                 self.logger.error(f"Error disconnecting from Thalex: {str(e)}")
             
-            # Close shared memory resources with timeout protection
+            # Close shared memory resources
             try:
                 self.logger.info("Cleaning up shared memory resources...")
-                if hasattr(self, 'shared_market_data') and self.shared_market_data is not None:
+                if hasattr(self, 'shm_obj') and self.shm_obj:
                     try:
-                        self.shared_market_data.close()
-                        self.logger.info("Shared memory closed")
-                    except Exception as se:
-                        self.logger.error(f"Error closing shared memory: {str(se)}")
+                        self.shm_obj.close()
+                        self.logger.info("Shared memory object closed.")
+                    except Exception as e_close:
+                        self.logger.error(f"Error closing shared memory object: {e_close}")
                     
+                    # Attempt to unlink. This might be the responsibility of the process that created it.
+                    # If multiple processes use it, only one should typically unlink.
+                    # For robustness, we can try and catch FileNotFoundError if already unlinked.
                     try:
-                        self.shared_market_data.unlink()
-                        self.logger.info("Shared memory unlinked")
+                        # Check if this process was the creator (if we stored that info) or just always try to unlink
+                        # For now, let's assume this instance might be responsible or it's okay to try.
+                        self.shm_obj.unlink()
+                        self.logger.info("Shared memory segment 'thalex_market_data' unlinked.")
                     except FileNotFoundError:
-                        self.logger.error(f"Error unlinking shared memory: File not found")
-                    except Exception as se:
-                        self.logger.error(f"Error unlinking shared memory: {str(se)}")
-            except Exception as e:
-                self.logger.error(f"Error cleaning up shared memory: {str(e)}")
+                        self.logger.info("Shared memory segment 'thalex_market_data' was already unlinked or not created by this instance.")
+                    except Exception as e_unlink:
+                        self.logger.error(f"Error unlinking shared memory segment 'thalex_market_data': {e_unlink}")
+                else:
+                    self.logger.info("No shared memory object (self.shm_obj) to clean up or it was already None.")
+            except Exception as e_outer_shm:
+                self.logger.error(f"Outer error during shared memory cleanup: {e_outer_shm}")
             
             # Cancel all tasks
             try:
@@ -464,6 +652,8 @@ class AvellanedaQuoter:
             except Exception as e:
                 self.logger.error(f"Error cancelling tasks: {str(e)}")
                 
+            self.logger.info("All tasks processed for cancellation.")
+
             self.logger.info("Quoter shutdown complete")
             
         except Exception as e:
@@ -797,7 +987,8 @@ class AvellanedaQuoter:
                     if "type" in data and data["type"] == "ticker" and "data" in data:
                         self.logger.info(f"Detected direct ticker update format")
                         ticker_data = data["data"]
-                        await self.handle_ticker_update(ticker_data)
+                        channel_name_for_direct_ticker = data.get("channel") or data.get("channel_name")
+                        await self.handle_ticker_update(ticker_data, channel_name=channel_name_for_direct_ticker)
                         continue
                     
                     # Process notification - handle both old and new API formats
@@ -819,11 +1010,13 @@ class AvellanedaQuoter:
                     # Direct ticker data pattern
                     elif "ticker" in data:
                         self.logger.info("Detected ticker data pattern")
-                        await self.handle_ticker_update(data["ticker"])
+                        channel_name_for_ticker_key = data.get("channel") or data.get("channel_name")
+                        await self.handle_ticker_update(data["ticker"], channel_name=channel_name_for_ticker_key)
                     # Other direct data structures
-                    elif "instrument" in data and "price" in data:
+                    elif "instrument" in data and "price" in data: # This might be a ticker or market data update
                         self.logger.info("Detected direct market data format")
-                        await self.handle_ticker_update(data)
+                        channel_name_for_instrument_key = data.get("channel") or data.get("channel_name")
+                        await self.handle_ticker_update(data, channel_name=channel_name_for_instrument_key)
                     else:
                         self.logger.warning(f"Received unrecognized message format with keys: {data.keys()}")
                         self.logger.warning(f"Received unrecognized message format: {data.keys()}")
@@ -859,17 +1052,18 @@ class AvellanedaQuoter:
                     consecutive_errors = 0
 
     # Zero-copy message handling for high-frequency market data
-    async def handle_ticker_update(self, ticker_data: Dict):
+    async def handle_ticker_update(self, ticker_data: Dict, channel_name: Optional[str] = None):
         """
         Handle ticker updates with zero-copy optimizations.
         
         Args:
             ticker_data: Dictionary containing ticker update data
+            channel_name: Optional name of the channel from which the ticker update originated
         """
         with self.performance_tracer.trace("ticker_processing"):
             try:
                 # Add debug logging
-                self.logger.info(f"Received ticker update: {ticker_data.keys()}")
+                self.logger.info(f"Received ticker update. Keys: {list(ticker_data.keys())}. Channel: {channel_name}")
                 
                 # Extract instrument ID - handle different possible data formats
                 instrument_id = (
@@ -884,11 +1078,33 @@ class AvellanedaQuoter:
                     if isinstance(instrument_data, dict):
                         instrument_id = instrument_data.get("name") or instrument_data.get("instrumentId")
                 
+                # NEW LOGIC: Try to extract from channel_name if not found in payload
+                if not instrument_id and channel_name and channel_name.startswith("ticker."):
+                    try:
+                        # Example: "ticker.BTC-PERPETUAL.raw" -> "BTC-PERPETUAL"
+                        # Example: "ticker.BTC-28JUL23-30000-C.100ms" -> "BTC-28JUL23-30000-C"
+                        parts = channel_name.split('.')
+                        if len(parts) > 1 and parts[0] == "ticker":
+                            # Join parts that form the instrument name, excluding the last part if it's a frequency like 'raw' or '100ms'
+                            if parts[-1] in ["raw", "100ms", "500ms"]: # Add other common frequency suffixes if needed
+                                instrument_id = ".".join(parts[1:-1])
+                            else:
+                                instrument_id = ".".join(parts[1:])
+
+                            if instrument_id: # Ensure we got something
+                                self.logger.info(f"Extracted instrument ID '{instrument_id}' from channel_name '{channel_name}'")
+                            else: # if the split logic resulted in an empty string
+                                self.logger.warning(f"Instrument ID parsing from channel_name '{channel_name}' resulted in empty string.")
+                                instrument_id = None # Reset to ensure fallback if parsing failed
+                    except Exception as e:
+                        self.logger.warning(f"Could not parse instrument_id from channel_name '{channel_name}': {e}")
+                        instrument_id = None # Ensure fallback if parsing failed
+                
                 # Debug log
                 if instrument_id:
                     self.logger.info(f"Processing ticker for instrument: {instrument_id}")
                 else:
-                    self.logger.warning(f"Could not extract instrument ID from ticker data: {ticker_data}")
+                    self.logger.warning(f"Could not extract instrument ID from ticker data: {ticker_data} or channel: {channel_name}")
                     # Try to infer from our expected instrument
                     instrument_id = self.perp_name
                     self.logger.info(f"Using default instrument ID: {instrument_id}")
@@ -972,7 +1188,7 @@ class AvellanedaQuoter:
                     await self.check_market_conditions_for_quote()
                     
                     # Update shared memory for IPC with other processes
-                    if hasattr(self, 'shared_market_data') and self.shared_market_data is not None:
+                    if hasattr(self, 'shared_market_data_struct') and self.shared_market_data_struct is not None:
                         try:
                             # Create a dictionary with data matching SharedMarketData fields
                             market_data_dict = {
@@ -982,39 +1198,26 @@ class AvellanedaQuoter:
                                 'best_ask': ticker.best_ask_price,
                                 'bid_quantity': ticker.best_bid_amount,
                                 'ask_quantity': ticker.best_ask_amount,
-                                'volatility': 0.0,  # Calculate volatility if needed
+                                'volatility': 0.0,  # Placeholder, calculate volatility if needed
                                 'status': 1 # 1 for active/updated
                             }
                             
-                            # Write directly to the shared memory buffer using ctypes structure
-                            # Ensure the target buffer exists and is accessible
-                            if self.shared_market_data.shm.buf:
-                                # Create a ctypes structure instance from the shared memory buffer
-                                data_struct = SharedMarketData.from_buffer(self.shared_market_data.shm.buf)
-                                
-                                # Update fields - handle potential type errors
-                                for field_name, field_type in SharedMarketData._fields_:
-                                    value = market_data_dict.get(field_name)
-                                    if value is not None:
-                                        try:
-                                            # Cast value to the expected ctypes type
-                                            setattr(data_struct, field_name, field_type(value))
-                                        except (TypeError, ValueError) as type_err:
-                                            self.logger.error(f"Type error setting shared memory field '{field_name}': {type_err}. Value: {value}")
-                                    else:
-                                         self.logger.warning(f"Missing value for shared memory field: {field_name}")
+                            # Directly update the fields of the mapped structure instance
+                            data_struct = self.shared_market_data_struct # This is already the mapped object
+                            
+                            for field_name_key, _ in SharedMarketData._fields_: # Iterate using _fields_ from the class definition
+                                value = market_data_dict.get(field_name_key)
+                                if value is not None:
+                                    try:
+                                        setattr(data_struct, field_name_key, value)
+                                    except (TypeError, ValueError) as type_err:
+                                        self.logger.error(f"Type error setting shared memory field '{field_name_key}': {type_err}. Value: {value}, Type: {type(value)}")
+                                else:
+                                     self.logger.warning(f"Missing value for shared memory field: {field_name_key}")
 
-                            # # Old incorrect logic - removed:
-                            # # Update only the first array element to avoid index errors
-                            # self.shared_market_data.np_array[0] = market_data_dict.get('timestamp', 0.0)
-                        except AttributeError as ae:
-                             # Handle cases where from_buffer might not be available directly on the class
-                            if "'type' object has no attribute 'from_buffer'" in str(ae):
-                                 self.logger.error("Cannot use from_buffer directly on SharedMarketData class. Need instance or different approach.")
-                            else:
-                                 self.logger.error(f"Attribute error updating shared memory: {str(ae)}")
+                        except AttributeError as ae: # Should not happen if self.shared_market_data_struct is correctly an instance
+                            self.logger.error(f"Attribute error updating shared memory structure: {str(ae)}")
                         except Exception as shared_memory_error:
-                            # More specific error handling to identify the issue
                             self.logger.error(f"Error updating shared memory: {str(shared_memory_error)}", exc_info=True)
                 else:
                     if instrument_id:
@@ -1084,17 +1287,40 @@ class AvellanedaQuoter:
             return order
 
     async def update_quotes(self, price_data: Dict, market_conditions: Dict):
-        """Generate new quotes based on current market data"""
+        """Update quotes based on market conditions and strategy logic"""
+        if not self.active_trading:
+            self.logger.warning("Trading is halted due to a prior risk limit breach. Skipping quote update.")
+            return
+
+        if not self.quoting_enabled or self.cooldown_active:
+            self.logger.debug("Quoting disabled or cooldown active, skipping update_quotes.")
+            return
+
+        if not self.ticker or not hasattr(self.ticker, 'mark_price') or self.ticker.mark_price <= 0:
+            self.logger.warning("Skipping quote update: No valid ticker or mark_price available.")
+            return
+
+        # --- Pre-trade Risk Check ---
+        limit_exceeded, reason = self.risk_manager.check_position_limits(current_price=self.ticker.mark_price)
+        if limit_exceeded:
+            self.logger.warning(f"Risk limit breached (pre-trade check): {reason}. Halting quote update.")
+            # If RiskManager's check_position_limits does not yet use a callback to cancel orders,
+            # and if we want to ensure orders are cancelled *before* the next cycle, we might add:
+            # await self.cancel_quotes(f"Pre-trade risk check failed: {reason}")
+            return
+        # --- End Pre-trade Risk Check ---
+
+        # Original logic of update_quotes starts here
         with self.performance_tracer.trace("quote_generation"):
             try:
                 if price_data is None and self.ticker:
                     # Create price data from ticker if not provided
                     price_data = {
                         "mid_price": (self.ticker.best_bid_price + self.ticker.best_ask_price) / 2
-                        if hasattr(self.ticker, 'best_bid_price') and hasattr(self.ticker, 'best_ask_price')
+                        if hasattr(self.ticker, 'best_bid_price') and hasattr(self.ticker, 'best_ask_price') and self.ticker.best_bid_price > 0 and self.ticker.best_ask_price > 0
                         else self.ticker.mark_price
                     }
-                    self.logger.info(f"Created price data from ticker: mid_price={price_data['mid_price']}")
+                    self.logger.info(f"Created price data from ticker: mid_price={price_data.get('mid_price')}")
                 
                 instrument_id = self.perp_name
                 price = price_data.get("mid_price", 0) if price_data else 0
@@ -1110,14 +1336,6 @@ class AvellanedaQuoter:
                         self.logger.error("No valid price available for quote generation")
                         return
                 
-                if not self.quoting_enabled:
-                    self.logger.info("Quoting is disabled, skipping quote update")
-                    return
-                
-                if self.cooldown_active and time.time() < self.cooldown_until:
-                    self.logger.info(f"Cooldown active until {self.cooldown_until}, skipping quote update")
-                    return
-                
                 # Generate quotes using the Avellaneda market maker or fallback to simple method
                 bid_quotes = []
                 ask_quotes = []
@@ -1125,18 +1343,19 @@ class AvellanedaQuoter:
                 try:
                     if hasattr(self, 'market_maker') and self.market_maker:
                         self.logger.info("Generating quotes using Avellaneda market maker")
-                        # Use thread pool for CPU-intensive calculations if available
+                        # Create a Ticker object from price data for market_maker
+                        # Ensure ticker_obj has all necessary fields that market_maker.generate_quotes expects
+                        ticker_obj_data = {
+                            "mark_price": price,
+                            "best_bid_price": self.ticker.best_bid_price if hasattr(self.ticker, 'best_bid_price') and self.ticker.best_bid_price else price * 0.999,
+                            "best_ask_price": self.ticker.best_ask_price if hasattr(self.ticker, 'best_ask_price') and self.ticker.best_ask_price else price * 1.001,
+                            "mark_timestamp": getattr(self.ticker, 'mark_timestamp', time.time()),
+                            "timestamp": getattr(self.ticker, 'timestamp', time.time()), # Added timestamp
+                            "index": getattr(self.ticker, 'index_price', price) # or self.ticker.index
+                        }
+                        ticker_obj = Ticker(ticker_obj_data)
+
                         if hasattr(self, 'thread_pool') and self.thread_pool:
-                            # Create a Ticker object from price data
-                            ticker_obj = Ticker({
-                                "mark_price": price,
-                                "best_bid_price": price * 0.999,  # Approximate bid as slightly below price
-                                "best_ask_price": price * 1.001,   # Approximate ask as slightly above price
-                                "mark_timestamp": time.time(),
-                                "index": price
-                            })
-                            
-                            # Call generate_quotes with proper parameters
                             bid_quotes, ask_quotes = await asyncio.get_event_loop().run_in_executor(
                                 self.thread_pool,
                                 self.market_maker.generate_quotes,
@@ -1145,26 +1364,14 @@ class AvellanedaQuoter:
                                 self.max_orders_per_side
                             )
                         else:
-                            # Fallback if thread pool not available
-                            # Create a Ticker object from price data
-                            ticker_obj = Ticker({
-                                "mark_price": price,
-                                "best_bid_price": price * 0.999,  # Approximate bid as slightly below price
-                                "best_ask_price": price * 1.001,   # Approximate ask as slightly above price
-                                "mark_timestamp": time.time(),
-                                "index": price
-                            })
-                            
-                            # Call generate_quotes with proper parameters
                             bid_quotes, ask_quotes = self.market_maker.generate_quotes(
                                 ticker_obj, market_conditions, self.max_orders_per_side
                             )
                     else:
-                        # Fallback to simple quote generation
                         self.logger.warning("Market maker not available, using fallback quote generation")
                         bid_quotes, ask_quotes = self._generate_simple_quotes(price)
                 except Exception as e:
-                    self.logger.error(f"Error generating quotes with market maker: {str(e)}")
+                    self.logger.error(f"Error generating quotes with market maker: {str(e)}", exc_info=True)
                     self.logger.warning("Falling back to simple quote generation")
                     bid_quotes, ask_quotes = self._generate_simple_quotes(price)
                 
@@ -1189,15 +1396,16 @@ class AvellanedaQuoter:
                     self.quote_cv.notify()
                     
                 self.last_quote_update_time = time.time()
+                self.last_quote_time = time.time() # Update last_quote_time as well
                 
             except Exception as e:
-                self.logger.error(f"Error updating quotes: {str(e)}")
+                self.logger.error(f"Error updating quotes: {str(e)}", exc_info=True)
                 # Return quotes to the pool on error
                 if 'bid_quotes' in locals() and 'ask_quotes' in locals():
-                    for quote in bid_quotes + ask_quotes:
+                    for quote_obj in bid_quotes + ask_quotes: # Renamed to avoid conflict
                         if hasattr(self, 'quote_pool'):
-                            self.quote_pool.put(quote)
-    
+                            self.quote_pool.put(quote_obj)
+
     def _generate_simple_quotes(self, price):
         """Generate simple quotes as a fallback when market maker fails"""
         self.logger.info("Generating simple quotes as fallback")
@@ -1217,19 +1425,20 @@ class AvellanedaQuoter:
         bid_quotes = []
         ask_quotes = []
         instrument_id = self.perp_name
+        default_order_size = TRADING_CONFIG["avellaneda"].get("base_size", 0.01)
         
         # Create quote objects for bids
         for bid_price in bid_prices:
             quote = self.quote_pool.get() if hasattr(self, 'quote_pool') else Quote(
                 price=bid_price,
-                amount=TRADING_PARAMS.get("order_size", 0.01),
+                amount=default_order_size,
                 instrument=instrument_id,
                 side="BUY",
                 timestamp=time.time()
             )
             if hasattr(self, 'quote_pool'):
                 quote.price = bid_price
-                quote.amount = TRADING_PARAMS.get("order_size", 0.01)
+                quote.amount = default_order_size
                 quote.instrument = instrument_id
                 quote.side = "BUY"
                 quote.timestamp = time.time()
@@ -1239,14 +1448,14 @@ class AvellanedaQuoter:
         for ask_price in ask_prices:
             quote = self.quote_pool.get() if hasattr(self, 'quote_pool') else Quote(
                 price=ask_price,
-                amount=TRADING_PARAMS.get("order_size", 0.01),
+                amount=default_order_size,
                 instrument=instrument_id,
                 side="SELL",
                 timestamp=time.time()
             )
             if hasattr(self, 'quote_pool'):
                 quote.price = ask_price
-                quote.amount = TRADING_PARAMS.get("order_size", 0.01)
+                quote.amount = default_order_size
                 quote.instrument = instrument_id
                 quote.side = "SELL"
                 quote.timestamp = time.time()
@@ -1316,7 +1525,23 @@ class AvellanedaQuoter:
             
             # Handle fills
             if order_data.get("status") == "filled":
-                # Log the fill with improved formatting
+                # --- BEGIN HFT-FOCUSED FIX FOR FILLED ORDERS WITH UNKNOWN DIRECTION ---
+                if order.direction is None:
+                    self.logger.critical(
+                        f"CRITICAL: Order {order.id} (from data: {order_data.get('id')}) "
+                        f"filled with UNKNOWN direction. "
+                        f"Amount: {order.amount:.4f} (from data: {order_data.get('amount')}), "
+                        f"Price: {order.price:.2f} (from data: {order_data.get('limitPrice')}). "
+                        f"Original order_data: {order_data}. SKIPPING this fill processing."
+                    )
+                    # Optional: Increment a metric here for 'filled_order_unknown_direction'
+                    return # Stop processing this critically flawed fill update
+
+                # If we reach here, order.direction is guaranteed to be non-None.
+                # Proceed with logging and processing.
+                # Using .lower() for robustness in case 'side' can be 'Buy'/'Sell'.
+                is_buy_flag = order.direction.lower() == "buy"
+                
                 self.logger.info(
                     f"Order filled: {order.id} - {order.direction.upper()} {order.amount:.4f} @ {order.price:.2f}"
                 )
@@ -1326,13 +1551,13 @@ class AvellanedaQuoter:
                     order_id=order.id,
                     fill_price=order.price,
                     fill_size=order.amount,
-                    is_buy=order.direction == "buy"
+                    is_buy=is_buy_flag # Use the pre-calculated, robust flag
                 )
                 
                 # Update risk manager with position information directly from fill
                 if hasattr(self.risk_manager, 'update_position_fill'):
                     await self.risk_manager.update_position_fill(
-                        direction=order.direction,
+                        direction=order.direction, # Pass the known, non-None direction
                         price=order.price,
                         size=order.amount,
                         timestamp=time.time()
@@ -1343,9 +1568,10 @@ class AvellanedaQuoter:
                     self.market_maker.update_vamp(
                         price=order.price,
                         volume=order.amount,
-                        is_buy=order.direction == "buy",
+                        is_buy=is_buy_flag, # Use the pre-calculated, robust flag
                         is_aggressive=False  # Assuming most of our fills are passive
                     )
+                # --- END HFT-FOCUSED FIX ---
                 
                 # Force quote update after fills based on size threshold
                 significant_fill_threshold = TRADING_CONFIG["avellaneda"].get("significant_fill_threshold", 0.1)
@@ -1589,6 +1815,10 @@ class AvellanedaQuoter:
             bid_quotes: List of bid quotes to place
             ask_quotes: List of ask quotes to place
         """
+        if not self.active_trading:
+            self.logger.warning("Trading is halted due to a prior risk limit breach. Skipping quote placement.")
+            return
+
         try:
             if not self.quoting_enabled:
                 self.logger.debug("Quoting is disabled, skipping quote placement")
@@ -1642,9 +1872,9 @@ class AvellanedaQuoter:
             else:
                 self.logger.warning("Market maker object or 'position_size' attribute not found. Inventory check will use 0 inventory.")
 
-            max_inventory_deviation = TRADING_PARAMS.get("max_allowed_inventory_deviation", float('inf'))
+            max_inventory_deviation = RISK_LIMITS.get("max_position", float('inf')) # Changed from TRADING_PARAMS
             if not isinstance(max_inventory_deviation, (int, float)) or max_inventory_deviation < 0:
-                self.logger.warning(f"Invalid 'max_allowed_inventory_deviation' ({max_inventory_deviation}). Using infinity (feature disabled).")
+                self.logger.warning(f"Invalid 'max_position' from RISK_LIMITS ({max_inventory_deviation}). Using infinity (feature disabled).")
                 max_inventory_deviation = float('inf')
             
             can_place_bids_inventory_wise = True
@@ -1935,6 +2165,10 @@ class AvellanedaQuoter:
         """Main quoting loop - periodically checks if quotes need updating"""
         self.logger.info("Quote task started - waiting for updates")
         
+        if not self.active_trading:
+            self.logger.critical("Quote task starting, but trading is already halted due to a prior risk breach. Will not proceed.")
+            return # Exit task if trading already halted at start
+
         last_quote_time = 0
         min_quote_interval = 1.0  # Reduced from 3.0 to 1.0 seconds for more frequent updates
         force_quote_interval = 30.0  # Force new quotes every 30 seconds even without ticker updates
@@ -1951,7 +2185,10 @@ class AvellanedaQuoter:
                 # Add a diagnostic log every minute
                 heartbeat_counter += 1
                 if heartbeat_counter % 60 == 0:
-                    self.logger.info(f"Quote task heartbeat #{heartbeat_counter} - task is alive")
+                    self.logger.info(f"Quote task heartbeat #{heartbeat_counter} - task is alive. Active trading: {self.active_trading}")
+                    if not self.active_trading:
+                        self.logger.critical("Trading HALTED. Quote task will cease further operations.")
+                        break # Exit the loop if trading has been halted
                     if not self.ticker:
                         self.logger.warning("No ticker data received yet")
                     else:

@@ -45,10 +45,18 @@ BOT_CONFIG = {
             "max_loss_threshold": 0.03,    # Maximum loss before gradual exit
             
             # Quote sizing and levels
-            "base_size": 0.05,             # Base quote size increased from 0.01
+            "base_size": 0.001,             # Base quote size increased from 0.01
             "size_multipliers": [0.2, 0.4, 0.6, 1.0, 1.6, 2.0],  # Size multipliers with Fibonacci-like progression
             "max_levels": 12,              # Maximum number of quote levels (reduced from 21)
             "level_spacing": 100,          # Base spacing between levels in ticks (increased from 50 to 100)
+            "vamp_spread_sensitivity": 0.5,  # Sensitivity of spread to VAMP impact
+            "vamp_skew_sensitivity": 0.001,  # Sensitivity of quote skew to VAMP impact
+            # Predictive adjustment thresholds
+            "pa_gamma_adj_threshold": 0.05,
+            "pa_kappa_adj_threshold": 0.05,
+            "pa_res_price_offset_adj_threshold": 0.00005,
+            "pa_volatility_adj_threshold": 0.05,
+            "pa_prediction_max_age_seconds": 300,
         },
         
         # Order execution parameters
@@ -81,13 +89,39 @@ BOT_CONFIG = {
         "vamp": {
             "window": 50,                   # Number of price-volume samples
             "aggressive_window": 20,        # Number of aggressive trade samples
-            "impact_window": 30,           # Number of market impact samples
+            "impact_window": 30            # Number of market impact samples
+        },
+
+        # Volume Candle configuration for predictive analysis
+        "volume_candle": {
+            "threshold": 1.0,               # Volume threshold for candle formation (e.g., in BTC)
+            "max_candles": 100,             # Max number of candles to store
+            "max_time_seconds": 300,        # Max time for a candle to form if volume threshold not met
+            "use_exchange_data": False,     # Whether to use exchange's kline data as a source
+            "fetch_interval_seconds": 60,   # Interval to fetch exchange data if use_exchange_data is True
+            "lookback_hours": 1,            # Lookback hours for initial data fetch
+            "prediction_update_interval": 10.0 # How often to query for new predictions
         }
+    },
+    
+    # Orderbook specific parameters
+    "orderbook": {
+        "min_spread": 3,                # Minimum spread in ticks
+        "base_order_size": 0.01,        # Base order size for quoting
+        "min_order_size": 0.001,        # Absolute minimum order size
+        "levels": 6,                    # Number of order book levels for quoting logic
+        "bid_step": 10,                 # Default step for placing bid orders (in ticks)
+        "ask_step": 10,                 # Default step for placing ask orders (in ticks)
+        "min_size": 0.001,              # Minimum size for individual orders (used by AMM)
+        "quote_lifetime": 30,           # Max lifetime for quotes in seconds
+        "amend_threshold": 25,          # Price movement (in ticks) to trigger quote amendment
+        "min_quote_interval": 2.0,      # Minimum interval between quote updates in seconds
+        "bid_sizes": [0.3, 0.5, 0.7, 0.9, 1.0, 1.2] # Size multipliers for bid side levels
     },
     
     # Risk management
     "risk": {
-        "max_position": 1.0,           # Maximum position size
+        "max_position": 0.02,           # Maximum position size
         "stop_loss_pct": 0.06,         # Stop loss percentage
         "take_profit_pct": 0.0018,     # Take profit percentage (reduced from 0.23% to 0.18% for faster profit capture)
         "max_drawdown": 0.10,          # Maximum drawdown
@@ -105,8 +139,8 @@ BOT_CONFIG = {
         "min_take_profit_pct": 0.002,  # Minimum take profit percentage (0.2%)
         
         # Position management
-        "max_notional": 50000,  # Maximum notional value in USD
-        "max_position_notional": 40000,  # Maximum notional position (80% of max_notional)
+        "max_notional": 1000,  # Maximum notional value in USD
+        "max_position_notional": 800,  # Maximum notional position (80% of max_notional)
     },
     
     # Hedging configuration
@@ -210,6 +244,9 @@ BOT_CONFIG = {
 MARKET_CONFIG = BOT_CONFIG["market"]
 CALL_IDS = BOT_CONFIG["call_ids"]
 
+# Orderbook specific configuration
+ORDERBOOK_CONFIG = BOT_CONFIG["orderbook"]
+
 # Default volatility settings - used directly in several places
 DEFAULT_VOLATILITY_CONFIG = {
     "default": 0.025,    # Default volatility (2.5%)
@@ -228,69 +265,53 @@ TRADING_CONFIG = {
         "gamma": BOT_CONFIG["trading_strategy"]["avellaneda"]["gamma"],
         "kappa": BOT_CONFIG["trading_strategy"]["avellaneda"]["kappa"],
         "time_horizon": BOT_CONFIG["trading_strategy"]["avellaneda"]["time_horizon"],
+        "order_flow_intensity": BOT_CONFIG["trading_strategy"]["avellaneda"]["order_flow_intensity"],
+        "base_spread": BOT_CONFIG["trading_strategy"]["avellaneda"]["base_spread"],
         "min_spread": BOT_CONFIG["trading_strategy"]["avellaneda"]["min_spread"],
         "max_spread": BOT_CONFIG["trading_strategy"]["avellaneda"]["max_spread"],
+        "spread_multiplier": BOT_CONFIG["trading_strategy"]["avellaneda"]["spread_multiplier"],
         "inventory_weight": BOT_CONFIG["trading_strategy"]["avellaneda"]["inventory_weight"],
         "inventory_cost_factor": BOT_CONFIG["trading_strategy"]["avellaneda"]["inventory_cost_factor"],
-        "max_loss_threshold": BOT_CONFIG["trading_strategy"]["avellaneda"]["max_loss_threshold"],
-        "min_profit_rebalance": BOT_CONFIG["trading_strategy"]["avellaneda"]["min_profit_rebalance"],
-        "fixed_volatility": 0.01,  # Default fallback
         "position_fade_time": BOT_CONFIG["trading_strategy"]["avellaneda"]["position_fade_time"],
-        "order_flow_intensity": BOT_CONFIG["trading_strategy"]["avellaneda"]["order_flow_intensity"],
         "adverse_selection_threshold": BOT_CONFIG["trading_strategy"]["avellaneda"]["adverse_selection_threshold"],
-        "position_limit": BOT_CONFIG["risk"]["max_position"]
+        "min_profit_rebalance": BOT_CONFIG["trading_strategy"]["avellaneda"]["min_profit_rebalance"],
+        "max_loss_threshold": BOT_CONFIG["trading_strategy"]["avellaneda"]["max_loss_threshold"],
+        "base_size": BOT_CONFIG["trading_strategy"]["avellaneda"]["base_size"],
+        "size_multipliers": BOT_CONFIG["trading_strategy"]["avellaneda"]["size_multipliers"],
+        "max_levels": BOT_CONFIG["trading_strategy"]["avellaneda"]["max_levels"],
+        "level_spacing": BOT_CONFIG["trading_strategy"]["avellaneda"]["level_spacing"],
+        "vamp_spread_sensitivity": BOT_CONFIG["trading_strategy"]["avellaneda"]["vamp_spread_sensitivity"],
+        "vamp_skew_sensitivity": BOT_CONFIG["trading_strategy"]["avellaneda"]["vamp_skew_sensitivity"],
+        "pa_gamma_adj_threshold": BOT_CONFIG["trading_strategy"]["avellaneda"]["pa_gamma_adj_threshold"],
+        "pa_kappa_adj_threshold": BOT_CONFIG["trading_strategy"]["avellaneda"]["pa_kappa_adj_threshold"],
+        "pa_res_price_offset_adj_threshold": BOT_CONFIG["trading_strategy"]["avellaneda"]["pa_res_price_offset_adj_threshold"],
+        "pa_volatility_adj_threshold": BOT_CONFIG["trading_strategy"]["avellaneda"]["pa_volatility_adj_threshold"],
+        "pa_prediction_max_age_seconds": BOT_CONFIG["trading_strategy"]["avellaneda"]["pa_prediction_max_age_seconds"],
+        "position_limit": BOT_CONFIG["risk"]["max_position"], 
+        "exchange_fee_rate": 0.0001, 
+        "fixed_volatility": 0.01, 
     },
     "quoting": {
-        "min_quote_interval": BOT_CONFIG["trading_strategy"]["quote_timing"]["min_interval"],
-        "quote_lifetime": BOT_CONFIG["trading_strategy"]["quote_timing"]["max_lifetime"],
-        "refresh_interval": BOT_CONFIG["trading_strategy"]["quote_timing"]["min_interval"] / 2,
-        "max_quote_age": BOT_CONFIG["trading_strategy"]["quote_timing"]["max_lifetime"] * 3,
-        "operation_interval": BOT_CONFIG["trading_strategy"]["quote_timing"]["operation_interval"],
-        "max_pending_operations": BOT_CONFIG["trading_strategy"]["quote_timing"]["max_pending"],
-        "fast_cancel_threshold": BOT_CONFIG["trading_strategy"]["market_impact"]["fast_cancel_threshold"],
-        "market_impact_threshold": BOT_CONFIG["trading_strategy"]["market_impact"]["threshold"],
-        "min_size": BOT_CONFIG["trading_strategy"]["execution"]["min_size"],
-        "max_size": BOT_CONFIG["trading_strategy"]["execution"]["max_size"],
         "levels": BOT_CONFIG["trading_strategy"]["avellaneda"]["max_levels"],
-        "post_only": BOT_CONFIG["trading_strategy"]["execution"]["post_only"]
+        "min_interval": BOT_CONFIG["trading_strategy"]["quote_timing"]["min_interval"],
+        "max_lifetime": BOT_CONFIG["trading_strategy"]["quote_timing"]["max_lifetime"],
+        "operation_interval": BOT_CONFIG["trading_strategy"]["quote_timing"]["operation_interval"],
+        "max_pending": BOT_CONFIG["trading_strategy"]["quote_timing"]["max_pending"],
     },
     "order": {
-        "spread": BOT_CONFIG["trading_strategy"]["avellaneda"]["base_spread"],
-        "min_spread": BOT_CONFIG["trading_strategy"]["avellaneda"]["min_spread"],
-        "max_spread": BOT_CONFIG["trading_strategy"]["avellaneda"]["max_spread"],
-        "bid_step": BOT_CONFIG["trading_strategy"]["avellaneda"]["level_spacing"],
-        "ask_step": BOT_CONFIG["trading_strategy"]["avellaneda"]["level_spacing"],
-        "bid_sizes": BOT_CONFIG["trading_strategy"]["avellaneda"]["size_multipliers"],
-        "ask_sizes": BOT_CONFIG["trading_strategy"]["avellaneda"]["size_multipliers"],
-        "threshold": BOT_CONFIG["trading_strategy"]["avellaneda"]["adverse_selection_threshold"],
-        "amend_threshold": BOT_CONFIG["trading_strategy"]["avellaneda"]["max_loss_threshold"],
-        "post_only": BOT_CONFIG["trading_strategy"]["execution"]["post_only"]
+        "bid_step": BOT_CONFIG["orderbook"]["bid_step"], 
+        "ask_step": BOT_CONFIG["orderbook"]["ask_step"], 
+        "price_decimals": BOT_CONFIG["trading_strategy"]["execution"]["price_decimals"],
+        "size_decimals": BOT_CONFIG["trading_strategy"]["execution"]["size_decimals"],
+        "size_increment": BOT_CONFIG["trading_strategy"]["execution"]["size_increment"],
     },
-    "vamp": {
-        "window": 50,                   # Number of price-volume samples
-        "aggressive_window": 20,        # Number of aggressive trade samples
-        "impact_window": 30,            # Number of market impact samples
-    },
-    "volume_candle": {
-        "threshold": 0.5,               # Volume threshold to complete a candle (BTC)
-        "max_candles": 100,             # Maximum candles to keep in buffer
-        "max_time_seconds": 300,        # Maximum time before forcing candle completion
-        "prediction_update_interval": 10.0, # How often to update predictions (seconds)
-        "use_exchange_data": True,      # Enable exchange API integration for complete data
-        "fetch_interval_seconds": 60,   # How often to fetch exchange data (seconds)
-        "lookback_hours": 1,            # How far back to look for historical data
-        "sensitivity": {
-            "momentum": 1.0,            # Sensitivity multiplier for momentum signals
-            "reversal": 1.0,            # Sensitivity multiplier for reversal signals
-            "volatility": 1.0,          # Sensitivity multiplier for volatility signals
-            "reservation_price": 1.0    # Sensitivity for reservation price adjustments
-        }
-    },
+    "execution": BOT_CONFIG["trading_strategy"]["execution"],
+    "volume_candle": BOT_CONFIG["trading_strategy"]["volume_candle"],
     "volatility": DEFAULT_VOLATILITY_CONFIG,
-    "hedging": BOT_CONFIG.get("hedging", {"enabled": False})
+    "vamp": BOT_CONFIG["trading_strategy"]["vamp"],
 }
 
-# Risk management configuration
+# Risk limits configuration
 RISK_LIMITS = {
     "max_position": BOT_CONFIG["risk"]["max_position"],
     "max_notional": BOT_CONFIG["risk"]["max_notional"],
@@ -303,117 +324,54 @@ RISK_LIMITS = {
 }
 
 # =============================================================================
-# LEGACY CONFIGS - KEPT FOR BACKWARD COMPATIBILITY
+# LEGACY CONFIGS - REMOVED - All usages should now point to TRADING_CONFIG, 
+# RISK_LIMITS, or BOT_CONFIG directly.
 # =============================================================================
 
+# DeprecatedConfigDict class and _legacy_config_warning function can also be removed 
+# if no other DeprecatedConfigDict instances remain.
+# For now, keeping them in case other legacy configs are added/managed temporarily.
+
 # Display warning about using legacy configs
-def _legacy_config_warning(name: str) -> None:
-    warnings.warn(
-        f"Using legacy config '{name}'. This is deprecated and will be removed in a future version. "
-        f"Please use TRADING_CONFIG or RISK_LIMITS instead.",
-        DeprecationWarning, 
-        stacklevel=2
-    )
+# def _legacy_config_warning(name: str) -> None:
+#     warnings.warn(
+#         f"Using legacy config '{name}'. This is deprecated and will be removed in a future version. "
+#         f"Please use TRADING_CONFIG or RISK_LIMITS instead.",
+#         DeprecationWarning, 
+#         stacklevel=2
+#     )
 
 # Create proxy dictionary that warns when accessed
-class DeprecatedConfigDict(dict):
-    def __init__(self, data: Dict[str, Any], name: str):
-        super().__init__(data)
-        self.name = name
-        
-    def __getitem__(self, key):
-        _legacy_config_warning(self.name)
-        return super().__getitem__(key)
+# class DeprecatedConfigDict(dict):
+#     def __init__(self, data: Dict[str, Any], name: str):
+#         super().__init__(data)
+#         self.name = name
+#         
+#     def __getitem__(self, key):
+#         _legacy_config_warning(self.name)
+#         return super().__getitem__(key)
 
-# Define direct backward compatibility mappings
-ORDERBOOK_CONFIG = TRADING_CONFIG["order"]
-CONNECTION_CONFIG = BOT_CONFIG["connection"]
+# REMOVED: ORDERBOOK_CONFIG = TRADING_CONFIG["order"]
+CONNECTION_CONFIG = BOT_CONFIG["connection"] # This one is fine as it's a direct alias to a part of BOT_CONFIG
 
-# Create legacy configurations with deprecation warnings
-QUOTING_CONFIG = DeprecatedConfigDict({
-    **TRADING_CONFIG["quoting"],
-    "post_only": BOT_CONFIG["trading_strategy"]["execution"]["post_only"],
-    "error_retry_interval": BOT_CONFIG["connection"]["retry_delay"],
-    # Add base_levels for compatibility with existing code
-    "base_levels": [
-        {"size": 0.03, "spread_multiplier": 1.0},  # Level 0 (closest to mid) - smaller size
-        {"size": 0.06, "spread_multiplier": 1.2},  # Level 1
-        {"size": 0.09, "spread_multiplier": 1.5},  # Level 2
-        {"size": 0.12, "spread_multiplier": 1.8},  # Level 3 
-        {"size": 0.15, "spread_multiplier": 2.2},  # Level 4
-        {"size": 0.20, "spread_multiplier": 2.5},  # Level 5 (furthest from mid) - larger size
-    ]
-}, "QUOTING_CONFIG")
+# REMOVED Legacy Config Definitions:
+# QUOTING_CONFIG
+# RISK_CONFIG
+# INVENTORY_CONFIG
+# PERFORMANCE_CONFIG
+# PERFORMANCE_METRICS
+# TRADING_PARAMS
 
-RISK_CONFIG = DeprecatedConfigDict({
-    # Position limits
-    "limits": RISK_LIMITS,
-    
-    # Inventory management
-    "inventory": {
-        "target": BOT_CONFIG["risk"]["inventory_target"],
-        "max_imbalance": BOT_CONFIG["risk"]["inventory_imbalance_limit"],
-        "fade_time": BOT_CONFIG["trading_strategy"]["avellaneda"]["position_fade_time"],
-        "adverse_selection_threshold": BOT_CONFIG["trading_strategy"]["avellaneda"]["adverse_selection_threshold"],
-        "min_profit_rebalance": BOT_CONFIG["trading_strategy"]["avellaneda"]["min_profit_rebalance"]
-    }
-}, "RISK_CONFIG")
+# Ensure BOT_CONFIG is accessible if needed for direct lookups by modules that previously used these.
+# (It's already imported and used for TRADING_CONFIG and RISK_LIMITS, so it's available)
 
-INVENTORY_CONFIG = DeprecatedConfigDict({
-    "max_inventory_imbalance": RISK_CONFIG["inventory"]["max_imbalance"],
-    "target_inventory": RISK_CONFIG["inventory"]["target"],
-    "inventory_fade_time": RISK_CONFIG["inventory"]["fade_time"],
-    "adverse_selection_threshold": RISK_CONFIG["inventory"]["adverse_selection_threshold"],
-    "inventory_skew_factor": TRADING_CONFIG["avellaneda"]["inventory_weight"],
-    "max_position_notional": RISK_LIMITS["max_position_notional"],
-    "min_profit_rebalance": RISK_CONFIG["inventory"]["min_profit_rebalance"],
-    "gradual_exit_steps": TRADING_CONFIG["avellaneda"]["max_loss_threshold"],
-    "inventory_cost_factor": TRADING_CONFIG["avellaneda"]["inventory_cost_factor"],
-}, "INVENTORY_CONFIG")
+# Example of how a module might now access a previously proxied value:
+# Old: val = QUOTING_CONFIG["min_spread"]
+# New direct: val = TRADING_CONFIG["avellaneda"]["min_spread"]
+# New via BOT_CONFIG: val = BOT_CONFIG["trading_strategy"]["avellaneda"]["min_spread"]
 
-PERFORMANCE_CONFIG = DeprecatedConfigDict({
-    "metrics": {
-        "window_size": BOT_CONFIG["performance"]["window_size"],
-        "min_trades": BOT_CONFIG["performance"]["min_trades"],
-        "update_interval": BOT_CONFIG["performance"]["metrics_update_interval"],
-        "max_position_time": BOT_CONFIG["performance"]["max_position_time"]
-    },
-    "thresholds": {
-        "profit_factor": BOT_CONFIG["performance"]["profit_factor_threshold"],
-        "win_rate": BOT_CONFIG["performance"]["win_rate_threshold"],
-        "risk_reward_ratio": BOT_CONFIG["performance"]["risk_reward_ratio"],
-        "target_profit": BOT_CONFIG["risk"]["take_profit_pct"],
-        "max_drawdown": BOT_CONFIG["risk"]["max_drawdown"],
-        "max_consecutive_losses": BOT_CONFIG["risk"]["max_consecutive_losses"],
-        "drawdown_recovery_factor": BOT_CONFIG["performance"]["drawdown_recovery_factor"]
-    }
-}, "PERFORMANCE_CONFIG")
+# Old: val = RISK_CONFIG["limits"]["max_position"]
+# New direct: val = RISK_LIMITS["max_position"]
+# New via BOT_CONFIG: val = BOT_CONFIG["risk"]["max_position"]
 
-PERFORMANCE_METRICS = DeprecatedConfigDict({
-    "window_size": PERFORMANCE_CONFIG["metrics"]["window_size"],
-    "min_trades": PERFORMANCE_CONFIG["metrics"]["min_trades"],
-    "target_profit": PERFORMANCE_CONFIG["thresholds"]["target_profit"],
-    "max_drawdown": PERFORMANCE_CONFIG["thresholds"]["max_drawdown"],
-    "max_position_time": PERFORMANCE_CONFIG["metrics"]["max_position_time"],
-    "metrics_update_interval": PERFORMANCE_CONFIG["metrics"]["update_interval"],
-    "profit_factor_threshold": PERFORMANCE_CONFIG["thresholds"]["profit_factor"],
-    "win_rate_threshold": PERFORMANCE_CONFIG["thresholds"]["win_rate"],
-    "risk_reward_ratio": PERFORMANCE_CONFIG["thresholds"]["risk_reward_ratio"],
-    "max_consecutive_losses": PERFORMANCE_CONFIG["thresholds"]["max_consecutive_losses"],
-    "drawdown_recovery_factor": PERFORMANCE_CONFIG["thresholds"]["drawdown_recovery_factor"]
-}, "PERFORMANCE_METRICS")
-
-TRADING_PARAMS = DeprecatedConfigDict({
-    "position_management": {
-        "gamma": BOT_CONFIG["trading_strategy"]["avellaneda"]["gamma"],
-        "inventory_weight": BOT_CONFIG["trading_strategy"]["avellaneda"]["inventory_weight"],
-        "position_fade_time": BOT_CONFIG["trading_strategy"]["avellaneda"]["position_fade_time"],
-        "order_flow_intensity": BOT_CONFIG["trading_strategy"]["avellaneda"]["order_flow_intensity"],
-        "inventory_cost_factor": BOT_CONFIG["trading_strategy"]["avellaneda"]["inventory_cost_factor"],
-        "max_inventory_imbalance": BOT_CONFIG["risk"]["inventory_imbalance_limit"],
-        "adverse_selection_threshold": BOT_CONFIG["trading_strategy"]["avellaneda"]["adverse_selection_threshold"],
-        "kappa": BOT_CONFIG["trading_strategy"]["avellaneda"]["kappa"],
-    },
-    "volatility": DEFAULT_VOLATILITY_CONFIG,
-    "position_limit": BOT_CONFIG["risk"]["max_position"],
-}, "TRADING_PARAMS")
+# The rest of the file, if any, continues below...

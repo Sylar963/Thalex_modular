@@ -10,9 +10,9 @@ import websockets
 from threading import Lock
 import numpy as np
 from collections import deque
-import plotly.graph_objects as go
 from enum import Enum
 from dataclasses import dataclass, field
+import itertools
 
 import thalex as th
 from .keys import *  # Import from the local keys.py file
@@ -22,9 +22,9 @@ from ..config.market_config import (
     BOT_CONFIG,
     MARKET_CONFIG,
     TRADING_CONFIG,
-    RISK_CONFIG,
-    PERFORMANCE_CONFIG
+    RISK_LIMITS, # Changed from RISK_CONFIG
 )
+from ..thalex_logging import LoggerFactory # Added import
 
 # Basic configuration - use values from MARKET_CONFIG
 UNDERLYING = MARKET_CONFIG["underlying"]
@@ -32,26 +32,79 @@ LABEL = MARKET_CONFIG["label"]
 NETWORK = MARKET_CONFIG["network"]
 
 # Order book configuration - use values from TRADING_CONFIG
-AMEND_THRESHOLD = TRADING_CONFIG["order"]["amend_threshold"]
-SPREAD = TRADING_CONFIG["order"]["spread"]
-BID_STEP = TRADING_CONFIG["order"]["bid_step"]
-ASK_STEP = TRADING_CONFIG["order"]["ask_step"]
-BID_SIZES = TRADING_CONFIG["order"]["bid_sizes"]
-ASK_SIZES = TRADING_CONFIG["order"]["ask_sizes"]
+# REMOVED global constants: AMEND_THRESHOLD, SPREAD, BID_STEP, ASK_STEP, BID_SIZES, ASK_SIZES
+# These were problematic as TRADING_CONFIG does not have an "order" subkey as previously assumed.
+# Functionality should rely on QUOTING_CONFIG or AVELLANEDA_CONFIG.
 
 # These configuration dictionaries have been moved to market_config.py
 # Reference them from the imported configurations
-# POSITION_LIMITS now comes from RISK_CONFIG["limits"]
+# POSITION_LIMITS now comes from RISK_LIMITS
 # QUOTING_CONFIG now comes from TRADING_CONFIG["quoting"]
 # INVENTORY_CONFIG now comes from RISK_CONFIG["inventory"]
 # SIGNAL_CONFIG now comes from BOT_CONFIG["technical"]["signal"]
 # AVELLANEDA_CONFIG now comes from TRADING_CONFIG["avellaneda"]
 
 # Define convenience variables for imported configurations
-POSITION_LIMITS = RISK_CONFIG["limits"] if "limits" in RISK_CONFIG else {}
-QUOTING_CONFIG = TRADING_CONFIG["quoting"] if "quoting" in TRADING_CONFIG else {}
-INVENTORY_CONFIG = RISK_CONFIG["inventory"] if "inventory" in RISK_CONFIG else {}
-SIGNAL_CONFIG = BOT_CONFIG.get("technical", {}).get("signal", {})
+POSITION_LIMITS = RISK_LIMITS # Changed from RISK_CONFIG["limits"]
+
+# Construct QUOTING_CONFIG from modern config sources
+_quoting_config_source = {
+    # From TRADING_CONFIG["avellaneda"]
+    "min_spread": TRADING_CONFIG.get("avellaneda", {}).get("min_spread"),
+    "max_spread": TRADING_CONFIG.get("avellaneda", {}).get("max_spread"),
+    "adverse_selection_threshold": TRADING_CONFIG.get("avellaneda", {}).get("adverse_selection_threshold"), # For amend_threshold mapping
+    "size_multipliers": TRADING_CONFIG.get("avellaneda", {}).get("size_multipliers"), # For base_levels logic
+    "max_levels": TRADING_CONFIG.get("avellaneda", {}).get("max_levels"), # For base_levels logic
+    "base_size": TRADING_CONFIG.get("avellaneda", {}).get("base_size"), # For base_levels logic
+
+    # From TRADING_CONFIG["quote_timing"]
+    "min_quote_interval": TRADING_CONFIG.get("quote_timing", {}).get("min_interval"),
+    "quote_lifetime": TRADING_CONFIG.get("quote_timing", {}).get("max_lifetime"),
+    "order_operation_interval": TRADING_CONFIG.get("quote_timing", {}).get("operation_interval"),
+    "max_pending_operations": TRADING_CONFIG.get("quote_timing", {}).get("max_pending"),
+
+    # From TRADING_CONFIG["market_impact"]
+    "fast_cancel_threshold": TRADING_CONFIG.get("market_impact", {}).get("fast_cancel_threshold"),
+    "market_impact_threshold": TRADING_CONFIG.get("market_impact", {}).get("threshold"), # Could be an alternative for amend_threshold
+
+    # From BOT_CONFIG["connection"]
+    "error_retry_interval": BOT_CONFIG.get("connection", {}).get("retry_delay"),
+
+    # From BOT_CONFIG["trading_strategy"]["execution"]
+    "post_only": BOT_CONFIG.get("trading_strategy", {}).get("execution", {}).get("post_only"),
+
+    # Custom/Legacy - to be reviewed if still needed or can be mapped
+    # "volatility_spread_factor": ???, # Needs a source or default
+    # "base_levels": ???, # Needs to be constructed or logic adapted
+}
+QUOTING_CONFIG = {k: v for k, v in _quoting_config_source.items() if v is not None}
+
+# Fallback for amend_threshold if not found directly, map from adverse_selection or market_impact
+if "amend_threshold" not in QUOTING_CONFIG:
+    QUOTING_CONFIG["amend_threshold"] = QUOTING_CONFIG.get("adverse_selection_threshold") or QUOTING_CONFIG.get("market_impact_threshold")
+
+# Reconstruct INVENTORY_CONFIG directly from BOT_CONFIG, TRADING_CONFIG, and RISK_LIMITS
+# Using original key names for compatibility with existing code in this file.
+_inventory_config_source = {
+    "max_inventory_imbalance": BOT_CONFIG.get("risk", {}).get("inventory_imbalance_limit"),
+    "target_inventory": BOT_CONFIG.get("risk", {}).get("inventory_target"),
+    "inventory_fade_time": TRADING_CONFIG.get("avellaneda", {}).get("position_fade_time"),
+    "adverse_selection_threshold": TRADING_CONFIG.get("avellaneda", {}).get("adverse_selection_threshold"),
+    "inventory_skew_factor": TRADING_CONFIG.get("avellaneda", {}).get("inventory_weight"),
+    "max_position_notional": RISK_LIMITS.get("max_position_notional"),
+    "min_profit_rebalance": TRADING_CONFIG.get("avellaneda", {}).get("min_profit_rebalance"),
+    "gradual_exit_steps": TRADING_CONFIG.get("avellaneda", {}).get("max_loss_threshold"), # Note: source key name is max_loss_threshold
+    "inventory_cost_factor": TRADING_CONFIG.get("avellaneda", {}).get("inventory_cost_factor"),
+}
+INVENTORY_CONFIG = {k: v for k, v in _inventory_config_source.items() if v is not None}
+
+# Ensure keys used in data_models.py are present with defaults if necessary
+# e.g. the key "max_loss_threshold" is used in handle_position_loss, 
+# and its value was sourced from "gradual_exit_steps" in the legacy config.
+if "max_loss_threshold" not in INVENTORY_CONFIG and INVENTORY_CONFIG.get("gradual_exit_steps") is not None:
+    INVENTORY_CONFIG["max_loss_threshold"] = INVENTORY_CONFIG["gradual_exit_steps"]
+
+# SIGNAL_CONFIG = BOT_CONFIG.get("technical", {}).get("signal", {}) # Removed SIGNAL_CONFIG
 AVELLANEDA_CONFIG = TRADING_CONFIG["avellaneda"] if "avellaneda" in TRADING_CONFIG else {}
 
 # Performance metrics
@@ -226,7 +279,7 @@ class PerpQuoter:
         self.portfolio: Dict[str, float] = {}
         self.orders: List[List[Order]] = [[], []]  # bids, asks
         self.client_order_id: int = 100
-        self.tick: Optional[float] = None
+        self.tick: Optional[float] = None # This is critical, should be set (e.g. in await_instruments)
         self.perp_name: Optional[str] = None
         
         # Position management
@@ -279,6 +332,11 @@ class PerpQuoter:
         self.last_inventory_update = time.time()
         self.inventory_holding_cost = 0.0
         self.inventory_imbalance = 0.0
+        self.logger = LoggerFactory.configure_component_logger(
+            "perp_quoter", 
+            log_file="perp_quoter.log",
+            high_frequency=False # Assuming PerpQuoter doesn't need HFT logging by default
+        )
 
     def round_to_tick(self, value):
         return self.tick * round(value / self.tick)
@@ -300,25 +358,28 @@ class PerpQuoter:
         return np.mean(high_low)
 
     async def check_risk_limits(self) -> bool:
-        """Check if position and notional risk limits are exceeded"""
-        position = self.position_size
+        """Check position and notional value against limits."""
+        # Ensure self.position_size is a float
+        position = float(self.position_size) if self.position_size is not None else 0.0
+        entry_price = float(self.entry_price) if self.entry_price is not None else 0.0
+
+        if abs(position) >= POSITION_LIMITS.get("max_position", float('inf')):
+            logging.warning(f"Position {position} exceeds limit of {POSITION_LIMITS.get('max_position')}")
+            await self.handle_risk_breach() # Added await
+            return False
         
-        # Check absolute position limit
-        if abs(position) >= RISK_CONFIG["limits"]["max_position"]:
-            logging.warning(f"Position {position} exceeds limit of {RISK_CONFIG['limits']['max_position']}")
+        # Calculate notional value
+        notional = abs(position * entry_price)
+        if notional >= POSITION_LIMITS.get("max_notional", float('inf')):
+            logging.warning(f"Notional value {notional} exceeds limit of {POSITION_LIMITS.get('max_notional')}")
+            await self.handle_risk_breach() # Added await
             return False
             
-        # Check notional value limit
-        price = self.ticker.mark_price if self.ticker else 0
-        notional = abs(position * price)
-        if notional >= RISK_CONFIG["limits"]["max_notional"]:
-            logging.warning(f"Notional value {notional} exceeds limit of {RISK_CONFIG['limits']['max_notional']}")
-            return False
-            
-        # Check if position is approaching max and needs rebalancing
-        if abs(position) >= RISK_CONFIG["limits"]["max_position"] * RISK_CONFIG["limits"]["position_rebalance_threshold"]:
-            logging.warning(f"Position {position} approaching max {RISK_CONFIG['limits']['max_position']}, consider rebalancing")
-            
+        # Check rebalance threshold from BOT_CONFIG directly as it's not in RISK_LIMITS
+        rebalance_threshold = BOT_CONFIG["risk"].get("position_rebalance_threshold")
+        if rebalance_threshold is not None and abs(position) >= POSITION_LIMITS.get("max_position", float('inf')) * rebalance_threshold:
+            logging.warning(f"Position {position} approaching max {POSITION_LIMITS.get('max_position')}, consider rebalancing")
+            # Potentially trigger rebalance logic here
         return True
 
     def should_alert(self, alert_key: str, current_time: float) -> bool:
@@ -552,73 +613,95 @@ class PerpQuoter:
             logging.error(f"Error updating inventory metrics: {str(e)}")
 
     def calculate_dynamic_spread(self, atr: float, zscore: float) -> float:
-        """Calculate dynamic spread based on market conditions"""
-        try:
-            # Base spread from config
-            base_spread = QUOTING_CONFIG["min_spread"] * self.tick
-            
-            # Volatility adjustment
-            volatility_factor = 1.0
-            if atr > 0:
-                volatility_factor = 1.0 + (atr / self.ticker.mark_price) * QUOTING_CONFIG["volatility_spread_factor"]
-                
-            # Trend adjustment
-            trend_factor = 1.0 + abs(zscore) * 0.1
-            
-            # Market impact protection
-            market_spread = float('inf')
-            if self.ticker.best_bid and self.ticker.best_ask:
-                market_spread = self.ticker.best_ask - self.ticker.best_bid
-                if market_spread > 0:
-                    base_spread = max(base_spread, market_spread * 0.5)
-            
-            # Add collar buffer adjustment
-            collar_buffer = self.ticker.mark_price * 0.005  # 0.5% collar buffer
-            min_spread = collar_buffer * 2  # Minimum spread must be at least the collar buffer
-            
-            # Calculate final spread
-            spread = base_spread * volatility_factor * trend_factor
-            
-            # Ensure spread respects collar buffer
-            spread = max(min_spread, spread)
-            
-            # Clamp to min/max bounds
-            return min(
-                QUOTING_CONFIG["max_spread"] * self.tick,
-                max(QUOTING_CONFIG["min_spread"] * self.tick, spread)
-            )
-            
-        except Exception as e:
-            logging.error(f"Error calculating dynamic spread: {str(e)}")
-            return QUOTING_CONFIG["min_spread"] * self.tick  # Return minimum spread on error
+        """Calculate dynamic spread based on ATR and Z-score (absolute monetary value)"""
+        if not self.ticker or self.ticker.mark_price == 0:
+            self.logger.warning("Ticker or mark_price not available for dynamic spread calculation.")
+            # Fallback: use configured min_spread_ticks * self.tick if possible, or a small default if not.
+            if self.tick and self.tick > 0:
+                min_spread_ticks = QUOTING_CONFIG.get("min_spread", 3.0) # Default to 3.0 ticks
+                return min_spread_ticks * self.tick
+            return 0.01 # Small absolute fallback if no tick size
+
+        if not self.tick or self.tick <= 0:
+            self.logger.warning("Tick size not available or invalid. Cannot calculate dynamic spread accurately using ticks.")
+            # Fallback to a small percentage of mark price if ticks are not usable
+            min_spread_fallback_pct = 0.001 # 0.1%
+            return min_spread_fallback_pct * self.ticker.mark_price
+
+        # min_spread from config is in ticks (e.g., 3.0 ticks)
+        min_spread_ticks = QUOTING_CONFIG.get("min_spread", 3.0)
+        base_spread_abs = min_spread_ticks * self.tick
+        
+        # Volatility component (ATR based)
+        # atr is assumed to be an absolute price value from self.calculate_atr()
+        volatility_spread_factor = QUOTING_CONFIG.get("volatility_spread_factor", 0.5) 
+        volatility_adjustment_abs = atr * volatility_spread_factor
+        
+        calculated_spread_abs = base_spread_abs + volatility_adjustment_abs
+        
+        # Ensure spread is within min/max limits (absolute monetary values, derived from ticks)
+        min_allowable_spread_abs = min_spread_ticks * self.tick
+        
+        max_spread_ticks = QUOTING_CONFIG.get("max_spread", 25.0) # Default to 25.0 ticks
+        max_allowable_spread_abs = max_spread_ticks * self.tick
+
+        # Clamp spread
+        final_spread_abs = max(min_allowable_spread_abs, calculated_spread_abs)
+        if max_allowable_spread_abs > 0 and max_allowable_spread_abs > min_allowable_spread_abs: # Ensure max is valid and greater than min
+            final_spread_abs = min(final_spread_abs, max_allowable_spread_abs)
+        
+        self.logger.debug(f"Dynamic spread: final_abs={final_spread_abs:.4f} (base_abs={base_spread_abs:.4f}, vol_adj_abs={volatility_adjustment_abs:.4f})")
+        return final_spread_abs
 
     def validate_and_adjust_spread(self, bid_price: float, ask_price: float) -> Tuple[float, float]:
-        """Validate and adjust spread to respect price collar"""
-        try:
-            if not self.ticker or not self.ticker.mark_price:
-                return bid_price, ask_price
-
-            # Calculate collar bounds
-            collar_buffer = self.ticker.mark_price * 0.005
-            max_bid = self.ticker.mark_price - collar_buffer
-            min_ask = self.ticker.mark_price + collar_buffer
-
-            # Adjust prices to respect collar
-            adjusted_bid = min(bid_price, max_bid)
-            adjusted_ask = max(ask_price, min_ask)
-
-            # Ensure minimum spread
-            min_spread = collar_buffer * 2
-            if adjusted_ask - adjusted_bid < min_spread:
-                mid_price = (adjusted_bid + adjusted_ask) / 2
-                adjusted_bid = mid_price - min_spread/2
-                adjusted_ask = mid_price + min_spread/2
-
-            return self.round_to_tick(adjusted_bid), self.round_to_tick(adjusted_ask)
-
-        except Exception as e:
-            logging.error(f"Error validating spread: {str(e)}")
+        """Validate and adjust spread to meet minimum and maximum configured requirements (tick-based)."""
+        if not self.tick or self.tick <= 0:
+            self.logger.warning("Tick size not available or invalid. Cannot validate spread accurately using ticks.")
             return bid_price, ask_price
+        if not self.ticker or self.ticker.mark_price == 0: # mark_price might not be strictly needed if all calcs are tick based
+            self.logger.warning("Ticker or mark_price not available. Spread validation might be less accurate if fallbacks occur.")
+            # Proceeding, but min/max calculations will rely on self.tick only
+
+        current_spread_abs = ask_price - bid_price
+        
+        # Min spread check (tick-based)
+        min_spread_ticks = QUOTING_CONFIG.get("min_spread", 3.0) # Default to 3.0 ticks
+        min_required_spread_abs = min_spread_ticks * self.tick
+
+        if current_spread_abs < min_required_spread_abs:
+            self.logger.warning(f"Spread {current_spread_abs:.4f} is less than minimum required {min_required_spread_abs:.4f} (ticks: {min_spread_ticks}). Adjusting.")
+            adjustment = (min_required_spread_abs - current_spread_abs) / 2
+            # Adjust and round to tick. Ensure bid < ask.
+            bid_price = self.round_to_tick(bid_price - adjustment)
+            ask_price = self.round_to_tick(ask_price + adjustment)
+            # Re-check spread after rounding, adjust ask if necessary to meet minimum
+            if ask_price - bid_price < min_required_spread_abs:
+                ask_price = self.round_to_tick(bid_price + min_required_spread_abs)
+
+        # Max spread check (tick-based)
+        max_spread_ticks = QUOTING_CONFIG.get("max_spread", 25.0) # Default to 25.0 ticks
+        if max_spread_ticks is not None and max_spread_ticks > 0: # Check if max_spread is configured and positive
+            max_allowable_spread_abs = max_spread_ticks * self.tick
+            current_spread_after_min_adj = ask_price - bid_price # re-calculate current spread
+            
+            if max_allowable_spread_abs < min_required_spread_abs: # Sanity check: max spread shouldn't be less than min
+                 self.logger.warning(f"Configured max_spread_ticks ({max_spread_ticks}) results in a smaller absolute spread ({max_allowable_spread_abs:.4f}) than min_required_spread_abs ({min_required_spread_abs:.4f}). Ignoring max_spread clamping.")
+            elif current_spread_after_min_adj > max_allowable_spread_abs:
+                 self.logger.warning(f"Spread {current_spread_after_min_adj:.4f} exceeds max allowable {max_allowable_spread_abs:.4f} (ticks: {max_spread_ticks}). Clamping.")
+                 excess_spread = current_spread_after_min_adj - max_allowable_spread_abs
+                 # Adjust and round to tick
+                 bid_price = self.round_to_tick(bid_price + excess_spread / 2)
+                 ask_price = self.round_to_tick(ask_price - excess_spread / 2)
+                 # Ensure ask is still above bid after clamping and rounding
+                 if ask_price <= bid_price:
+                     ask_price = self.round_to_tick(bid_price + self.tick) # Ensure at least one tick spread
+                 # Ensure it still meets min spread
+                 if ask_price - bid_price < min_required_spread_abs:
+                     ask_price = self.round_to_tick(bid_price + min_required_spread_abs)
+
+
+        self.logger.debug(f"Validated spread: BidP={bid_price:.4f}, AskP={ask_price:.4f}")
+        return bid_price, ask_price
 
     def calculate_quote_size(self, base_size: float, side: str, position_ratio: float) -> float:
         """Enhanced quote size calculation with inventory management and safety checks"""
@@ -765,32 +848,45 @@ class PerpQuoter:
         return True
 
     async def cleanup_stale_orders(self):
-        """Periodically cleanup stale orders"""
-        while True:
-            try:
-                current_time = time.time()
-                
-                async with self.orders_lock:  # Add lock
-                    for side in [0, 1]:
-                        for order in self.orders[side][:]:
-                            try:
-                                if order.is_open():
-                                    if hasattr(order, 'timestamp') and \
-                                       current_time - order.timestamp > QUOTING_CONFIG["quote_lifetime"]:
-                                        await self.fast_cancel_order(order)
-                                        
-                                    elif self.ticker and self.should_fast_cancel(order):
-                                        await self.fast_cancel_order(order)
-                            except Exception as e:
-                                logging.error(f"Error processing order {order.id} in cleanup: {str(e)}")
-                                continue
-                                
-                await self.cleanup_completed_orders()  # Add periodic cleanup
-                await asyncio.sleep(5)
-                
-            except Exception as e:
-                logging.error(f"Error in cleanup_stale_orders: {str(e)}")
-                await asyncio.sleep(5)
+        """Cancel orders that are stale based on quote_lifetime."""
+        if not self.orders: # self.orders is List[List[Order]]
+            return
+
+        current_time = time.time()
+        orders_to_cancel_candidates = []
+        
+        # quote_lifetime_val should be present due to QUOTING_CONFIG reconstruction
+        quote_lifetime_val = QUOTING_CONFIG.get("quote_lifetime") 
+        if quote_lifetime_val is None:
+            self.logger.warning("'quote_lifetime' not found in QUOTING_CONFIG. Stale order cleanup might not work as expected.")
+            return # Or use a default like 60s
+
+        # Collect all open orders that are stale
+        async with self.orders_lock: # Acquire lock for reading self.orders state
+            for side_order_list in self.orders:
+                for order in side_order_list:
+                    if order.is_open(): # Check if order is effectively open
+                        order_timestamp = getattr(order, 'timestamp', 0.0)
+                        if not isinstance(order_timestamp, (float, int)):
+                            order_timestamp = 0.0 # Default if timestamp is invalid
+                        
+                        if current_time - order_timestamp > quote_lifetime_val:
+                            self.logger.info(f"Order {order.id} (timestamp: {order_timestamp:.2f}) identified as stale (age: {current_time - order_timestamp:.2f}s > {quote_lifetime_val}s). Queuing for cancellation.")
+                            orders_to_cancel_candidates.append(order)
+        
+        # Cancel identified stale orders
+        if orders_to_cancel_candidates:
+            self.logger.debug(f"Found {len(orders_to_cancel_candidates)} stale orders to cancel.")
+            for order_to_cancel in orders_to_cancel_candidates:
+                try:
+                    # fast_cancel_order should ideally handle removal from self.orders upon successful cancellation
+                    # or update its status so it's no longer considered active.
+                    await self.fast_cancel_order(order_to_cancel)
+                except Exception as e:
+                    self.logger.error(f"Error during fast_cancel_order for stale order {order_to_cancel.id}: {e}")
+                    # Decide if retry or other error handling is needed here for individual cancel failures
+        else:
+            self.logger.debug("No stale orders found to cancel.")
 
     async def quote_task(self):
         """Enhanced quoting loop with state validation"""
@@ -840,7 +936,7 @@ class PerpQuoter:
     async def listen_task(self):
         await self.thalex.connect()
         await self.await_instruments()
-        await self.thalex.login(keys.key_ids[NETWORK], keys.private_keys[NETWORK], id=CALL_ID_LOGIN)
+        await self.thalex.login(key_ids[NETWORK], private_keys[NETWORK], id=CALL_ID_LOGIN)
         await self.thalex.set_cancel_on_disconnect(6, id=CALL_ID_SET_COD)
         await self.thalex.private_subscribe(["session.orders", "account.portfolio", "account.trade_history"], id=CALL_ID_SUBSCRIBE)
         await self.thalex.public_subscribe([f"ticker.{self.perp_name}.raw", f"price_index.{UNDERLYING}"], id=CALL_ID_SUBSCRIBE)
@@ -1028,21 +1124,25 @@ class PerpQuoter:
         """Handle API call results within class context"""
         try:
             if cid == CALL_ID_INSTRUMENT:
-                logging.debug(f"Instrument result: {result}")
+                # logging.debug(f"Instrument result: {result}")
+                pass # Debug log removed
             elif cid == CALL_ID_SUBSCRIBE:
                 logging.info(f"Subscription confirmed: {result}")
             elif cid == CALL_ID_LOGIN:
                 logging.info("Login successful")
             elif cid == CALL_ID_SET_COD:
-                logging.debug("Cancel on disconnect set")
+                # logging.debug("Cancel on disconnect set")
+                pass # Debug log removed
             elif cid > 99:
                 # Handle order results
                 if "error" in result:
                     await self.order_error(result["error"], cid)
                 else:
-                    logging.debug(f"Order {cid} result: {result}")
+                    # logging.debug(f"Order {cid} result: {result}")
+                    pass # Debug log removed
             else:
-                logging.debug(f"Result {cid}: {result}")
+                # logging.debug(f"Result {cid}: {result}")
+                pass # Debug log removed
         except Exception as e:
             logging.error(f"Error in result_callback: {str(e)}")
 
@@ -1446,15 +1546,60 @@ class PerpQuoter:
     def calculate_optimal_spread(self) -> float:
         """Calculate optimal spread using Avellaneda-Stoikov formula"""
         if len(self.price_window) < 2:
-            return SPREAD * self.tick
+            if not self.tick:
+                self.logger.warning("Tick size not available for default spread. Returning 0.0")
+                return 0.0
+            # Using min_spread from config as the default if price window is too short
+            min_spread_ticks_from_config = AVELLANEDA_CONFIG.get("min_spread", 3.0) # Assuming 3.0 ticks as default
+            self.logger.debug(f"Price window too short, returning default min_spread: {min_spread_ticks_from_config * self.tick}")
+            return min_spread_ticks_from_config * self.tick
             
         # Calculate volatility
-        self.sigma = np.std(np.diff(np.array(self.price_window)))
-        
+        # self.sigma is set by update_model_parameters or needs to be calculated here if not.
+        # Assuming self.sigma is already up-to-date via another mechanism (e.g., update_model_parameters).
+        # If not, it should be: self.sigma = self.calculate_volatility() or similar
+        # For this function, we rely on self.sigma being current.
+        if self.sigma is None or self.sigma <= 0:
+            self.logger.warning(f"Invalid market volatility (sigma: {self.sigma}), cannot calculate optimal spread accurately.")
+            if not self.tick:
+                self.logger.warning("Tick size not available for fallback spread. Returning 0.0")
+                return 0.0
+            min_spread_ticks_from_config = AVELLANEDA_CONFIG.get("min_spread", 3.0)
+            return min_spread_ticks_from_config * self.tick
+
         # Optimal spread = γσ²(T-t) + 2/γ log(1 + γ/k)
-        spread = (self.gamma * self.sigma**2 * self.T + 
+        # Note: self.T is time horizon. (T-t) implies remaining time. If self.T is total horizon, this might be just self.T.
+        # Assuming self.T represents the relevant time factor for the formula.
+        # Ensure self.gamma and self.k are valid.
+        if self.gamma <= 0 or self.k <= 0:
+            self.logger.warning(f"Invalid Avellaneda params: gamma={self.gamma}, k={self.k}. Using default min_spread.")
+            if not self.tick:
+                self.logger.warning("Tick size not available for fallback spread. Returning 0.0")
+                return 0.0
+            min_spread_ticks_from_config = AVELLANEDA_CONFIG.get("min_spread", 3.0)
+            return min_spread_ticks_from_config * self.tick
+            
+        calculated_model_spread_abs = (self.gamma * self.sigma**2 * self.T + 
                  2/self.gamma * np.log(1 + self.gamma/self.k))
-        return max(SPREAD * self.tick, spread)
+        
+        if not (np.isfinite(calculated_model_spread_abs) and calculated_model_spread_abs > 0):
+            self.logger.warning(f"Calculated model spread is not valid: {calculated_model_spread_abs}. Using configured min_spread.")
+            if not self.tick:
+                self.logger.warning("Tick size not available for fallback spread. Returning 0.0")
+                return 0.0
+            min_spread_ticks_from_config = AVELLANEDA_CONFIG.get("min_spread", 3.0)
+            return min_spread_ticks_from_config * self.tick
+
+        if not self.tick:
+            self.logger.warning("Tick size not available, cannot enforce tick-based min spread. Returning model spread.")
+            return calculated_model_spread_abs
+
+        min_spread_ticks_from_config = AVELLANEDA_CONFIG.get("min_spread", 3.0) # Defaulting to 3.0 ticks
+        min_abs_spread_monetary = min_spread_ticks_from_config * self.tick
+        
+        final_spread = max(min_abs_spread_monetary, calculated_model_spread_abs)
+        self.logger.debug(f"Calculated optimal spread: {final_spread} (model: {calculated_model_spread_abs}, floor: {min_abs_spread_monetary})")
+        return final_spread
         
     def get_position_size(self) -> float:
         """Get current position size with portfolio reconciliation"""
@@ -1828,7 +1973,8 @@ class PerpQuoter:
             return False
 
         price_diff = abs(order.price - self.ticker.mark_price) / self.ticker.mark_price
-        return price_diff > QUOTING_CONFIG["fast_cancel_threshold"]
+        fast_cancel_thresh = QUOTING_CONFIG.get("fast_cancel_threshold", 0.005) # Added .get
+        return price_diff > fast_cancel_thresh
 
     async def cleanup_completed_orders(self):
         """Remove completed orders from tracking"""
@@ -1841,130 +1987,264 @@ class PerpQuoter:
                 ]
 
     async def make_quotes(self) -> List[List[Quote]]:
-        """Generate quotes using Avellaneda-Stoikov model"""
+        """Generate quotes using Avellaneda-Stoikov model and configured levels."""
         if not await self.check_risk_limits():
+            self.logger.warning("Risk limits check failed, not generating quotes.")
             return [[], []]
 
         try:
-            if not self.ticker or not self.tick:
+            if not self.ticker or not self.tick or self.ticker.mark_price <= 0:
+                self.logger.warning("Ticker, tick size, or valid mark price not available. Cannot generate quotes.")
                 return [[], []]
 
-            # Get optimal quotes from Avellaneda-Stoikov model
-            bid_price, ask_price, bid_size, ask_size = self.calculate_optimal_quotes()
+            l0_bid_price, l0_ask_price, l0_bid_size, l0_ask_size = self.calculate_optimal_quotes()
             
-            if bid_price <= 0 or ask_price <= 0:
+            if not (l0_bid_price > 0 and l0_ask_price > 0 and l0_ask_price > l0_bid_price):
+                self.logger.warning(f"Invalid L0 prices from calculate_optimal_quotes: Bid={l0_bid_price}, Ask={l0_ask_price}. Not generating quotes.")
                 return [[], []]
                 
-            # Create quote lists
             bids = []
             asks = []
             
-            # Add base quotes
-            if bid_size >= 0.001:
-                bids.append(Quote(price=bid_price, amount=bid_size))
-            if ask_size >= 0.001:
-                asks.append(Quote(price=ask_price, amount=ask_size))
-                
-            # Add additional levels with wider spreads
-            for i, level in enumerate(QUOTING_CONFIG["base_levels"][1:], 1):
-                spread_multiplier = 1 + (i * 0.5)  # Increase spread by 50% each level
-                
-                level_bid = self.round_to_tick(bid_price * (1 - 0.0001 * spread_multiplier))
-                level_ask = self.round_to_tick(ask_price * (1 + 0.0001 * spread_multiplier))
-                
-                level_size = bid_size * level["size"] / QUOTING_CONFIG["base_levels"][0]["size"]
-                
-                if level_size >= 0.001:
-                    bids.append(Quote(price=level_bid, amount=level_size))
-                    asks.append(Quote(price=level_ask, amount=level_size))
+            min_trade_size = TRADING_CONFIG.get("execution", {}).get("min_size", 0.001)
+            price_decimals = TRADING_CONFIG.get("execution", {}).get("price_decimals", 2) # Assuming default from BOT_CONFIG
+            size_decimals = TRADING_CONFIG.get("execution", {}).get("size_decimals", 3)   # Assuming default from BOT_CONFIG
 
+            # Add base quotes (Level 0)
+            if l0_bid_size >= min_trade_size:
+                bids.append(Quote(price=round(l0_bid_price, price_decimals), 
+                                  amount=round(l0_bid_size, size_decimals), 
+                                  instrument=self.perp_name, side="BUY"))
+            if l0_ask_size >= min_trade_size:
+                asks.append(Quote(price=round(l0_ask_price, price_decimals), 
+                                   amount=round(l0_ask_size, size_decimals), 
+                                   instrument=self.perp_name, side="SELL"))
+                
+            # Config for additional levels from TRADING_CONFIG["avellaneda"] (via QUOTING_CONFIG reconstruction)
+            max_levels = QUOTING_CONFIG.get("max_levels", 1) 
+            level_spacing_pct = QUOTING_CONFIG.get("level_spacing", 0.001) 
+            size_multipliers = QUOTING_CONFIG.get("size_multipliers", [1.0]) 
+
+            # Add additional levels (Level 1 onwards)
+            # max_levels includes L0. If max_levels is 5, we want L0, L1, L2, L3, L4.
+            # Loop for i from 1 to max_levels-1.
+            for i in range(1, max_levels):
+                # Price adjustment: spread further from L0 prices by i * level_spacing_pct * L0_mid_price
+                # L0 mid price can be approximated as (l0_bid_price + l0_ask_price) / 2 or based on self.ticker.mark_price if L0 is symmetric
+                l0_mid_for_spacing = (l0_bid_price + l0_ask_price) / 2
+                spread_increment_abs = i * level_spacing_pct * l0_mid_for_spacing
+
+                level_bid_p = self.round_to_tick(l0_bid_price - spread_increment_abs)
+                level_ask_p = self.round_to_tick(l0_ask_price + spread_increment_abs)
+
+                if not (level_bid_p > 0 and level_ask_p > 0 and level_ask_p > level_bid_p):
+                    self.logger.debug(f"Skipping level {i} due to invalid/crossed prices: Bid={level_bid_p}, Ask={level_ask_p}")
+                    continue
+
+                current_level_size_multiplier = 1.0 # Default multiplier
+                if i < len(size_multipliers): # size_multipliers[0] is for L0, [1] for L1, etc.
+                    current_level_size_multiplier = size_multipliers[i]
+                elif size_multipliers: # Fallback to last available multiplier if list is too short
+                    current_level_size_multiplier = size_multipliers[-1]
+                
+                level_bid_s = round(l0_bid_size * current_level_size_multiplier, size_decimals)
+                level_ask_s = round(l0_ask_size * current_level_size_multiplier, size_decimals)
+                
+                if level_bid_s >= min_trade_size:
+                    bids.append(Quote(price=round(level_bid_p, price_decimals), 
+                                      amount=level_bid_s, 
+                                      instrument=self.perp_name, side="BUY"))
+                if level_ask_s >= min_trade_size:
+                    asks.append(Quote(price=round(level_ask_p, price_decimals), 
+                                       amount=level_ask_s, 
+                                       instrument=self.perp_name, side="SELL"))
+            
+            self.logger.debug(f"Generated quotes: Bids({len(bids)}), Asks({len(asks)})")
             return [bids, asks]
 
         except Exception as e:
-            logging.error(f"Error generating quotes: {str(e)}")
+            self.logger.error(f"Error in make_quotes: {str(e)}, Trace: {traceback.format_exc()}")
             return [[], []]
 
     def calculate_optimal_quotes(self) -> Tuple[float, float, float, float]:
         """Calculate optimal quotes using Avellaneda-Stoikov model"""
         try:
-            if not self.ticker or not self.price_history:
-                logging.warning("Missing ticker or price history for optimal quotes calculation")
+            if not self.ticker or not self.price_history or self.ticker.mark_price <= 0:
+                self.logger.warning("Missing ticker, price history, or valid mark price for optimal quotes calculation")
                 return 0, 0, 0, 0
 
-            if len(self.price_history) < AVELLANEDA_CONFIG["vol_window"]:
-                logging.warning(f"Insufficient price history: {len(self.price_history)} < {AVELLANEDA_CONFIG['vol_window']}")
-                return 0, 0, 0, 0
+            # Correctly source vol_window from TRADING_CONFIG["volatility"]
+            vol_config = TRADING_CONFIG.get("volatility", {})
+            vol_window = vol_config.get("window")
 
-            # Calculate mid price and volatility
+            if vol_window is None or len(self.price_history) < vol_window:
+                self.logger.warning(f"Insufficient price history: {len(self.price_history)} < {vol_window if vol_window is not None else 'N/A'} for volatility calculation.")
+                return 0,0,0,0
+
             mid_price = self.ticker.mark_price
-            if mid_price <= 0:
-                logging.warning(f"Invalid mid price: {mid_price}")
-                return 0, 0, 0, 0
 
-            # Add price collar buffer (0.5% from mid price)
-            collar_buffer = mid_price * 0.005
-            max_bid = mid_price - collar_buffer
-            min_ask = mid_price + collar_buffer
+            # Avellaneda parameters from AVELLANEDA_CONFIG (TRADING_CONFIG["avellaneda"])
+            gamma = AVELLANEDA_CONFIG.get("gamma", 0.1) # Risk aversion
+            inventory_weight_param = AVELLANEDA_CONFIG.get("inventory_weight", 1.0) # Inventory sensitivity
+            k_param = AVELLANEDA_CONFIG.get("k", 1.5) # Order book liquidity parameter
+            time_horizon_t = AVELLANEDA_CONFIG.get("time_horizon", 1.0) # Trader's time horizon
+            
+            # Configured spread limits in ticks
+            min_spread_ticks_cfg = AVELLANEDA_CONFIG.get("min_spread", 3.0) # Default 3.0 ticks
+            max_spread_ticks_cfg = AVELLANEDA_CONFIG.get("max_spread", 25.0) # Default 25.0 ticks
+            
+            # Normalized inventory q
+            max_pos_for_q_calc = RISK_LIMITS.get("max_position")
+            if max_pos_for_q_calc is None or max_pos_for_q_calc == 0:
+                self.logger.warning("max_position for q-calculation is not set or zero in RISK_LIMITS.")
+                return 0,0,0,0
+            q = self.position_size / max_pos_for_q_calc
 
-            volatility = self.calculate_volatility()
-            if volatility <= 0:
-                logging.warning(f"Invalid volatility: {volatility}")
-                return 0, 0, 0, 0
+            volatility_sigma = self.calculate_volatility() 
+            if not (volatility_sigma > 0 and np.isfinite(volatility_sigma)):
+                self.logger.warning(f"Invalid volatility calculated: {volatility_sigma}. Using fixed fallback if configured.")
+                fixed_vol = AVELLANEDA_CONFIG.get("fixed_volatility")
+                if fixed_vol is not None and fixed_vol > 0:
+                    volatility_sigma = fixed_vol
+                    self.logger.info(f"Using fixed_volatility: {volatility_sigma}")
+                else:
+                    self.logger.error("No valid dynamic volatility and no valid fixed_volatility fallback.")
+                    return 0,0,0,0
+            
+            reservation_price_offset = q * gamma * (volatility_sigma**2) * time_horizon_t * inventory_weight_param
+            reservation_price = mid_price - reservation_price_offset
+            
+            spread_component_variance = gamma * (volatility_sigma**2) * time_horizon_t
+            spread_component_liquidity = (2 / (gamma * time_horizon_t) if time_horizon_t > 0 else float('inf')) * np.log(1 + (gamma * time_horizon_t / k_param if k_param > 0 else float('inf'))) 
+            if k_param <=0 : spread_component_liquidity = float('inf') 
+            
+            model_calculated_spread_abs = spread_component_variance + spread_component_liquidity
+            
+            if not self.tick or self.tick <= 0:
+                self.logger.error("Tick size not available or invalid. Cannot apply tick-based spread limits or round prices.")
+                # Fallback to a simple percentage of mid_price if tick is not available for safety
+                if not (np.isfinite(model_calculated_spread_abs) and model_calculated_spread_abs > 0):
+                     model_calculated_spread_abs = mid_price * 0.001 # 0.1% of mid as a desperate fallback
+                # Cannot round or apply tick-based limits.
+                final_bid_price = reservation_price - model_calculated_spread_abs / 2
+                final_ask_price = reservation_price + model_calculated_spread_abs / 2
+                # Early exit if no tick size
+                bid_size_no_tick = self.calculate_optimal_size("bid", q, volatility_sigma)
+                ask_size_no_tick = self.calculate_optimal_size("ask", q, volatility_sigma)
+                return final_bid_price, final_ask_price, bid_size_no_tick, ask_size_no_tick
 
-            # Calculate reservation price
-            q = self.position_size / AVELLANEDA_CONFIG["position_limit"]
-            r = mid_price - q * AVELLANEDA_CONFIG["gamma"] * volatility**2 * AVELLANEDA_CONFIG["inventory_weight"]
+            # Apply tick-based min/max spread limits to the model-calculated absolute spread
+            min_abs_spread_from_config = min_spread_ticks_cfg * self.tick
+            max_abs_spread_from_config = max_spread_ticks_cfg * self.tick
+
+            if not (np.isfinite(model_calculated_spread_abs) and model_calculated_spread_abs > 0):
+                self.logger.warning(f"Model-calculated spread is not valid: {model_calculated_spread_abs}. Falling back to min_spread_ticks * self.tick ({min_abs_spread_from_config}).")
+                final_spread_abs = min_abs_spread_from_config
+            else:
+                # Clamp the model's absolute spread directly
+                clamped_model_spread_abs = model_calculated_spread_abs
+                if clamped_model_spread_abs < min_abs_spread_from_config:
+                    self.logger.debug(f"Model spread {clamped_model_spread_abs:.4f} < min_config_abs {min_abs_spread_from_config:.4f}. Using min_config_abs.")
+                    clamped_model_spread_abs = min_abs_spread_from_config
+                if max_abs_spread_from_config > 0 and max_abs_spread_from_config > min_abs_spread_from_config and clamped_model_spread_abs > max_abs_spread_from_config: # Ensure max is valid
+                    self.logger.debug(f"Model spread {clamped_model_spread_abs:.4f} > max_config_abs {max_abs_spread_from_config:.4f}. Using max_config_abs.")
+                    clamped_model_spread_abs = max_abs_spread_from_config
+                final_spread_abs = clamped_model_spread_abs
             
-            # Calculate optimal spread
-            spread = AVELLANEDA_CONFIG["gamma"] * volatility**2 + (2/AVELLANEDA_CONFIG["gamma"]) * \
-                    np.log(1 + AVELLANEDA_CONFIG["gamma"]/AVELLANEDA_CONFIG["k"])
-                    
-            # Apply spread limits with collar consideration
-            spread = min(max(spread, AVELLANEDA_CONFIG["min_spread"]), AVELLANEDA_CONFIG["max_spread"])
+            model_bid_price = reservation_price - final_spread_abs / 2
+            model_ask_price = reservation_price + final_spread_abs / 2
+
+            exchange_fee_rate = AVELLANEDA_CONFIG.get("exchange_fee_rate", 0.0001) 
+            desired_margin_rate = AVELLANEDA_CONFIG.get("desired_margin_rate_above_fee", 0.00025)
+            fee_margin_factor = exchange_fee_rate + desired_margin_rate
+            adjusted_bid_price = model_bid_price * (1 - fee_margin_factor)
+            adjusted_ask_price = model_ask_price * (1 + fee_margin_factor)
             
-            # Calculate initial bid and ask prices
-            bid_price = self.round_to_tick(r - spread/2)
-            ask_price = self.round_to_tick(r + spread/2)
+            final_bid_price = self.round_to_tick(adjusted_bid_price)
+            final_ask_price = self.round_to_tick(adjusted_ask_price)
             
-            # Ensure prices respect collar buffer
-            bid_price = min(bid_price, max_bid)
-            ask_price = max(ask_price, min_ask)
+            collar_buffer_pct = AVELLANEDA_CONFIG.get("collar_buffer_pct", 0.005) 
+            max_allowable_bid = mid_price * (1 - collar_buffer_pct) # Note: mid_price is used here for collar
+            min_allowable_ask = mid_price * (1 + collar_buffer_pct) # Note: mid_price is used here for collar
+
+            final_bid_price = min(final_bid_price, self.round_to_tick(max_allowable_bid)) # Round collar limits too
+            final_ask_price = max(final_ask_price, self.round_to_tick(min_allowable_ask)) # Round collar limits too
+
+            if final_bid_price >= final_ask_price:
+                self.logger.warning(f"Crossed book after all adjustments: Bid={final_bid_price}, Ask={final_ask_price}. Widening around reservation price using min_spread_ticks_cfg.")
+                # Fallback using min_spread_ticks_cfg around reservation_price or mid_price
+                fallback_spread_abs = min_spread_ticks_cfg * self.tick
+                
+                temp_bid = self.round_to_tick(reservation_price - fallback_spread_abs / 2)
+                temp_ask = self.round_to_tick(reservation_price + fallback_spread_abs / 2)
+                if temp_bid < temp_ask:
+                    final_bid_price, final_ask_price = temp_bid, temp_ask
+                else: 
+                    self.logger.warning(f"Still crossed with reservation price. Using mid_price ({mid_price}) for fallback spread centering.")
+                    final_bid_price = self.round_to_tick(mid_price - fallback_spread_abs / 2)
+                    final_ask_price = self.round_to_tick(mid_price + fallback_spread_abs / 2)
+                    if final_bid_price >= final_ask_price: # Final desperate measure
+                         final_ask_price = self.round_to_tick(final_bid_price + self.tick)
+
+            bid_size = self.calculate_optimal_size("bid", q, volatility_sigma)
+            ask_size = self.calculate_optimal_size("ask", q, volatility_sigma)
             
-            # Calculate optimal sizes with volatility adjustment
-            bid_size = self.calculate_optimal_size("bid", q, volatility)
-            ask_size = self.calculate_optimal_size("ask", q, volatility)
-            
-            # Log the calculations for debugging
-            logging.debug(f"Optimal quotes: bid={bid_price}, ask={ask_price}, bid_size={bid_size}, ask_size={ask_size}")
-            
-            return bid_price, ask_price, bid_size, ask_size
+            # Ensure price_decimals and size_decimals are available, e.g. from self.price_decimals / self.size_decimals if set on init
+            # Using hardcoded or BOT_CONFIG lookup for now if not class members
+            price_decimals = BOT_CONFIG.get("trading_strategy", {}).get("execution", {}).get("price_decimals", 2)
+            size_decimals = BOT_CONFIG.get("trading_strategy", {}).get("execution", {}).get("size_decimals", 3)
+
+            self.logger.debug(f"Optimal L0 Quotes: BidP={final_bid_price:.{price_decimals}f}, AskP={final_ask_price:.{price_decimals}f}, BidS={bid_size:.{size_decimals}f}, AskS={ask_size:.{size_decimals}f} | r={reservation_price:.2f}, final_spread_abs={final_spread_abs:.2f}, vol={volatility_sigma:.4f}, q={q:.4f}")
+            return final_bid_price, final_ask_price, bid_size, ask_size
             
         except Exception as e:
-            logging.error(f"Error calculating optimal quotes: {str(e)}")
+            self.logger.error(f"Error calculating optimal quotes: {str(e)}, Trace: {traceback.format_exc()}")
             return 0, 0, 0, 0
 
     def calculate_volatility(self) -> float:
-        """Calculate rolling volatility with improved error handling"""
+        """Calculate rolling volatility of log returns for the configured window."""
         try:
-            if len(self.price_history) < AVELLANEDA_CONFIG["vol_window"]:
-                return 0.0
+            vol_config = TRADING_CONFIG.get("volatility", {})
+            vol_window = vol_config.get("window") # Correctly sourced
+            vol_floor = vol_config.get("floor", 0.0001) # Min volatility (e.g. 0.01% if returns are daily)
+            vol_ceiling = vol_config.get("ceiling", 1.0)  # Max volatility (e.g. 100%)
+            # The annualization factor depends on how frequently price_history is updated and what T represents.
+            # If T (time_horizon in A-S) is 1 (representing 1 day), then volatility should be daily.
+            # If price_history has per-second data, need to sample or adjust. Assuming it aligns with T or is raw.
+            # For now, this returns standard deviation of log returns for the window. A-S will use time_horizon_t.
+
+            if vol_window is None or len(self.price_history) < vol_window:
+                return 0.0 
                 
-            prices = np.array(list(self.price_history))
+            # Use the most recent `vol_window` elements from the deque
+            prices_in_window = list(itertools.islice(self.price_history, max(0, len(self.price_history) - vol_window), len(self.price_history)))
+            if len(prices_in_window) < vol_window:
+                 self.logger.debug(f"Not enough price points in deque slice ({len(prices_in_window)}) for volatility window {vol_window}.")
+                 return 0.0
+
+            prices = np.array(prices_in_window)
             if np.any(prices <= 0):
-                logging.warning("Invalid prices in history")
+                self.logger.warning("Invalid (zero/negative) prices in history window for volatility.")
                 return 0.0
                 
-            returns = np.diff(np.log(prices[-AVELLANEDA_CONFIG["vol_window"]:]))
-            vol = np.std(returns) * np.sqrt(252 * 24 * 60 * 60)  # Annualized volatility
+            log_returns = np.diff(np.log(prices))
+            if log_returns.size == 0:
+                 self.logger.debug("Not enough price points (after diff) to calculate log returns for volatility.")
+                 return 0.0
+
+            calculated_vol_std = np.std(log_returns)
             
-            if not np.isfinite(vol):
-                logging.warning(f"Invalid volatility calculated: {vol}")
+            if not (np.isfinite(calculated_vol_std) and calculated_vol_std >= 0):
+                self.logger.warning(f"Volatility calculation resulted in non-finite/negative value: {calculated_vol_std}")
                 return 0.0
-                
-            return vol
+            
+            # Apply floor and ceiling
+            final_vol = max(vol_floor, min(calculated_vol_std, vol_ceiling))
+            self.logger.debug(f"Calculated volatility: {final_vol:.6f} (std of {log_returns.size} log returns, window: {vol_window})")
+            return final_vol
             
         except Exception as e:
-            logging.error(f"Error calculating volatility: {str(e)}")
+            self.logger.error(f"Error calculating volatility: {str(e)}, Trace: {traceback.format_exc()}")
             return 0.0
 
     def calculate_optimal_size(self, side: str, q: float, volatility: float) -> float:
@@ -2037,180 +2317,6 @@ class PerpQuoter:
             logging.error(f"Error validating order parameters: {str(e)}")
             return 0, 0
 
-    def calculate_signals(self) -> Dict[str, float]:
-        """Calculate trading signals with notional awareness"""
-        try:
-            if len(self.price_history) < SIGNAL_CONFIG["bbands_period"]:
-                return {}
-
-            prices = np.array(list(self.price_history))
-            
-            # Calculate available notional first
-            available_notional = self.calculate_available_notional()
-            if available_notional <= 0:
-                return {"composite": 0}  # No trading if no notional available
-            
-            signals = {
-                "bbands": self.calculate_bbands(prices),
-                "momentum": self.calculate_momentum(prices),
-                "volume_profile": self.calculate_volume_profile(),
-                "trend_strength": self.calculate_trend_strength(prices),
-                "volatility_signal": self.calculate_volatility_signal(),
-                "available_notional": available_notional
-            }
-            
-            # Calculate composite signal with notional consideration
-            signals["composite"] = self.calculate_composite_signal(signals)
-            
-            return signals
-            
-        except Exception as e:
-            logging.error(f"Error calculating signals: {str(e)}")
-            return {"composite": 0}
-
-    def calculate_composite_signal(self, signals: Dict[str, Any]) -> float:
-        """Calculate composite signal with position and notional limits"""
-        try:
-            weights = {
-                "bbands": 0.25,
-                "momentum": 0.20,
-                "volume_profile": 0.20,
-                "trend_strength": 0.20,
-                "volatility_signal": 0.15
-            }
-            
-            composite = 0
-            
-            # Bollinger Bands signal
-            bb = signals.get("bbands", {}).get("bb_position", 0.5)
-            bb_signal = 2 * (bb - 0.5)  # Normalize to [-1, 1]
-            composite += bb_signal * weights["bbands"]
-            
-            # Other signals
-            composite += signals.get("momentum", 0) * weights["momentum"]
-            composite += signals.get("volume_profile", 0) * weights["volume_profile"]
-            composite += signals.get("trend_strength", 0) * weights["trend_strength"]
-            composite += signals.get("volatility_signal", 0) * weights["volatility_signal"]
-            
-            # Normalize composite signal
-            composite = np.tanh(composite)
-            
-            # Apply notional-based dampening
-            available_notional = signals.get("available_notional", 0)
-            max_notional = INVENTORY_CONFIG["max_position_notional"]
-            notional_factor = min(1.0, available_notional / max_notional)
-            
-            return composite * notional_factor * SIGNAL_CONFIG["signal_size_dampening"]
-            
-        except Exception as e:
-            logging.error(f"Error calculating composite signal: {str(e)}")
-            return 0
-
-    def calculate_available_notional(self) -> float:
-        """Calculate remaining notional capacity"""
-        try:
-            if not self.ticker or self.ticker.mark_price <= 0:
-                return 0
-                
-            current_notional = abs(self.position_size * self.ticker.mark_price)
-            max_notional = INVENTORY_CONFIG["max_position_notional"]
-            
-            available = max(0, max_notional - current_notional)
-            # Add buffer to prevent exceeding limits
-            return available * SIGNAL_CONFIG["notional_utilization_threshold"]
-            
-        except Exception as e:
-            logging.error(f"Error calculating available notional: {str(e)}")
-            return 0
-
-    def calculate_bbands(self, prices: np.ndarray) -> Dict[str, float]:
-        """Calculate Bollinger Bands"""
-        try:
-            ma = np.mean(prices[-SIGNAL_CONFIG["bbands_period"]:])
-            std = np.std(prices[-SIGNAL_CONFIG["bbands_period"]:])
-            
-            upper = ma + (SIGNAL_CONFIG["bbands_std"] * std)
-            lower = ma - (SIGNAL_CONFIG["bbands_std"] * std)
-            
-            current_price = prices[-1]
-            bb_position = (current_price - lower) / (upper - lower)
-            
-            return {
-                "bb_position": bb_position,
-                "upper": upper,
-                "lower": lower
-            }
-            
-        except Exception as e:
-            logging.error(f"Error calculating Bollinger Bands: {str(e)}")
-            return {"bb_position": 0.5, "upper": 0, "lower": 0}
-
-    def calculate_momentum(self, prices: np.ndarray) -> float:
-        """Calculate price momentum"""
-        try:
-            momentum = (prices[-1] / prices[-SIGNAL_CONFIG["momentum_period"]] - 1)
-            return momentum
-        except Exception as e:
-            logging.error(f"Error calculating momentum: {str(e)}")
-            return 0
-
-    def calculate_volume_profile(self) -> float:
-        """Calculate volume profile signal"""
-        try:
-            if not hasattr(self, 'trade_history') or len(self.trade_history) < SIGNAL_CONFIG["volume_ma_period"]:
-                return 0
-                
-            recent_trades = self.trade_history[-SIGNAL_CONFIG["volume_ma_period"]:]
-            buy_volume = sum(t['amount'] for t in recent_trades if t['is_buy'])
-            sell_volume = sum(t['amount'] for t in recent_trades if not t['is_buy'])
-            
-            if buy_volume + sell_volume == 0:
-                return 0
-                
-            volume_imbalance = (buy_volume - sell_volume) / (buy_volume + sell_volume)
-            return volume_imbalance
-            
-        except Exception as e:
-            logging.error(f"Error calculating volume profile: {str(e)}")
-            return 0
-
-    def calculate_trend_strength(self, prices: np.ndarray) -> float:
-        """Calculate trend strength"""
-        try:
-            if len(prices) < 20:
-                return 0
-                
-            # Linear regression
-            x = np.arange(len(prices))
-            slope, _ = np.polyfit(x, prices, 1)
-            
-            # R-squared calculation
-            y_pred = slope * x + _
-            r_squared = 1 - (np.sum((prices - y_pred) ** 2) / np.sum((prices - np.mean(prices)) ** 2))
-            
-            return r_squared * np.sign(slope)
-            
-        except Exception as e:
-            logging.error(f"Error calculating trend strength: {str(e)}")
-            return 0
-
-    def calculate_volatility_signal(self) -> float:
-        """Calculate volatility-based signal"""
-        try:
-            if not self.ticker:
-                return 0
-                
-            current_atr = self.calculate_atr()
-            if current_atr == 0:
-                return 0
-                
-            volatility_ratio = current_atr / (self.ticker.mark_price * 0.01)  # Compare to 1% of price
-            return min(max(-1, volatility_ratio - 1), 1)  # Normalize to [-1, 1]
-            
-        except Exception as e:
-            logging.error(f"Error calculating volatility signal: {str(e)}")
-            return 0
-
 class ConfigValidator:
     @staticmethod
     def validate_config():
@@ -2226,58 +2332,6 @@ class ConfigValidator:
             POSITION_LIMITS["rebalance_threshold"] > 0 and POSITION_LIMITS["rebalance_threshold"] < 1
         ]
         return all(checks)
-
-def plot_pnl(time_history, pnl_history):
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=time_history, y=pnl_history, mode='lines', name='Cumulative PnL'))
-    
-    fig.update_layout(
-        title='Execution PnL Over Time',
-        xaxis_title='Time',
-        yaxis_title='Cumulative PnL',
-        xaxis=dict(tickmode='linear'),
-        yaxis=dict(title='PnL'),
-        showlegend=True
-    )
-    
-    fig.show()
-
-async def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s"
-    )
-    
-    import tracemalloc
-    tracemalloc.start()
-    
-    run = True
-    while run:
-        try:
-            thalex = th.Thalex(network=NETWORK)
-            perp_quoter = PerpQuoter(thalex)
-            tasks = [
-                asyncio.create_task(perp_quoter.listen_task()),
-                asyncio.create_task(perp_quoter.quote_task()),
-                asyncio.create_task(perp_quoter.log_pnl()),  # Add PnL logging task
-            ]
-            
-            logging.info(f"Starting on {NETWORK} {UNDERLYING=}")
-            await asyncio.gather(*tasks)
-            
-        except (websockets.ConnectionClosed, socket.gaierror) as e:
-            logging.error(f"Connection error ({e}). Reconnecting...")
-            await asyncio.sleep(1)
-        except KeyboardInterrupt:
-            run = False
-            logging.info("Shutting down...")
-        except Exception as e:
-            logging.exception("Unexpected error:")
-            await asyncio.sleep(1)
-
-    # Example condition to plot PnL
-    await asyncio.sleep(3600)  # Run for an hour
-    plot_pnl(perp_quoter.time_history, perp_quoter.pnl_history)  # Plot PnL after an hour
 
 if __name__ == "__main__":
     logging.basicConfig(
