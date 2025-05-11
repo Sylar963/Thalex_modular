@@ -23,6 +23,7 @@ from ..config.market_config import (
     MARKET_CONFIG,
     TRADING_CONFIG,
     RISK_LIMITS, # Changed from RISK_CONFIG
+    ORDERBOOK_CONFIG # Added import for ORDERBOOK_CONFIG
 )
 from ..thalex_logging import LoggerFactory # Added import
 
@@ -2322,14 +2323,14 @@ class ConfigValidator:
     def validate_config():
         """Validate configuration parameters"""
         checks = [
-            SPREAD > 0,
-            len(BID_SIZES) == len(ASK_SIZES),
-            POSITION_LIMITS["max_position"] > 0,
-            POSITION_LIMITS["max_notional"] > 0,
-            POSITION_LIMITS["stop_loss_pct"] > 0,
-            POSITION_LIMITS["base_take_profit_pct"] > POSITION_LIMITS["min_take_profit_pct"],
-            POSITION_LIMITS["max_take_profit_pct"] > POSITION_LIMITS["base_take_profit_pct"],
-            POSITION_LIMITS["rebalance_threshold"] > 0 and POSITION_LIMITS["rebalance_threshold"] < 1
+            TRADING_CONFIG["avellaneda"]["min_spread"] > 0, # Use TRADING_CONFIG for min_spread
+            len(ORDERBOOK_CONFIG["bid_sizes"]) == len(ORDERBOOK_CONFIG["ask_sizes"]), # Use ORDERBOOK_CONFIG
+            RISK_LIMITS["max_position"] > 0, # Use RISK_LIMITS directly
+            RISK_LIMITS["max_notional"] > 0, # Use RISK_LIMITS directly
+            RISK_LIMITS["stop_loss_pct"] > 0, # Use RISK_LIMITS directly
+            RISK_LIMITS.get("base_take_profit_pct", 0) > RISK_LIMITS.get("min_take_profit_pct", -1),
+            RISK_LIMITS.get("max_take_profit_pct", 0) > RISK_LIMITS.get("base_take_profit_pct", -1),
+            RISK_LIMITS.get("rebalance_threshold", 0) > 0 and RISK_LIMITS.get("rebalance_threshold", 0) < 1
         ]
         return all(checks)
 

@@ -1497,12 +1497,21 @@ class AvellanedaQuoter:
                 self.logger.info(f"Processing portfolio update")
                 await self.handle_portfolio_update(notification)
             elif channel == "account.trade_history":
-                self.logger.info(f"Processing trade update")
-                await self.handle_trade_update(notification)
+                self.logger.info(f"Processing trade update from channel: {channel}") # Added channel for clarity
+                if isinstance(notification, list):
+                    for trade_entry in notification: # Iterate if it's a list
+                        if isinstance(trade_entry, dict):
+                            await self.handle_trade_update(trade_entry)
+                        else:
+                            self.logger.warning(f"Skipping non-dict item in trade_history list: {trade_entry}")
+                elif isinstance(notification, dict): # Process if it's a single dict
+                    await self.handle_trade_update(notification)
+                else:
+                    self.logger.warning(f"Unexpected data type for trade_history notification: {type(notification)}")
             else:
                 self.logger.warning(f"Notification for unknown channel: {channel}")
         except Exception as e:
-            self.logger.error(f"Error processing notification: {str(e)}", exc_info=True)
+            self.logger.error(f"Error processing notification from channel {channel}: {str(e)}", exc_info=True) # Added channel
 
     async def handle_index_update(self, index_data: Dict):
         """Process index price updates"""

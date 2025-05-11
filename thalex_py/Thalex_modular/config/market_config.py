@@ -116,7 +116,8 @@ BOT_CONFIG = {
         "quote_lifetime": 30,           # Max lifetime for quotes in seconds
         "amend_threshold": 25,          # Price movement (in ticks) to trigger quote amendment
         "min_quote_interval": 2.0,      # Minimum interval between quote updates in seconds
-        "bid_sizes": [0.3, 0.5, 0.7, 0.9, 1.0, 1.2] # Size multipliers for bid side levels
+        "bid_sizes": [0.3, 0.5, 0.7, 0.9, 1.0, 1.2], # Size multipliers for bid side levels
+        "ask_sizes": [0.3, 0.5, 0.7, 0.9, 1.0, 1.2]  # Size multipliers for ask side levels (mirrors bid_sizes)
     },
     
     # Risk management
