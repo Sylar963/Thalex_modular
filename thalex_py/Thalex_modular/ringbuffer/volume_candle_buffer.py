@@ -1,11 +1,17 @@
 import numpy as np
 import time
 import threading
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, Any
 from datetime import datetime
 import logging
-from .fast_ringbuffer import FastRingBuffer
+from collections import deque
+import os
+import csv
 from ..thalex_logging import LoggerFactory
+
+TRADE_ID_CACHE_SIZE = 10000 # Define cache size
+SIGNAL_EVAL_LOG_MAX_SIZE = 1000 # Max in-memory signal events before older ones (if not written) are pushed out
+LOGS_DIR = "/home/aladhimarkets/Thalex_SimpleQuouter/logs" # User-provided log directory
 
 class VolumeCandle:
     """Simple container for volume-based candle data"""
@@ -62,6 +68,30 @@ class VolumeCandle:
 class VolumeBasedCandleBuffer:
     """Buffer for volume-based candles with predictive indicators"""
     
+    # --- Signal Calculation Constants ---
+    MIN_CANDLES_FOR_SIGNALS = 5
+    MOMENTUM_PRICE_FACTOR = 20.0
+    MOMENTUM_DELTA_SENSITIVITY_FACTOR = 2.0
+    REVERSAL_PRICE_CHANGE_FACTOR = 10.0
+    REVERSAL_DELTA_CHANGE_FACTOR = 5.0
+    VOLATILITY_PRICE_RANGE_FACTOR = 10.0
+    EXHAUSTION_DELTA_TREND_THRESHOLD = 0.2
+    EXHAUSTION_STRENGTH_FACTOR = 2.0
+    SIGNIFICANT_SIGNAL_CHANGE_THRESHOLD = 0.2
+    SIGNAL_LOGGING_FREQUENCY = 5 # For predictions_made % N
+
+    # --- Parameter Prediction Constants ---
+    GAMMA_ADJ_VOLATILITY_FACTOR = 0.4
+    GAMMA_ADJ_REVERSAL_FACTOR = 0.3
+    KAPPA_ADJ_VOLATILITY_FACTOR = -0.3 # Negative as it reduces market depth
+    RESERVATION_OFFSET_MOMENTUM_THRESHOLD = 0.2
+    RESERVATION_OFFSET_EXHAUSTION_THRESHOLD = 0.5
+    RESERVATION_OFFSET_MOMENTUM_FACTOR = 0.0003
+    RESERVATION_OFFSET_REVERSAL_THRESHOLD = 0.6
+    RESERVATION_OFFSET_REVERSAL_FACTOR = 0.0005 # Applied negatively to price_direction
+    TREND_DIRECTION_MOMENTUM_THRESHOLD = 0.3
+    VOL_ADJ_VOLATILITY_FACTOR = 0.4
+    
     def __init__(
         self,
         volume_threshold: float = 1.0,     # Volume required to complete a candle
@@ -72,7 +102,8 @@ class VolumeBasedCandleBuffer:
         instrument: str = None,            # Instrument to track
         use_exchange_data: bool = False,   # Whether to use exchange data
         fetch_interval_seconds: int = 60,  # How often to fetch exchange data
-        lookback_hours: int = 1            # How far back to look for historical data
+        lookback_hours: int = 1,           # How far back to look for historical data
+        evaluation_horizons: Optional[List[int]] = None # Added for signal evaluation
     ):
         # Configure logging
         self.logger = LoggerFactory.configure_component_logger(
@@ -91,7 +122,7 @@ class VolumeBasedCandleBuffer:
         self.current_candle = VolumeCandle()
         
         # Completed candles buffer
-        self.candles = []
+        self.candles = deque(maxlen=max_candles)
         self.max_candles = max_candles
         
         # Technical indicators
@@ -131,7 +162,17 @@ class VolumeBasedCandleBuffer:
         self._lock = threading.RLock()  # Reentrant lock for thread safety
         self._fetch_thread = None
         self._stop_event = threading.Event()
-        self._processed_trade_ids = set()  # Track processed trades to avoid duplicates
+        self._processed_trade_ids_set = set()
+        self._processed_trade_ids_queue = deque(maxlen=TRADE_ID_CACHE_SIZE)
+        
+        # --- Signal Evaluation Setup ---
+        self.evaluation_horizons = evaluation_horizons if evaluation_horizons else [1, 3, 5, 10] # Default horizons
+        self.signal_evaluation_log = deque(maxlen=SIGNAL_EVAL_LOG_MAX_SIZE)
+        self.signal_eval_log_file_path = os.path.join(LOGS_DIR, "signal_evaluation.csv")
+        self._setup_signal_eval_logger()
+        self.signal_eval_log_header_written = False
+        # Attempt to write header if file is new or empty
+        self._write_signal_eval_header_if_needed()
         
         # Start data fetching thread if needed
         if self.use_exchange_data and self.exchange_client and self.instrument:
@@ -143,6 +184,50 @@ class VolumeBasedCandleBuffer:
                 self.logger.warning("Exchange data requested but missing required parameters "
                                    f"(exchange_client: {exchange_client is not None}, "
                                    f"instrument: {instrument})")
+
+    def _setup_signal_eval_logger(self) -> None:
+        """Sets up a dedicated logger for signal evaluation CSV data."""
+        self.signal_eval_logger = logging.getLogger(__name__ + ".SignalEval")
+        # Prevent propagation to the root logger or other handlers like the main component logger
+        self.signal_eval_logger.propagate = False 
+        
+        # Ensure logs directory exists
+        if not os.path.exists(LOGS_DIR):
+            try:
+                os.makedirs(LOGS_DIR)
+                self.logger.info(f"Created logs directory: {LOGS_DIR}")
+            except OSError as e:
+                self.logger.error(f"Failed to create logs directory {LOGS_DIR}: {e}")
+                # If dir creation fails, logger won't be able to write. 
+                # Could disable this logger or let it fail silently on write attempt.
+                return
+
+        # Add file handler if not already present (e.g. during re-init or multiple instances)
+        if not any(isinstance(h, logging.FileHandler) and h.baseFilename == self.signal_eval_log_file_path for h in self.signal_eval_logger.handlers):
+            fh = logging.FileHandler(self.signal_eval_log_file_path, mode='a') # Append mode
+            # No formatter needed as we will write raw CSV lines
+            self.signal_eval_logger.addHandler(fh)
+            self.signal_eval_logger.setLevel(logging.INFO) # Or whatever level is appropriate
+
+    def _write_signal_eval_header_if_needed(self) -> None:
+        """Writes the CSV header if the file is new or empty."""
+        try:
+            file_exists_and_not_empty = os.path.exists(self.signal_eval_log_file_path) and os.path.getsize(self.signal_eval_log_file_path) > 0
+            if not file_exists_and_not_empty:
+                # Ensure consistent order of signal columns, matching data logging
+                signal_keys_sorted = sorted(self.signals.keys()) 
+                header = ['initial_timestamp', 'entry_price'] \
+                         + [f'signal_{s_name}' for s_name in signal_keys_sorted] \
+                         + sum([[f'future_price_h{h}', f'pnl_h{h}'] for h in self.evaluation_horizons], []) \
+                         + ['candles_completed_for_eval']
+                
+                with open(self.signal_eval_log_file_path, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(header)
+                self.signal_eval_log_header_written = True # Mark as written for this session
+                self.logger.info(f"Signal evaluation CSV header written to {self.signal_eval_log_file_path}")
+        except Exception as e:
+            self.logger.error(f"Failed to write signal evaluation CSV header: {e}")
 
     def update(self, price: float, volume: float, is_buy: bool, timestamp: int = None, trade_id: str = None) -> Optional[VolumeCandle]:
         """
@@ -160,17 +245,27 @@ class VolumeBasedCandleBuffer:
         """
         with self._lock:
             # Check for duplicate trade if ID is provided
-            if trade_id and trade_id in self._processed_trade_ids:
+            if trade_id and trade_id in self._processed_trade_ids_set:
                 self.logger.debug(f"Skipping duplicate trade {trade_id}")
                 return None
                 
             # Add to processed trades if ID provided
             if trade_id:
-                self._processed_trade_ids.add(trade_id)
-                # Limit size of processed trade IDs set
-                if len(self._processed_trade_ids) > 10000:
-                    # Keep only the most recent 5000 trade IDs
-                    self._processed_trade_ids = set(list(self._processed_trade_ids)[-5000:])
+                # If trade_id is new and the queue is already full, 
+                # the oldest item (at index 0 of the queue) will be evicted.
+                # We must remove this soon-to-be-evicted item from the set.
+                if trade_id not in self._processed_trade_ids_set and len(self._processed_trade_ids_queue) == TRADE_ID_CACHE_SIZE:
+                    evicted_id = self._processed_trade_ids_queue[0] # This is the item that will be pushed out
+                    self._processed_trade_ids_set.remove(evicted_id)
+                
+                # Add the new trade_id to the queue (and it's implicitly managed by maxlen)
+                # Add it to the set for fast lookups.
+                # If trade_id was already in the queue/set, this effectively does nothing for set, 
+                # and deque doesn't change order for existing items on append.
+                # If we want to move to end on re-occurrence, we'd need remove then append.
+                # For simple deduplication, this is okay.
+                self._processed_trade_ids_queue.append(trade_id) # Deque handles its own eviction if full
+                self._processed_trade_ids_set.add(trade_id) # Add/update in set
             
             # Set timestamp if not provided
             if timestamp is None:
@@ -198,9 +293,7 @@ class VolumeBasedCandleBuffer:
                 
                 # Add to buffer
                 self.candles.append(self.current_candle)
-                if len(self.candles) > self.max_candles:
-                    self.candles.pop(0)
-                    
+                
                 # Update indicators
                 self._update_indicators(completed_candle)
                 
@@ -222,8 +315,83 @@ class VolumeBasedCandleBuffer:
                 # Reset current candle
                 self.current_candle = VolumeCandle()
                 
+                # --- Update and log signal evaluations based on the newly completed candle ---
+                if completed_candle:
+                    self._update_and_log_signal_evaluations(completed_candle)
+                
             self._last_update_time = timestamp
             return completed_candle
+
+    def _update_and_log_signal_evaluations(self, current_completed_candle: VolumeCandle) -> None:
+        """
+        Iterates through pending signal evaluations, updates them with new candle data,
+        and logs them to CSV if all evaluation horizons are met.
+        """
+        # Iterate over a copy of the items if modifying deque, or manage indices carefully.
+        # Since we append to right and potentially remove from left later (if we cap strictly by CSV write),
+        # direct iteration should be fine for updating in place.
+        
+        items_to_log_and_remove_indices = []
+
+        for i, event in enumerate(self.signal_evaluation_log):
+            if not event['is_complete']:
+                event['candles_passed'] += 1
+                all_horizons_filled = True
+                for h in self.evaluation_horizons:
+                    if event['future_prices_at_horizon'][h] is None and event['candles_passed'] >= h:
+                        # If candles_passed is exactly h, this is the first time we can log this horizon.
+                        # If candles_passed > h (e.g. if a horizon was missed due to some issue or startup),
+                        # we might log it here too, or decide to only log if candles_passed == h.
+                        # For simplicity, let's assume current_completed_candle is the h-th candle after the signal.
+                        # This requires that _update_and_log_signal_evaluations is called for *every* completed candle.
+                        if event['candles_passed'] == h: # Ensure it's exactly the h-th candle
+                             event['future_prices_at_horizon'][h] = current_completed_candle.close_price
+                             # Basic P&L: (future_price - entry_price). 
+                             # Directionality (buy/sell based on signal) will be handled in Phase B analysis.
+                             event['pnl_at_horizon'][h] = current_completed_candle.close_price - event['entry_price']
+                    
+                    if event['future_prices_at_horizon'][h] is None:
+                        all_horizons_filled = False # Still waiting for data for this horizon
+                
+                if all_horizons_filled:
+                    event['is_complete'] = True
+                    # Prepare data for CSV logging
+                    row_data = [
+                        event['initial_timestamp'],
+                        event['entry_price']
+                    ]
+                    # Add signal values in a consistent order (sorted by key for example)
+                    # This order must match the header from _write_signal_eval_header_if_needed
+                    # self.signals.keys() in header writing implies a specific initial order.
+                    # For safety, let's sort keys from self.signals (used in header) and event signals.
+                    signal_keys_sorted = sorted(self.signals.keys()) # Matches header generation if signals keys are fixed
+                    for s_key in signal_keys_sorted:
+                        row_data.append(event['signals'].get(s_key, None)) # Use .get for safety
+                    
+                    for h in self.evaluation_horizons:
+                        row_data.append(event['future_prices_at_horizon'][h])
+                        row_data.append(event['pnl_at_horizon'][h])
+                    row_data.append(event['candles_passed']) # Actually, this is max_horizon when complete.
+                                                            # Let's log the actual max candles passed which is event['candles_passed']
+
+                    try:
+                        # Use a context manager for writing to ensure file is closed.
+                        # The logger's FileHandler keeps the file open, so direct write is also an option.
+                        # For simplicity with CSV, direct write via open() is fine here as it's one row.
+                        with open(self.signal_eval_log_file_path, 'a', newline='') as f:
+                            writer = csv.writer(f)
+                            writer.writerow(row_data)
+                        # Mark for removal if we want to strictly use deque as a temporary buffer
+                        # items_to_log_and_remove_indices.append(i) # Not removing for now, deque maxlen handles memory.
+                    except Exception as e:
+                        self.logger.error(f"Failed to write signal eval data to CSV: {e} for event {event}")
+        
+        # If we were to remove from deque after writing (not strictly needed due to maxlen):
+        # for i in sorted(items_to_log_and_remove_indices, reverse=True):
+        #     # This is complex with deque if removing from middle. Better to let maxlen handle it, 
+        #     # or only remove from left if they are guaranteed to be processed in order.
+        #     # Since `is_complete` flag is used, maxlen is the simplest memory management here.
+        pass # End of method
 
     def _initialize_exchange_data(self) -> None:
         """Initialize with historical exchange data"""
@@ -247,21 +415,35 @@ class VolumeBasedCandleBuffer:
             for trade in trades:
                 try:
                     # Extract trade data
-                    price = float(trade.get('price', 0))
-                    volume = float(trade.get('size', 0))
-                    is_buy = trade.get('side', '').lower() == 'buy'
-                    timestamp = int(trade.get('timestamp', 0))
-                    trade_id = str(trade.get('tradeId', ''))
-                    
-                    if price > 0 and volume > 0:
+                    parsed_trade = self._parse_trade_data(trade)
+                    if parsed_trade:
+                        price, volume, is_buy, timestamp, trade_id = parsed_trade
                         self.update(price, volume, is_buy, timestamp, trade_id)
-                except Exception as e:
-                    self.logger.error(f"Error processing historical trade: {str(e)}")
+                except Exception as e: # Should be caught by _parse_trade_data, but as a safeguard
+                    self.logger.error(f"Error processing historical trade: {str(e)} for trade {trade}")
                     
             self.logger.info(f"Historical data initialization complete, processed {len(trades)} trades")
             
         except Exception as e:
             self.logger.error(f"Error initializing exchange data: {str(e)}")
+
+    def _parse_trade_data(self, trade: Dict[str, Any]) -> Optional[Tuple[float, float, bool, int, str]]:
+        """Helper method to parse raw trade data."""
+        try:
+            price = float(trade.get('price', 0))
+            volume = float(trade.get('size', 0))
+            is_buy = trade.get('side', '').lower() == 'buy'
+            timestamp = int(trade.get('timestamp', 0))
+            trade_id = str(trade.get('tradeId', ''))
+
+            if price > 0 and volume > 0:
+                return price, volume, is_buy, timestamp, trade_id
+            else:
+                self.logger.warning(f"Invalid trade data (price/volume <= 0): {trade}")
+                return None
+        except Exception as e:
+            self.logger.error(f"Error parsing trade data: {trade}, Error: {str(e)}")
+            return None
 
     def _start_fetch_thread(self) -> None:
         """Start background thread to fetch exchange data periodically"""
@@ -309,16 +491,12 @@ class VolumeBasedCandleBuffer:
                         for trade in trades:
                             try:
                                 # Extract trade data
-                                price = float(trade.get('price', 0))
-                                volume = float(trade.get('size', 0))
-                                is_buy = trade.get('side', '').lower() == 'buy'
-                                timestamp = int(trade.get('timestamp', 0))
-                                trade_id = str(trade.get('tradeId', ''))
-                                
-                                if price > 0 and volume > 0:
+                                parsed_trade = self._parse_trade_data(trade)
+                                if parsed_trade:
+                                    price, volume, is_buy, timestamp, trade_id = parsed_trade
                                     self.update(price, volume, is_buy, timestamp, trade_id)
-                            except Exception as e:
-                                self.logger.error(f"Error processing exchange trade: {str(e)}")
+                            except Exception as e: # Should be caught by _parse_trade_data, but as a safeguard
+                                self.logger.error(f"Error processing exchange trade: {str(e)} for trade {trade}")
                 else:
                     self.logger.debug("No new exchange trades found")
                 
@@ -399,13 +577,13 @@ class VolumeBasedCandleBuffer:
         
     def _calculate_signals(self) -> None:
         """Calculate predictive signals from candle data"""
-        if len(self.candles) < 5:
+        if len(self.candles) < self.MIN_CANDLES_FOR_SIGNALS:
             return
         
         self.predictions_made += 1
             
         # Get recent candles
-        recent = self.candles[-5:]
+        recent = list(self.candles)[-self.MIN_CANDLES_FOR_SIGNALS:]
         
         # Save old signals for logging change
         old_signals = self.signals.copy()
@@ -416,7 +594,7 @@ class VolumeBasedCandleBuffer:
         
         # Combine price and volume momentum (volume confirming price or diverging)
         self.signals["momentum"] = np.clip(
-            price_momentum * 20 * np.sign(delta_momentum) * min(1.0, abs(delta_momentum) * 2),
+            price_momentum * self.MOMENTUM_PRICE_FACTOR * np.sign(delta_momentum) * min(1.0, abs(delta_momentum) * self.MOMENTUM_DELTA_SENSITIVITY_FACTOR),
             -1.0, 1.0
         )
         
@@ -430,7 +608,7 @@ class VolumeBasedCandleBuffer:
             price_change = abs(recent[-1].close_price / recent[0].open_price - 1.0)
             delta_change = abs(self.delta_ema["fast"] - self.delta_ema["slow"])
             
-            self.signals["reversal"] = min(1.0, price_change * 10) * min(1.0, delta_change * 5)
+            self.signals["reversal"] = min(1.0, price_change * self.REVERSAL_PRICE_CHANGE_FACTOR) * min(1.0, delta_change * self.REVERSAL_DELTA_CHANGE_FACTOR)
         else:
             self.signals["reversal"] = 0.0
         
@@ -439,15 +617,16 @@ class VolumeBasedCandleBuffer:
         volume_variability = np.std([c.volume for c in recent]) / np.mean([c.volume for c in recent])
         delta_variability = np.std([c.delta_ratio for c in recent])
         
-        self.signals["volatility"] = min(1.0, (price_range * 10 + volume_variability + delta_variability) / 3)
+        self.signals["volatility"] = min(1.0, (price_range * self.VOLATILITY_PRICE_RANGE_FACTOR + volume_variability + delta_variability) / 3)
         
         # 4. Exhaustion Signal - detects potential buying/selling exhaustion
         # Delta dropping while price continues in same direction
         recent_deltas = [c.delta_ratio for c in recent]
         delta_trend = recent_deltas[-1] - recent_deltas[0]
         
-        if (price_direction > 0 and delta_trend < -0.2) or (price_direction < 0 and delta_trend > 0.2):
-            self.signals["exhaustion"] = min(1.0, abs(delta_trend) * 2)
+        if (price_direction > 0 and delta_trend < -self.EXHAUSTION_DELTA_TREND_THRESHOLD) or \
+           (price_direction < 0 and delta_trend > self.EXHAUSTION_DELTA_TREND_THRESHOLD):
+            self.signals["exhaustion"] = min(1.0, abs(delta_trend) * self.EXHAUSTION_STRENGTH_FACTOR)
         else:
             self.signals["exhaustion"] = 0.0
             
@@ -459,7 +638,7 @@ class VolumeBasedCandleBuffer:
         signal_change = sum(abs(self.signals[k] - old_signals[k]) for k in self.signals.keys())
         
         # Always log on significant changes or periodically
-        if signal_change > 0.2 or self.predictions_made % 5 == 0:
+        if signal_change > self.SIGNIFICANT_SIGNAL_CHANGE_THRESHOLD or self.predictions_made % self.SIGNAL_LOGGING_FREQUENCY == 0:
             self.logger.info(
                 f"Prediction #{self.predictions_made} - Signals: "
                 f"Momentum={self.signals['momentum']:.2f} ({old_signals['momentum']:.2f}), "
@@ -468,6 +647,22 @@ class VolumeBasedCandleBuffer:
                 f"Exhaustion={self.signals['exhaustion']:.2f} ({old_signals['exhaustion']:.2f}), "
                 f"Strength={self.last_signal_strength:.2f}"
             )
+        
+        # --- Log signal event for evaluation ---
+        # This assumes _calculate_signals is called right after a candle completes
+        # and `self.candles[-1]` is that completed candle.
+        if self.candles:
+            completed_candle = self.candles[-1] # The candle that just completed and triggered these signals
+            signal_event = {
+                'initial_timestamp': completed_candle.end_time,
+                'entry_price': completed_candle.close_price,
+                'signals': self.signals.copy(), 
+                'candles_passed': 0,
+                'future_prices_at_horizon': {h: None for h in self.evaluation_horizons},
+                'pnl_at_horizon': {h: None for h in self.evaluation_horizons},
+                'is_complete': False
+            }
+            self.signal_evaluation_log.append(signal_event)
     
     def get_predicted_parameters(self) -> Dict[str, float]:
         """
@@ -476,7 +671,7 @@ class VolumeBasedCandleBuffer:
         Returns:
             Dictionary of predicted parameters for the Avellaneda model
         """
-        if len(self.candles) < 5:
+        if len(self.candles) < self.MIN_CANDLES_FOR_SIGNALS:
             return {
                 "gamma_adjustment": 0.0,
                 "kappa_adjustment": 0.0,
@@ -493,34 +688,34 @@ class VolumeBasedCandleBuffer:
         
         # 1. Gamma adjustment (risk aversion)
         # Increase gamma when volatility expected to rise or around reversal points
-        gamma_adj = volatility * 0.4 + reversal * 0.3
+        gamma_adj = volatility * self.GAMMA_ADJ_VOLATILITY_FACTOR + reversal * self.GAMMA_ADJ_REVERSAL_FACTOR
         
         # 2. Kappa adjustment (market depth)
         # Reduce market depth parameter when market might be thin (high volatility)
-        kappa_adj = -volatility * 0.3
+        kappa_adj = volatility * self.KAPPA_ADJ_VOLATILITY_FACTOR # Factor is already negative
         
         # 3. Reservation price offset (predictive skew)
         # Skew reservation price based on momentum and potential reversals
         reservation_offset = 0.0
-        if abs(momentum) > 0.2:
+        if abs(momentum) > self.RESERVATION_OFFSET_MOMENTUM_THRESHOLD:
             # Strong momentum - skew in direction of momentum
-            if exhaustion < 0.5:  # Not showing exhaustion yet
-                reservation_offset = momentum * 0.0003  # Small adjustment
-        elif reversal > 0.6:
+            if exhaustion < self.RESERVATION_OFFSET_EXHAUSTION_THRESHOLD:  # Not showing exhaustion yet
+                reservation_offset = momentum * self.RESERVATION_OFFSET_MOMENTUM_FACTOR  # Small adjustment
+        elif reversal > self.RESERVATION_OFFSET_REVERSAL_THRESHOLD:
             # Strong reversal signal - skew against recent price direction
-            last_candle = self.candles[-1]
-            prev_candle = self.candles[-2]
+            last_candle = list(self.candles)[-1]
+            prev_candle = list(self.candles)[-2]
             price_direction = np.sign(last_candle.close_price - prev_candle.close_price)
-            reservation_offset = -price_direction * reversal * 0.0005
+            reservation_offset = -price_direction * reversal * self.RESERVATION_OFFSET_REVERSAL_FACTOR
         
         # 4. Trend direction (-1, 0, 1)
         trend_direction = 0
-        if abs(momentum) > 0.3:
+        if abs(momentum) > self.TREND_DIRECTION_MOMENTUM_THRESHOLD:
             trend_direction = np.sign(momentum)
         
         # 5. Volatility adjustment
         # Increase volatility estimate when expecting higher volatility
-        vol_adj = volatility * 0.4
+        vol_adj = volatility * self.VOL_ADJ_VOLATILITY_FACTOR
         
         return {
             "gamma_adjustment": gamma_adj,
@@ -561,7 +756,7 @@ class VolumeBasedCandleBuffer:
             return 0.0
             
         # Get prediction made N candles ago
-        old_prediction = self.candles[-prediction_horizon].close_price
+        old_prediction = list(self.candles)[-prediction_horizon].close_price
         pred_direction = self.signals["momentum"] * prediction_horizon
         
         # Calculate if prediction was correct

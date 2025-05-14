@@ -115,6 +115,9 @@ class AvellanedaQuoter:
             high_frequency=False  # Only market maker needs high frequency logging
         )
         
+        # Initialize tasks dictionary early to prevent AttributeError in shutdown
+        self.tasks: Dict[str, Optional[asyncio.Task]] = {}
+        
         # Set up the market maker components
         self.market_maker = AvellanedaMarketMaker(exchange_client=self.thalex)
         self.order_manager = OrderManager(self.thalex)
@@ -475,9 +478,30 @@ class AvellanedaQuoter:
                 self.logger.info("Logging in to Thalex API...")
                 # Retrieve credentials from configuration
                 network = MARKET_CONFIG["network"]
+
+                # ---- TEMPORARY DIAGNOSTIC PRINTS ----
+                # Import os here if not already imported at the top of the file for os.getenv
+                # For key_ids and private_keys, they are already imported from models.keys
+                # which itself uses os.getenv. So direct os.getenv here is for cross-checking.
+                import os 
+                self.logger.info(f"DEBUG: Attempting to load keys for network: {network}")
+                self.logger.info(f"DEBUG: Key ID directly from env for TEST: {os.getenv('THALEX_TEST_API_KEY_ID')}")
+                self.logger.info(f"DEBUG: Private Key directly from env for TEST (first 40, last 40 chars): {str(os.getenv('THALEX_TEST_PRIVATE_KEY'))[:40] if os.getenv('THALEX_TEST_PRIVATE_KEY') else 'None'} ... {str(os.getenv('THALEX_TEST_PRIVATE_KEY'))[-40:] if os.getenv('THALEX_TEST_PRIVATE_KEY') else 'None'}")
+                self.logger.info(f"DEBUG: Key ID directly from env for PROD: {os.getenv('THALEX_PROD_API_KEY_ID')}")
+                # ---- END TEMPORARY DIAGNOSTIC PRINTS ----
+
                 key_id = key_ids[network]
                 private_key = private_keys[network]
+
+                # ---- TEMPORARY DIAGNOSTIC PRINTS ----
+                self.logger.info(f"DEBUG: Retrieved key_id for {network}: {key_id} (type: {type(key_id)})")
+                self.logger.info(f"DEBUG: Retrieved private_key for {network} (first 40, last 40 chars): {str(private_key)[:40] if private_key else 'None'} ... {str(private_key)[-40:] if private_key else 'None'} (type: {type(private_key)})")
+                # ---- END TEMPORARY DIAGNOSTIC PRINTS ----
                 
+                if key_id is None or private_key is None:
+                    self.logger.error(f"CRITICAL: API Key ID or Private Key is None for network {network}. Check .env file and variable names (e.g., THALEX_TEST_API_KEY_ID).")
+                    return False
+
                 # Login to the API
                 await self.thalex.login(key_id, private_key, id=CALL_IDS["login"])
                 self.logger.info("Login successful")
@@ -1244,8 +1268,30 @@ class AvellanedaQuoter:
             order = self.order_pool.get()
             
             # Update only the fields defined in the Order class
-            order.id = data.get("id", 0)
-            order.price = float(data.get("limitPrice", 0))
+            # Use 'order_id' from exchange, fallback to 'client_order_id', then 'id', then default 0
+            order_id_str = data.get("order_id")
+            if order_id_str:
+                # Thalex order IDs can be hex strings, internal Order.id is int.
+                # For now, let's try to use client_order_id if available, as it's usually int.
+                # If the internal model expects a string ID, this needs adjustment.
+                # Assuming Order.id is an int, client_order_id is preferred if it's an int.
+                client_id = data.get("client_order_id", data.get("cid"))
+                if client_id is not None:
+                    try:
+                        order.id = int(client_id)
+                    except ValueError:
+                        self.logger.warning(f"Could not convert client_order_id '{client_id}' to int. Using 0 or hash for order.id from order_id '{order_id_str}'.")
+                        # If client_id is not an int, we might need to hash order_id_str or handle string IDs.
+                        # For simplicity now, if client_id isn't int, use 0 or a hash.
+                        # Let's try to keep it simple and use 0 if client_id is not a simple int.
+                        # A more robust solution might involve mapping string exchange IDs to internal integer IDs.
+                        order.id = data.get("id", 0) # Fallback to 'id' or 0 if client_id is complex
+                else: # No client_order_id, use 'id' or 0
+                    order.id = data.get("id", 0)
+            else: # No 'order_id', try 'client_order_id', then 'id'
+                order.id = data.get("client_order_id", data.get("id", 0))
+
+            order.price = float(data.get("price", data.get("limitPrice", 0))) # Use "price", fallback to "limitPrice"
             order.amount = float(data.get("amount", 0))
             
             # Handle status safely - converting string to enum
@@ -1253,36 +1299,48 @@ class AvellanedaQuoter:
             try:
                 order.status = OrderStatus(status_str)
             except (ValueError, KeyError):
-                order.status = OrderStatus.PENDING
+                order.status = OrderStatus.PENDING # Default to PENDING if status is unknown
                 
-            order.direction = data.get("side", None)
+            order.direction = data.get("direction", data.get("side", None)) # Use "direction", fallback to "side"
             
             # Store additional data as attributes (optional)
             # These won't be part of the core Order class but will be accessible
-            order.client_id = data.get("clientId")
-            order.instrument_id = data.get("instrumentId")
-            order.type = data.get("type")
-            order.filled = float(data.get("filled", 0))
-            order.timestamp = time.time()
+            order.client_id = data.get("client_order_id", data.get("clientId")) # Use client_order_id as well
+            order.instrument_id = data.get("instrument_name", data.get("instrumentId")) # Use instrument_name
+            order.type = data.get("order_type", data.get("type")) # Use order_type
+            # 'filled' might be 'filled_amount' in the Thalex message
+            order.filled = float(data.get("filled_amount", data.get("filled", 0)))
+            order.timestamp = data.get("create_time", time.time()) # Use create_time if available
             
             return order
             
         except Exception as e:
-            self.logger.error(f"Error creating order from data: {str(e)}")
+            self.logger.error(f"Error creating order from data: {str(e)}", exc_info=True)
             # Fall back to creating a new order if pool fails
+            # Ensure fallback also uses the corrected keys
+            order_id_val = data.get("client_order_id", data.get("id", 0))
+            try:
+                order_id_val = int(order_id_val)
+            except (ValueError, TypeError):
+                 # Fallback for ID if it's not int (e.g. use 'order_id' hash or default to 0)
+                order_id_val = 0 # simplified fallback
+                if "order_id" in data: # if actual exchange id exists, we could log it
+                    self.logger.warning(f"Fallback ID creation: using 0, exchange order_id was {data['order_id']}")
+
+
             order = Order(
-                id=data.get("id", 0),
-                price=float(data.get("limitPrice", 0)),
+                id=order_id_val,
+                price=float(data.get("price", data.get("limitPrice", 0))),
                 amount=float(data.get("amount", 0)),
                 status=OrderStatus.PENDING,  # Use safe default
-                direction=data.get("side", None)
+                direction=data.get("direction", data.get("side", None))
             )
             # Add additional attributes
-            order.client_id = data.get("clientId")
-            order.instrument_id = data.get("instrumentId")
-            order.type = data.get("type")
-            order.filled = float(data.get("filled", 0))
-            order.timestamp = time.time()
+            order.client_id = data.get("client_order_id", data.get("clientId"))
+            order.instrument_id = data.get("instrument_name", data.get("instrumentId"))
+            order.type = data.get("order_type", data.get("type"))
+            order.filled = float(data.get("filled_amount", data.get("filled", 0)))
+            order.timestamp = data.get("create_time", time.time())
             
             return order
 

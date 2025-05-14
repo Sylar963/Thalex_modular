@@ -11,8 +11,17 @@ from datetime import datetime
 import uuid
 import json
 
-from .hedge_config import HedgeConfig
+# Added: Imports for environment variable loading and Thalex network/keys
+import os
+from dotenv import load_dotenv
+from thalex import Network
 from ...thalex_logging import LoggerFactory
+from ...models.keys import key_ids, private_keys # For API credentials
+
+from .hedge_config import HedgeConfig
+
+# Added: Load environment variables from .env file
+load_dotenv()
 
 # Enum for order types
 class OrderType(Enum):
@@ -151,22 +160,29 @@ class HedgeExecution:
         if exchange_client is not None:
             self.logger.info(f"Using provided exchange client of type {type(exchange_client).__name__}")
         else:
-            # Only create a new client if none was provided and we have credentials
-            if config.exchange_api_key and config.exchange_api_secret:
+            # Determine network and attempt to load keys from environment
+            current_network = Network.TEST if config.use_testnet else Network.PROD
+            api_key_id = key_ids.get(current_network)
+            api_private_key = private_keys.get(current_network)
+
+            if api_key_id and api_private_key:
                 try:
                     from ...exchange_clients.thalex_client import ThalexClient
-                    self.logger.info("Creating Thalex exchange client")
+                    self.logger.info(f"Creating Thalex exchange client for {current_network.name}")
                     self.exchange_client = ThalexClient(
-                        api_key=config.exchange_api_key,
-                        api_secret=config.exchange_api_secret,
-                        testnet=config.use_testnet
+                        api_key=api_key_id,
+                        api_secret=api_private_key,
+                        testnet=config.use_testnet  # or (current_network == Network.TEST)
                     )
                     self.logger.info("Thalex exchange client created successfully")
                 except Exception as e:
                     self.logger.error(f"Failed to create exchange client: {e}")
                     self.exchange_client = None
             else:
-                self.logger.warning("No exchange client provided and no API credentials configured")
+                self.logger.warning(
+                    f"No exchange client provided and API credentials for {current_network.name} "
+                    f"not found in environment variables (THALEX_{current_network.name}_API_KEY_ID, "
+                    f"THALEX_{current_network.name}_PRIVATE_KEY).")
                 self.exchange_client = None
             
         # Active orders and fill history
