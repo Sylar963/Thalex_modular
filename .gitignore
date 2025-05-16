@@ -62,8 +62,7 @@ Thumbs.db
 .venv
 
 # Sensitive data
-**/keys.py
-!**/keys_template.py
+
 
 # Testing
 .coverage

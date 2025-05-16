@@ -6,7 +6,7 @@ High-performance market maker using the Avellaneda-Stoikov model
 
 # Added: Load environment variables from .env file at the very beginning
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(override=True)
 
 import asyncio
 import signal

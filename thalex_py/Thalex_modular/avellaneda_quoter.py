@@ -284,7 +284,8 @@ class AvellanedaQuoter:
         
     async def _handle_risk_breach(self, reason: str, price_at_breach: Optional[float]):
         """Handles actions to take when a risk limit is breached."""
-        self.logger.critical(f"RISK LIMIT BREACHED: {reason}. Price at check: {price_at_breach:.2f if price_at_breach is not None else 'N/A'}")
+        price_display = f"{price_at_breach:.2f}" if price_at_breach is not None else "N/A"
+        self.logger.critical(f"RISK LIMIT BREACHED: {reason}. Price at check: {price_display}")
         if not self.active_trading:
             self.logger.info("Trading already halted, risk breach handling skipped further action to prevent re-entry.")
             return
@@ -479,24 +480,113 @@ class AvellanedaQuoter:
                 # Retrieve credentials from configuration
                 network = MARKET_CONFIG["network"]
 
-                # ---- TEMPORARY DIAGNOSTIC PRINTS ----
-                # Import os here if not already imported at the top of the file for os.getenv
-                # For key_ids and private_keys, they are already imported from models.keys
-                # which itself uses os.getenv. So direct os.getenv here is for cross-checking.
-                import os 
-                self.logger.info(f"DEBUG: Attempting to load keys for network: {network}")
-                self.logger.info(f"DEBUG: Key ID directly from env for TEST: {os.getenv('THALEX_TEST_API_KEY_ID')}")
-                self.logger.info(f"DEBUG: Private Key directly from env for TEST (first 40, last 40 chars): {str(os.getenv('THALEX_TEST_PRIVATE_KEY'))[:40] if os.getenv('THALEX_TEST_PRIVATE_KEY') else 'None'} ... {str(os.getenv('THALEX_TEST_PRIVATE_KEY'))[-40:] if os.getenv('THALEX_TEST_PRIVATE_KEY') else 'None'}")
-                self.logger.info(f"DEBUG: Key ID directly from env for PROD: {os.getenv('THALEX_PROD_API_KEY_ID')}")
-                # ---- END TEMPORARY DIAGNOSTIC PRINTS ----
+                key_id_raw = key_ids[network]
+                private_key_raw = private_keys[network]
 
-                key_id = key_ids[network]
-                private_key = private_keys[network]
+                # self.logger.info(f"PHASE 0.5 DEBUG: Raw key_id from models.keys: '{key_id_raw}' (type: {type(key_id_raw)})")
+                # if private_key_raw and isinstance(private_key_raw, str):
+                #     self.logger.info(f"PHASE 0.5 DEBUG: Raw private_key from models.keys (len: {len(private_key_raw)}): '{private_key_raw[:100]}...{private_key_raw[-100:] if len(private_key_raw) > 200 else private_key_raw}'")
+                # elif private_key_raw:
+                #     self.logger.info(f"PHASE 0.5 DEBUG: Raw private_key from models.keys is not a string (type: {type(private_key_raw)})")
+                # else:
+                #     self.logger.info(f"PHASE 0.5 DEBUG: Raw private_key from models.keys is None or empty.")
 
-                # ---- TEMPORARY DIAGNOSTIC PRINTS ----
-                self.logger.info(f"DEBUG: Retrieved key_id for {network}: {key_id} (type: {type(key_id)})")
-                self.logger.info(f"DEBUG: Retrieved private_key for {network} (first 40, last 40 chars): {str(private_key)[:40] if private_key else 'None'} ... {str(private_key)[-40:] if private_key else 'None'} (type: {type(private_key)})")
-                # ---- END TEMPORARY DIAGNOSTIC PRINTS ----
+                key_id = key_id_raw
+                private_key = private_key_raw
+
+                # ++++ STRIP POTENTIAL QUOTES ++++
+                if key_id and isinstance(key_id, str):
+                    original_key_id_for_log = key_id
+                    stripped_something = True
+                    while stripped_something:
+                        stripped_something = False
+                        if ((key_id.startswith('"') and key_id.endswith('"')) or \
+                           (key_id.startswith("'") and key_id.endswith("'"))) and len(key_id) >= 2:
+                            key_id = key_id[1:-1]
+                            stripped_something = True
+                        # Check for triple quotes as well, though less common for key IDs
+                        elif key_id.startswith('"""') and key_id.endswith('"""') and len(key_id) >= 6:
+                            key_id = key_id[3:-3]
+                            stripped_something = True
+                    # if original_key_id_for_log != key_id:
+                    #     self.logger.info(f"PHASE 1.5 DEBUG: Iteratively stripped quotes from key_id. Original: '{original_key_id_for_log}', New: '{key_id}'")
+
+
+                if private_key and isinstance(private_key, str):
+                    original_private_key_for_log_start = private_key[:70] # For logging comparison
+                    
+                    stripped_something_pk = True
+                    while stripped_something_pk:
+                        stripped_something_pk = False
+                        # Handle \"\"\"key\"\"\"
+                        if private_key.startswith('"""') and private_key.endswith('"""') and len(private_key) >= 6:
+                            private_key = private_key[3:-3]
+                            stripped_something_pk = True
+                            # self.logger.info("PHASE 1.5 DEBUG: Iteratively stripped triple quotes from private_key.")
+                            continue # Restart loop for potentially nested quotes like \"\"\"\"key\"\"\"\"
+                        # Handle \"key\" or \'key\'
+                        if ((private_key.startswith('"') and private_key.endswith('"')) or \
+                           (private_key.startswith("'") and private_key.endswith("'"))) and len(private_key) >= 2:
+                            private_key = private_key[1:-1]
+                            stripped_something_pk = True
+                            # self.logger.info("PHASE 1.5 DEBUG: Iteratively stripped single/double quotes from private_key.")
+                            continue
+                    
+                    # if private_key[:70] != original_private_key_for_log_start :
+                    #      self.logger.info(f"PHASE 1.5 DEBUG: Private key after iterative quote stripping (first 70 chars): '{private_key[:70]}...'")
+                    
+                    # After stripping all quotes, trim whitespace that might have been inside quotes
+                    # e.g. \"  \\nKEY\\n  \" -> KEY
+                    original_len_before_strip = len(private_key)
+                    private_key = private_key.strip()
+                    # if len(private_key) != original_len_before_strip:
+                    #     self.logger.info(f"PHASE 1.5 DEBUG: Private key after final .strip() (first 70 chars): '{private_key[:70]}...'")
+                # ++++ END STRIP POTENTIAL QUOTES ++++
+
+                # ++++ ENHANCED PRIVATE KEY DIAGNOSTICS (Phase 1) ++++
+                # self.logger.info(f"PHASE 1 DEBUG: Retrieved key_id for {network}: {key_id} (type: {type(key_id)})")
+                if private_key:
+                    # pk_len = len(private_key)
+                    # Show more characters, ensure we don't go out of bounds for short keys
+                    # pk_start_slice = min(80, pk_len)
+                    # pk_end_slice = min(80, pk_len)
+                    
+                    # pk_start = str(private_key)[:pk_start_slice]
+                    
+                    # pk_middle_start_offset = max(0, pk_len // 2 - 40)
+                    # pk_middle_end_offset = min(pk_len, pk_middle_start_offset + 80) # Read 80 chars from middle
+                    # pk_middle = str(private_key)[pk_middle_start_offset:pk_middle_end_offset]
+                    
+                    # pk_end = str(private_key)[-pk_end_slice:]
+                    
+                    # self.logger.info(f"PHASE 1 DEBUG: Private Key for {network} (Length: {pk_len})")
+                    # self.logger.info(f"PHASE 1 DEBUG: PK START ({pk_start_slice} chars): {pk_start}")
+                    # self.logger.info(f"PHASE 1 DEBUG: PK MIDDLE (approx {len(pk_middle)} chars): ...{pk_middle}...")
+                    # self.logger.info(f"PHASE 1 DEBUG: PK END ({pk_end_slice} chars): {pk_end}")
+                    # self.logger.info(f"PHASE 1 DEBUG: PK Type: {type(private_key)}")
+                    
+                    # Check for common issues
+                    # if "\\\\n" in private_key: # Check for literal \\n
+                    #     self.logger.warning("PHASE 1 DEBUG: Private key string CONTAINS LITERAL '\\\\n' sequences! This is likely incorrect for .env loading.")
+                    # elif "\\n" in private_key: # Check for literal \\n
+                    #     self.logger.warning("PHASE 1 DEBUG: Private key string CONTAINS LITERAL '\\n' sequences! This is likely incorrect for .env loading.")
+                    
+                    # if private_key.count("-----BEGIN RSA PRIVATE KEY-----") > 1:
+                    #     self.logger.warning("PHASE 1 DEBUG: Private key string CONTAINS '-----BEGIN RSA PRIVATE KEY-----' MORE THAN ONCE!")
+                    # if private_key.count("-----END RSA PRIVATE KEY-----") > 1:
+                    #      self.logger.warning("PHASE 1 DEBUG: Private key string CONTAINS '-----END RSA PRIVATE KEY-----' MORE THAN ONCE!")
+                    
+                    # Check start and end after stripping whitespace from the whole key, then from the end of the value
+                    # This helps identify if the .env loader added extra quotes or if the value itself is bad
+                    # stripped_private_key = private_key.strip()
+                    # if not stripped_private_key.startswith("-----BEGIN RSA PRIVATE KEY-----"):
+                    #     self.logger.warning("PHASE 1 DEBUG: Stripped Private key string DOES NOT properly START with PEM marker.")
+                    # if not stripped_private_key.endswith("-----END RSA PRIVATE KEY-----"):
+                    #     self.logger.warning("PHASE 1 DEBUG: Stripped Private key string DOES NOT properly END with PEM marker.")
+                    pass # Keep the if private_key block for structure, but content is commented
+                else:
+                    self.logger.error(f"PHASE 1 DEBUG: Private Key for {network} is None!") # Keep this error for critical failure
+                # ++++ END ENHANCED PRIVATE KEY DIAGNOSTICS (Phase 1) ++++
                 
                 if key_id is None or private_key is None:
                     self.logger.error(f"CRITICAL: API Key ID or Private Key is None for network {network}. Check .env file and variable names (e.g., THALEX_TEST_API_KEY_ID).")
@@ -633,6 +723,11 @@ class AvellanedaQuoter:
             # Close shared memory resources
             try:
                 self.logger.info("Cleaning up shared memory resources...")
+                if hasattr(self, 'shared_market_data_struct') and self.shared_market_data_struct is not None:
+                    self.logger.info("Deleting reference to SharedMarketData ctypes structure.")
+                    del self.shared_market_data_struct # Explicitly delete the ctypes structure
+                    self.shared_market_data_struct = None
+
                 if hasattr(self, 'shm_obj') and self.shm_obj:
                     try:
                         self.shm_obj.close()
@@ -1540,7 +1635,7 @@ class AvellanedaQuoter:
             # Handle different channel types - Support both old and new formats
             if channel.startswith("ticker."):
                 self.logger.info(f"Processing ticker update for {channel}")
-                await self.handle_ticker_update(notification)
+                await self.handle_ticker_update(notification, channel_name=channel)
             elif channel.startswith("price_index."):
                 self.logger.info(f"Processing price index update")
                 await self.handle_index_update(notification)
@@ -1915,17 +2010,48 @@ class AvellanedaQuoter:
                 self.logger.warning(f"Found existing orders before placing quotes: {active_bids_count} bids, {active_asks_count} asks")
                 self.logger.warning(f"Cancelling all existing orders to ensure clean order book")
                 await self.cancel_quotes("Refreshing order book")
-                # Brief pause to allow cancellations to process
-                await asyncio.sleep(0.5)
+                
+                # Configurable sleep duration for first cancellation attempt
+                cancel_sleep_1_ms = TRADING_CONFIG.get("execution", {}).get("cancel_confirm_sleep_1_ms", 500)
+                await asyncio.sleep(cancel_sleep_1_ms / 1000.0)
                 
                 # Verify orders were cancelled
-                if len(self.order_manager.active_bids) > 0 or len(self.order_manager.active_asks) > 0:
-                    self.logger.error(f"Failed to cancel all orders. Still have {len(self.order_manager.active_bids)} bids and {len(self.order_manager.active_asks)} asks")
-                    # Force another cancellation
+                current_active_bids_after_cancel = len(self.order_manager.active_bids)
+                current_active_asks_after_cancel = len(self.order_manager.active_asks)
+                if current_active_bids_after_cancel > 0 or current_active_asks_after_cancel > 0:
+                    self.logger.error(
+                        f"Failed to cancel all orders after first attempt. Still have "
+                        f"{current_active_bids_after_cancel} bids and {current_active_asks_after_cancel} asks. "
+                        f"Attempting emergency cancellation."
+                    )
                     await self.cancel_quotes("Emergency cancellation")
-                    await asyncio.sleep(1.0)  # Longer wait time
+
+                    # Configurable sleep duration for second (emergency) cancellation attempt
+                    cancel_sleep_2_ms = TRADING_CONFIG.get("execution", {}).get("cancel_confirm_sleep_2_ms", 1000)
+                    await asyncio.sleep(cancel_sleep_2_ms / 1000.0)
+            
+                    # Final check after emergency cancellation
+                    final_bids_count = len(self.order_manager.active_bids)
+                    final_asks_count = len(self.order_manager.active_asks)
+                    if final_bids_count > 0 or final_asks_count > 0:
+                        self.logger.critical(
+                            f"CRITICAL: Failed to cancel all orders even after emergency attempt. "
+                            f"Still have {final_bids_count} bids and {final_asks_count} asks. "
+                            f"This is a high-risk state. Halting quote placement for this cycle."
+                        )
+                        # Clear current_quotes as they won't be placed.
+                        # self.current_quotes is set by the caller (update_quotes or handle_trade_update).
+                        # If place_quotes is called from handle_trade_update, self.current_quotes might not be set yet
+                        # to these specific bid_quotes, ask_quotes.
+                        # The most consistent action is to ensure that if we abort, any notion of "current quotes to be placed"
+                        # is invalidated if some component relies on self.current_quotes reflecting *placed* or *attempted* quotes.
+                        # However, self.current_quotes is typically what *was* generated.
+                        # The primary goal here is to not proceed with placing new orders.
+                        return # Stop placing quotes for this cycle if stuck
             
             # Store current quotes before sending to properly track what was sent
+            # This is important if place_quotes is called from handle_trade_update,
+            # as update_quotes sets self.current_quotes before calling, but handle_trade_update does not.
             self.current_quotes = (bid_quotes, ask_quotes)
             
             # Reset tracking variables to ensure clean state

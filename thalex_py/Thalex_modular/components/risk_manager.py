@@ -340,7 +340,7 @@ class RiskManager:
             elif self.entry_price <= 0 and self.position_size != 0: # Critical fallback if no price info
                  self.logger.error("Cannot perform accurate risk check without a valid price. Breaching for safety.")
                  if self.on_risk_limit_breached:
-                     self.on_risk_limit_breached("Critical: No valid price for risk check", 0.0)
+                     await self.on_risk_limit_breached("Critical: No valid price for risk check", 0.0)
                  return False # Breach for safety
             source_of_price = "internal last known/entry price"
 
@@ -358,7 +358,7 @@ class RiskManager:
                 self.logger.warning(reason)
                 self.limit_breaches["position_size"] += 1
                 if self.on_risk_limit_breached:
-                    self.on_risk_limit_breached(reason, price_for_check) # Pass the price used for context
+                    await self.on_risk_limit_breached(reason, price_for_check) # Pass the price used for context
                 return False # False means breach
                 
             # 2. Notional value limit (uses calculated_position_value)
@@ -370,7 +370,7 @@ class RiskManager:
                 self.logger.warning(reason)
                 self.limit_breaches["notional_value"] += 1
                 if self.on_risk_limit_breached:
-                    self.on_risk_limit_breached(reason, price_for_check)
+                    await self.on_risk_limit_breached(reason, price_for_check)
                 return False
                 
             # 3. Drawdown limit (uses drawdown_at_check_price)
@@ -384,7 +384,7 @@ class RiskManager:
                 self.logger.warning(reason)
                 self.limit_breaches["drawdown"] += 1
                 if self.on_risk_limit_breached:
-                    self.on_risk_limit_breached(reason, price_for_check)
+                    await self.on_risk_limit_breached(reason, price_for_check)
                 return False
                 
             return True # True means OK
@@ -392,7 +392,7 @@ class RiskManager:
         except Exception as e:
             self.logger.error(f"Error checking risk limits: {str(e)}")
             if self.on_risk_limit_breached:
-                self.on_risk_limit_breached(f"Error during risk check: {str(e)}", price_for_check if price_for_check else 0.0)
+                await self.on_risk_limit_breached(f"Error during risk check: {str(e)}", price_for_check if price_for_check else 0.0)
             return False  # Default to safety (breach) in case of errors
 
     def register_callback(self, event_type: str, callback: Callable[[str, float], Any]) -> None:
