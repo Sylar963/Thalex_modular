@@ -63,14 +63,14 @@ class AvellanedaMarketMaker:
         
         # NEW: Volume candle buffer for predictive analysis
         self.volume_buffer = VolumeBasedCandleBuffer(
-            volume_threshold=TRADING_CONFIG.get("volume_candle", {}).get("threshold", 1.0),
-            max_candles=TRADING_CONFIG.get("volume_candle", {}).get("max_candles", 100),
-            max_time_seconds=TRADING_CONFIG.get("volume_candle", {}).get("max_time_seconds", 300),
+            volume_threshold=TRADING_CONFIG["volume_candle"].get("threshold", 1.0),
+            max_candles=TRADING_CONFIG["volume_candle"].get("max_candles", 100),
+            max_time_seconds=TRADING_CONFIG["volume_candle"].get("max_time_seconds", 300),
             exchange_client=exchange_client,
             instrument=None,  # Will be set via set_instrument method
-            use_exchange_data=TRADING_CONFIG.get("volume_candle", {}).get("use_exchange_data", False),
-            fetch_interval_seconds=TRADING_CONFIG.get("volume_candle", {}).get("fetch_interval_seconds", 60),
-            lookback_hours=TRADING_CONFIG.get("volume_candle", {}).get("lookback_hours", 1)
+            use_exchange_data=TRADING_CONFIG["volume_candle"].get("use_exchange_data", False),
+            fetch_interval_seconds=TRADING_CONFIG["volume_candle"].get("fetch_interval_seconds", 60),
+            lookback_hours=TRADING_CONFIG["volume_candle"].get("lookback_hours", 1)
         )
         
         # NEW: Predictive state tracking - initialize at the start to avoid None issues
@@ -85,9 +85,9 @@ class AvellanedaMarketMaker:
         
         # Add parameters for real-time grid updates
         self.last_prediction_time = time.time()
-        self.prediction_interval = TRADING_CONFIG.get("volume_candle", {}).get("prediction_update_interval", 10.0)
+        self.prediction_interval = TRADING_CONFIG["volume_candle"].get("prediction_update_interval", 10.0)
         self.last_grid_update_time = time.time()
-        self.grid_update_interval = 3.0  # Update grid every 3 seconds
+        self.grid_update_interval = TRADING_CONFIG["quoting"].get("grid_update_interval", 3.0)
         self.force_grid_update = False
         
         self.logger.info("Avellaneda market maker initialized")
@@ -99,10 +99,10 @@ class AvellanedaMarketMaker:
         
         # Add critical missing parameters
         self.position_limit = TRADING_CONFIG["avellaneda"]["position_limit"]  # Position limit
-        self.base_spread_factor = 1.0  # Base spread multiplier
-        self.market_impact_factor = 0.5  # Market impact multiplier
-        self.inventory_factor = 0.5  # Inventory adjustment factor
-        self.volatility_multiplier = 0.2  # Volatility multiplier
+        self.base_spread_factor = TRADING_CONFIG["avellaneda"].get("base_spread_factor", 1.0)  # Base spread multiplier
+        self.market_impact_factor = TRADING_CONFIG["avellaneda"].get("market_impact_factor", 0.5)  # Market impact multiplier
+        self.inventory_factor = TRADING_CONFIG["avellaneda"].get("inventory_factor", 0.5)  # Inventory adjustment factor
+        self.volatility_multiplier = TRADING_CONFIG["avellaneda"].get("volatility_multiplier", 0.2)  # Volatility multiplier
         self.market_state = "normal"  # Market state: normal, trending, ranging
         
         # Market making state
@@ -427,7 +427,7 @@ class AvellanedaMarketMaker:
         """
         try:
             # Start with a minimum spread baseline based on tick size
-            min_spread_ticks = ORDERBOOK_CONFIG.get("min_spread", 5)
+            min_spread_ticks = ORDERBOOK_CONFIG["min_spread"]
             
             # Ensure tick_size is valid
             if self.tick_size <= 0:
@@ -756,53 +756,30 @@ class AvellanedaMarketMaker:
             # Debug: Log all ticker attributes
             self.logger.debug(f"Ticker data: {vars(ticker) if hasattr(ticker, '__dict__') else 'No ticker data'}")
             
-            # Make sure mark_price is not zero before calculations
             mark_price = getattr(ticker, 'mark_price', 0)
             if mark_price <= 0:
-                self.logger.error(f"Invalid mark price: {mark_price}")
+                self.logger.error(f"Invalid mark price from ticker: {mark_price}, cannot generate quotes.")
                 return [], []
-                
-            # Debug all calculations to find division by zero
-            try:
-                bid_price = ticker.best_bid_price if hasattr(ticker, 'best_bid_price') and ticker.best_bid_price else mark_price * 0.999
-                self.logger.debug(f"Calculated bid_price: {bid_price}")
-            except Exception as e:
-                self.logger.error(f"Error calculating bid_price: {str(e)}")
+
+            if ticker.best_bid_price is None or ticker.best_ask_price is None:
+                self.logger.warning(
+                    f"Ticker missing best_bid_price ({ticker.best_bid_price}) or best_ask_price ({ticker.best_ask_price}). Cannot generate quotes reliably."
+                )
                 return [], []
-                
-            try:
-                ask_price = ticker.best_ask_price if hasattr(ticker, 'best_ask_price') and ticker.best_ask_price else mark_price * 1.001
-                self.logger.debug(f"Calculated ask_price: {ask_price}")
-            except Exception as e:
-                self.logger.error(f"Error calculating ask_price: {str(e)}")
+
+            bid_price = ticker.best_bid_price
+            ask_price = ticker.best_ask_price
+
+            if not (bid_price and ask_price and bid_price > 0 and ask_price > 0 and ask_price > bid_price):
+                self.logger.error(f"Invalid BBO prices from ticker: bid={bid_price}, ask={ask_price}. Cannot generate quotes.")
+                return [], []
+
+            mid_price = (bid_price + ask_price) / 2
+            if mid_price <= 0:
+                self.logger.error(f"Calculated mid_price ({mid_price}) is invalid. Cannot generate quotes.")
                 return [], []
             
-            # Safety check for zero prices
-            if not bid_price or not ask_price or bid_price <= 0 or ask_price <= 0:
-                self.logger.error(f"Invalid prices: bid={bid_price}, ask={ask_price}")
-                # Return empty quotes
-                return [], []
-                
-            try:
-                # Extra validation to ensure both prices are numeric and positive
-                bid_price = float(bid_price)
-                ask_price = float(ask_price)
-                
-                # Ensure we're not using zero or negative values
-                if bid_price <= 0:
-                    self.logger.warning(f"Invalid bid price {bid_price}, using fallback")
-                    bid_price = mark_price * 0.999 if mark_price > 0 else 1.0
-                
-                if ask_price <= 0:
-                    self.logger.warning(f"Invalid ask price {ask_price}, using fallback")
-                    ask_price = mark_price * 1.001 if mark_price > 0 else 1.01
-                
-                # Now calculate mid price with validated values
-                mid_price = (bid_price + ask_price) / 2
-                self.logger.debug(f"Calculated mid_price: {mid_price}")
-            except Exception as e:
-                self.logger.error(f"Error calculating mid_price: {str(e)}")
-                return [], []
+            self.logger.debug(f"Using BBO for mid_price: bid={bid_price}, ask={ask_price}, mid={mid_price}")
             
             # Update market mid price
             self.last_mid_price = mid_price
@@ -872,7 +849,7 @@ class AvellanedaMarketMaker:
             
             # Enforce minimum spread 
             try:
-                min_spread_ticks = ORDERBOOK_CONFIG.get("min_spread", 2)
+                min_spread_ticks = ORDERBOOK_CONFIG["min_spread"]
                 min_spread = min_spread_ticks * self.tick_size
                 actual_spread = base_ask_price - base_bid_price
                 
@@ -1240,7 +1217,7 @@ class AvellanedaMarketMaker:
                     return True
             
             # 4. Check for position-based update (significant position needs more frequent updates)
-            position_check_interval = 5  # Check every 5 seconds with significant position
+            position_check_interval = TRADING_CONFIG["quoting"].get("position_check_interval", 5.0)
             significant_position_threshold = 0.05
             
             if abs(self.position_size) > significant_position_threshold and current_time - self.last_position_check > position_check_interval:
@@ -1288,8 +1265,8 @@ class AvellanedaMarketMaker:
         
         # Get min_size from trading config if available
         try:
-            if 'trading_strategy' in TRADING_CONFIG and 'avellaneda' in TRADING_CONFIG['trading_strategy']:
-                min_quote_size = max(0.01, TRADING_CONFIG['trading_strategy']['avellaneda'].get('base_size', 0.01))
+            if 'avellaneda' in TRADING_CONFIG: # Check if 'avellaneda' key exists
+                min_quote_size = max(0.01, TRADING_CONFIG["avellaneda"].get('base_size', 0.01))
         except (KeyError, TypeError):
             self.logger.warning("Could not get min_size from config, using default of 0.01")
         

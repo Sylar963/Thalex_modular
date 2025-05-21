@@ -51,7 +51,7 @@ POSITION_LIMITS = RISK_LIMITS # Changed from RISK_CONFIG["limits"]
 # Construct QUOTING_CONFIG from modern config sources
 _quoting_config_source = {
     # From TRADING_CONFIG["avellaneda"]
-    "min_spread": TRADING_CONFIG.get("avellaneda", {}).get("min_spread"),
+    "min_spread": ORDERBOOK_CONFIG.get("min_spread"),
     "max_spread": TRADING_CONFIG.get("avellaneda", {}).get("max_spread"),
     "adverse_selection_threshold": TRADING_CONFIG.get("avellaneda", {}).get("adverse_selection_threshold"), # For amend_threshold mapping
     "size_multipliers": TRADING_CONFIG.get("avellaneda", {}).get("size_multipliers"), # For base_levels logic
@@ -206,8 +206,8 @@ class Ticker:
     """Ticker data structure"""
     def __init__(self, data: Dict[str, Any]):
         self.mark_price: float = float(data["mark_price"])
-        self.best_bid_price: Optional[float] = float(data["best_bid_price"]) if "best_bid_price" in data else None
-        self.best_ask_price: Optional[float] = float(data["best_ask_price"]) if "best_ask_price" in data else None
+        self.best_bid_price: Optional[float] = float(data["best_bid_price"]) if data.get("best_bid_price") is not None else None
+        self.best_ask_price: Optional[float] = float(data["best_ask_price"]) if data.get("best_ask_price") is not None else None
         self.index: float = float(data["index"]) if "index" in data else 0.0
         self.mark_ts: float = float(data["mark_timestamp"]) if "mark_timestamp" in data else time.time()
         self.funding_rate: float = float(data["funding_rate"]) if "funding_rate" in data else 0.0
@@ -268,11 +268,11 @@ class PerpQuoter:
         self.ticker = None
         self.instruments = []
         self.perp_instrument_name = None
-        self.tick = 0
-        self.position_size = 0
-        self.entry_price = 0
-        self.realized_pnl = 0
-        self.unrealized_pnl = 0
+        # self.tick = 0 # Replaced by Optional[float] below
+        # self.position_size = 0 # Replaced by float below
+        # self.entry_price = 0 # Replaced by Optional[float] below
+        # self.realized_pnl = 0 # Replaced by float below
+        # self.unrealized_pnl = 0 # Replaced by float below
         
         # Initialize operation semaphore with concurrency limit
         self.operation_semaphore = asyncio.Semaphore(TRADING_CONFIG["quoting"]["max_pending_operations"])
@@ -284,8 +284,8 @@ class PerpQuoter:
         self.perp_name: Optional[str] = None
         
         # Position management
-        self.position_size = 0.0
-        self.entry_price = None  # Initialize as None to distinguish between no position and zero price
+        self.position_size: float = 0.0
+        self.entry_price: Optional[float] = None  # Initialize as None to distinguish between no position and zero price
         self.last_rebalance = 0
         
         # Initialize price tracking
@@ -296,9 +296,6 @@ class PerpQuoter:
         self.price_history = deque(maxlen=100)
         self.last_alert_time = {}
         self.quoting_enabled = True
-        # Add to existing init
-        self.highest_profit = 0.0
-        self.trailing_stop_active = False
         self.entry_prices = {}  # Dictionary to track entry prices for partial positions
         # Add parameters for Avellaneda-Stoikov model
         self.gamma = 0.1  # Risk aversion parameter
@@ -310,13 +307,10 @@ class PerpQuoter:
         self.time_history = []  # List to store timestamps for plotting
         
         # Add PnL tracking attributes
-        self.realized_pnl = 0.0
-        self.unrealized_pnl = 0.0
-        self.cumulative_pnl = 0.0
+        self.realized_pnl: float = 0.0
+        self.unrealized_pnl: float = 0.0
+        self.cumulative_pnl: float = 0.0
         self.trade_history = []
-        self.take_profit_orders = {}  # Track take profit orders
-        self.executed_take_profits = set()  # Track which levels have been executed
-        self.highest_profit_levels = {}  # Track highest profit for each trailing stop level
         self.pending_operations = set()
         self.last_operation_times = {}
         self.last_quote_task = 0
@@ -324,19 +318,24 @@ class PerpQuoter:
         self.last_position_check = 0
         self.last_rebalance_time = 0
         self.last_stop_loss = 0
-        self.last_take_profit = 0
+        # self.last_take_profit = 0 # Removed
         self.last_close_attempt = 0
         self.last_emergency_close = 0
-        self.orders_lock = asyncio.Lock()  # Add this line
+        self.orders_lock = asyncio.Lock()
         
-        # Add these new attributes
+        # Attributes for new time-based take profit
+        self.position_entry_time: Optional[float] = None
+        self.take_profit_duration_seconds: int = 30
+        self.other_leg_pnl_placeholder: float = 0.0  # Needs to be updated externally by strategy
+        self.last_take_profit_check_time: float = 0.0
+        
         self.last_inventory_update = time.time()
         self.inventory_holding_cost = 0.0
         self.inventory_imbalance = 0.0
         self.logger = LoggerFactory.configure_component_logger(
             "perp_quoter", 
             log_file="perp_quoter.log",
-            high_frequency=False # Assuming PerpQuoter doesn't need HFT logging by default
+            high_frequency=False
         )
 
     def round_to_tick(self, value):
@@ -915,7 +914,7 @@ class PerpQuoter:
                 await self.adjust_quotes(quotes)
                 
                 # Non-blocking tasks
-                asyncio.create_task(self.manage_take_profit())
+                # asyncio.create_task(self.manage_take_profit()) # REMOVED OLD CALL
                 asyncio.create_task(self.cleanup_completed_orders())
 
             except Exception as e:
@@ -927,16 +926,44 @@ class PerpQuoter:
         msg = await self.thalex.receive()
         msg = json.loads(msg)
         assert msg["id"] == CALL_ID_INSTRUMENTS
+        
+        target_underlying = UNDERLYING # From market_config
+        target_label = LABEL         # From market_config
+        
+        instrument_found = False
         for i in msg["result"]:
-            if i["type"] == "perpetual" and i["underlying"] == UNDERLYING:
+            instrument_matches = False
+            instrument_name_from_api = i.get("instrument_name", "")
+            api_label = i.get("label", "")
+            api_type = i.get("type", "")
+            api_underlying = i.get("underlying", "")
+
+            # Attempt to match based on configured label and underlying/instrument_name
+            if target_label == "P" and api_type == "perpetual" and api_underlying == target_underlying:
+                instrument_matches = True
+            elif target_label == "F" and api_type == "future" and instrument_name_from_api == target_underlying:
+                # For futures, instrument_name is often the same as configured underlying (e.g., BTC-21MAY25)
+                instrument_matches = True
+            elif api_label == target_label and instrument_name_from_api == target_underlying:
+                # Generic fallback: if API label and API instrument_name match config
+                instrument_matches = True
+            
+            if instrument_matches:
                 self.tick = i["tick_size"]
-                self.perp_name = i["instrument_name"]
+                self.perp_name = instrument_name_from_api 
+                self.logger.info(f"Selected instrument: {self.perp_name} with tick size: {self.tick} based on Underlying: {target_underlying} and Label: {target_label}")
+                instrument_found = True
                 return
-        assert False  # Perp not found
+
+        if not instrument_found:
+            self.logger.error(f"Target instrument not found for Underlying: {target_underlying} and Label: {target_label}. Available: {msg['result']}")
+            assert False, f"Instrument not found for {target_underlying} with label {target_label}"
 
     async def listen_task(self):
         await self.thalex.connect()
         await self.await_instruments()
+        self.market_maker.set_tick_size(self.tick)
+        self.market_maker.set_instrument(self.perp_name)
         await self.thalex.login(key_ids[NETWORK], private_keys[NETWORK], id=CALL_ID_LOGIN)
         await self.thalex.set_cancel_on_disconnect(6, id=CALL_ID_SET_COD)
         await self.thalex.private_subscribe(["session.orders", "account.portfolio", "account.trade_history"], id=CALL_ID_SUBSCRIBE)
@@ -1086,30 +1113,36 @@ class PerpQuoter:
             logging.error(f"Error in orders_callback: {str(e)}\nTrace: {traceback.format_exc()}")
 
     def portfolio_callback(self, portfolio: List[Dict]):
-        """Handle portfolio updates with improved drift handling"""
-        for position in portfolio:
-            instrument = position["instrument_name"]
-            new_position = float(position["position"])  # Ensure float conversion
-            old_position = self.portfolio.get(instrument, 0)
+        """Handle portfolio updates with improved drift handling and position entry time tracking."""
+        for position_data in portfolio: # Renamed to avoid conflict
+            instrument = position_data["instrument_name"]
+            new_position = float(position_data["position"])
+            old_position = self.portfolio.get(instrument, 0.0) # Ensure default is float
             self.portfolio[instrument] = new_position
             
             if instrument == self.perp_name:
-                # Use a smaller threshold for drift detection
+                # Update position_entry_time
+                if old_position == 0 and new_position != 0:
+                    self.position_entry_time = time.time()
+                    self.logger.info(f"New position detected for {self.perp_name}. Entry time set to: {self.position_entry_time}")
+                elif old_position != 0 and new_position == 0:
+                    self.position_entry_time = None # Reset when position is closed
+                    self.logger.info(f"Position for {self.perp_name} closed. Entry time reset.")
+
                 drift = abs(self.position_size - new_position)
-                if drift > 0.001:  # Reduced from 1e-6 to 0.001 for more practical threshold
-                    logging.info(f"Position adjustment: internal={self.position_size}, portfolio={new_position}")
+                if drift > 0.001:
+                    self.logger.info(f"Position adjustment: internal={self.position_size}, portfolio={new_position}")
                     self.position_size = new_position
                     
-                    # Update entry price if needed
-                    if new_position != 0 and (self.entry_price is None or self.entry_price <= 0):
-                        if self.ticker and self.ticker.mark_price > 0:
-                            self.entry_price = self.round_to_tick(self.ticker.mark_price)
-                            logging.info(f"Updated entry price to {self.entry_price}")
+                if new_position != 0 and (self.entry_price is None or self.entry_price <= 0):
+                    if self.ticker and self.ticker.mark_price > 0:
+                        self.entry_price = self.round_to_tick(self.ticker.mark_price)
+                        self.logger.info(f"Updated entry price to {self.entry_price}")
             
-            # Monitor significant position changes
-            if abs(new_position - old_position) > 0.001:
-                logging.info(f"Position changed: {old_position:.3f} -> {new_position:.3f}")
-                asyncio.create_task(self.check_risk_limits())
+            if abs(new_position - old_position) > 0.001: # Check for all instruments
+                self.logger.info(f"Portfolio change for {instrument}: {old_position:.3f} -> {new_position:.3f}")
+                if instrument == self.perp_name: # Only check risk limits for the main instrument
+                     asyncio.create_task(self.check_risk_limits())
 
     def order_from_data(self, data: Dict) -> Order:
         return Order(
@@ -1263,181 +1296,6 @@ class PerpQuoter:
         # Ensure price is aligned with tick size
         return self.round_to_tick(price)
 
-    def calculate_dynamic_take_profit(self) -> float:
-        """Calculate take profit based on market conditions"""
-        base_tp = POSITION_LIMITS["base_take_profit_pct"]
-        
-        # Adjust based on volatility (ATR)
-        atr = self.calculate_atr()
-        volatility_scalar = min(2.0, max(0.5, atr / self.ticker.mark_price))
-        
-        # Adjust based on trend strength (Z-score)
-        zscore = abs(self.calculate_zscore())
-        trend_scalar = min(1.5, max(0.7, zscore / 2))
-        
-        # Calculate final take profit
-        dynamic_tp = base_tp * volatility_scalar * trend_scalar
-        
-        # Clamp to min/max bounds
-        return min(
-            POSITION_LIMITS["max_take_profit_pct"],
-            max(POSITION_LIMITS["min_take_profit_pct"], dynamic_tp)
-        )
-
-    async def manage_take_profit(self):
-        """Enhanced take profit management with multiple levels"""
-        if self.position_size == 0:
-            self.trailing_stop_active = False
-            self.highest_profit = 0.0
-            self.executed_take_profits.clear()
-            self.highest_profit_levels.clear()
-            return
-
-        try:
-            current_pnl_pct = self.calculate_position_pnl()
-            
-            # Cancel any existing take profit orders if price moved significantly
-            await self.cleanup_take_profit_orders()
-            
-            # Handle layered take profits
-            await self.handle_layered_take_profits(current_pnl_pct)
-            
-            # Handle multiple trailing stops
-            await self.handle_trailing_stops(current_pnl_pct)
-            
-        except Exception as e:
-            logging.error(f"Error in take profit management: {str(e)}")
-
-    async def handle_layered_take_profits(self, current_pnl_pct: float):
-        """Handle multiple take profit levels"""
-        if not self.ticker or not self.position_size:
-            return
-
-        for level in POSITION_LIMITS["take_profit_levels"]:
-            level_pct = level["percentage"]
-            level_size = level["size"]
-            
-            if level_pct not in self.executed_take_profits and current_pnl_pct >= level_pct:
-                # Calculate the exact amount for this level
-                amount = abs(self.position_size * level_size)
-                # Round to nearest valid amount
-                amount = round(amount * 1000) / 1000  # Round to 0.001
-                
-                if amount >= 0.001:  # Minimum order size
-                    try:
-                        direction = th.Direction.SELL if self.position_size > 0 else th.Direction.BUY
-                        price = self.calculate_take_profit_price(level_pct)
-                        
-                        order_id = self.client_order_id
-                        await self.thalex.insert(
-                            direction=direction,
-                            instrument_name=self.perp_name,
-                            amount=amount,
-                            price=price,
-                            client_order_id=order_id,
-                            id=order_id
-                        )
-                        self.client_order_id += 1
-                        
-                        self.take_profit_orders[order_id] = {
-                            "level": level_pct,
-                            "amount": amount,
-                            "price": price
-                        }
-                        self.executed_take_profits.add(level_pct)
-                        
-                        logging.info(f"Take profit order placed: {amount} @ {price} (Level: {level_pct*100}%)")
-                        
-                    except Exception as e:
-                        logging.error(f"Error placing take profit order: {str(e)}")
-
-    async def handle_trailing_stops(self, current_pnl_pct: float):
-        """Handle multiple trailing stop levels"""
-        for level in POSITION_LIMITS["trailing_stop_levels"]:
-            activation = level["activation"]
-            distance = level["distance"]
-            
-            if current_pnl_pct >= activation:
-                # Update highest profit for this level
-                if activation not in self.highest_profit_levels:
-                    self.highest_profit_levels[activation] = current_pnl_pct
-                elif current_pnl_pct > self.highest_profit_levels[activation]:
-                    self.highest_profit_levels[activation] = current_pnl_pct
-                    
-                # Check if trailing stop is hit
-                trailing_stop_level = self.highest_profit_levels[activation] - distance
-                if current_pnl_pct < trailing_stop_level:
-                    await self.execute_trailing_stop(activation, current_pnl_pct)
-                    break  # Exit after first trailing stop hit
-
-    async def execute_trailing_stop(self, activation: float, current_pnl_pct: float):
-        """Execute trailing stop with proper amount alignment"""
-        try:
-            # Calculate remaining position size
-            remaining_size = abs(self.position_size)
-            if remaining_size < 0.001:  # Check minimum order size
-                return
-            
-            # Round to valid amount
-            amount = round(remaining_size * 1000) / 1000
-            
-            direction = th.Direction.SELL if self.position_size > 0 else th.Direction.BUY
-            price = self.calculate_trailing_stop_price(direction)
-            
-            await self.thalex.insert(
-                direction=direction,
-                instrument_name=self.perp_name,
-                amount=amount,
-                price=price,
-                client_order_id=self.client_order_id,
-                id=self.client_order_id
-            )
-            self.client_order_id += 1
-            
-            logging.info(f"Trailing stop executed at {activation*100}% level: {amount} @ {price}")
-            
-        except Exception as e:
-            logging.error(f"Error executing trailing stop: {str(e)}")
-
-    def calculate_take_profit_price(self, level_pct: float) -> float:
-        """Calculate properly aligned take profit price"""
-        if self.position_size > 0:
-            price = self.entry_price * (1 + level_pct)
-        else:
-            price = self.entry_price * (1 - level_pct)
-        return self.round_to_tick(price)
-
-    def calculate_trailing_stop_price(self, direction: th.Direction) -> float:
-        """Calculate properly aligned trailing stop price"""
-        current_price = self.ticker.mark_price
-        buffer = 0.0005  # 0.05% buffer for faster execution
-        
-        if direction == th.Direction.SELL:
-            price = current_price * (1 - buffer)
-        else:
-            price = current_price * (1 + buffer)
-        
-        return self.round_to_tick(price)
-
-    async def cleanup_take_profit_orders(self):
-        """Clean up existing take profit orders if needed"""
-        for order_id, order_info in list(self.take_profit_orders.items()):
-            try:
-                # Cancel order if price has moved significantly
-                current_price = self.ticker.mark_price
-                price_diff = abs(current_price - order_info["price"]) / order_info["price"]
-                
-                if price_diff > 0.01:  # 1% price movement
-                    await self.thalex.cancel(
-                        client_order_id=order_id,
-                        id=order_id
-                    )
-                    del self.take_profit_orders[order_id]
-                    self.executed_take_profits.remove(order_info["level"])
-                
-            except Exception as e:
-                logging.error(f"Error cleaning up take profit order {order_id}: {str(e)}")
-
     async def validate_position_state(self) -> bool:
         """Validate position state consistency"""
         try:
@@ -1467,26 +1325,6 @@ class PerpQuoter:
         except Exception as e:
             logging.error(f"Position validation error: {str(e)}\nTrace: {traceback.format_exc()}")
             return False
-
-    async def recover_position_state(self):
-        """Recover position state from portfolio"""
-        try:
-            # Get position from portfolio
-            portfolio_position = self.portfolio.get(self.perp_name, 0)
-            self.position_size = portfolio_position
-            
-            # Reset or recover entry price
-            if portfolio_position == 0:
-                self.entry_price = None
-                logging.info("Position recovery: Reset entry price for zero position")
-            elif self.ticker and self.ticker.mark_price > 0:
-                self.entry_price = self.round_to_tick(self.ticker.mark_price)
-                logging.warning(f"Position recovery: Set entry price to mark price {self.entry_price}")
-            
-            logging.info(f"Position state recovered: size={self.position_size}, entry_price={self.entry_price}")
-            
-        except Exception as e:
-            logging.error(f"Position recovery failed: {str(e)}\nTrace: {traceback.format_exc()}")
 
     def calculate_position_pnl(self) -> float:
         """Calculate current position PnL percentage with enhanced safety checks"""
@@ -1551,7 +1389,7 @@ class PerpQuoter:
                 self.logger.warning("Tick size not available for default spread. Returning 0.0")
                 return 0.0
             # Using min_spread from config as the default if price window is too short
-            min_spread_ticks_from_config = AVELLANEDA_CONFIG.get("min_spread", 3.0) # Assuming 3.0 ticks as default
+            min_spread_ticks_from_config = ORDERBOOK_CONFIG.get("min_spread", 3.0) # Assuming 3.0 ticks as default
             self.logger.debug(f"Price window too short, returning default min_spread: {min_spread_ticks_from_config * self.tick}")
             return min_spread_ticks_from_config * self.tick
             
@@ -1565,7 +1403,7 @@ class PerpQuoter:
             if not self.tick:
                 self.logger.warning("Tick size not available for fallback spread. Returning 0.0")
                 return 0.0
-            min_spread_ticks_from_config = AVELLANEDA_CONFIG.get("min_spread", 3.0)
+            min_spread_ticks_from_config = ORDERBOOK_CONFIG.get("min_spread", 3.0)
             return min_spread_ticks_from_config * self.tick
 
         # Optimal spread = γσ²(T-t) + 2/γ log(1 + γ/k)
@@ -1577,7 +1415,7 @@ class PerpQuoter:
             if not self.tick:
                 self.logger.warning("Tick size not available for fallback spread. Returning 0.0")
                 return 0.0
-            min_spread_ticks_from_config = AVELLANEDA_CONFIG.get("min_spread", 3.0)
+            min_spread_ticks_from_config = ORDERBOOK_CONFIG.get("min_spread", 3.0)
             return min_spread_ticks_from_config * self.tick
             
         calculated_model_spread_abs = (self.gamma * self.sigma**2 * self.T + 
@@ -1586,16 +1424,10 @@ class PerpQuoter:
         if not (np.isfinite(calculated_model_spread_abs) and calculated_model_spread_abs > 0):
             self.logger.warning(f"Calculated model spread is not valid: {calculated_model_spread_abs}. Using configured min_spread.")
             if not self.tick:
-                self.logger.warning("Tick size not available for fallback spread. Returning 0.0")
-                return 0.0
-            min_spread_ticks_from_config = AVELLANEDA_CONFIG.get("min_spread", 3.0)
-            return min_spread_ticks_from_config * self.tick
+                self.logger.warning("Tick size not available, cannot enforce tick-based min spread. Returning model spread.")
+                return calculated_model_spread_abs
 
-        if not self.tick:
-            self.logger.warning("Tick size not available, cannot enforce tick-based min spread. Returning model spread.")
-            return calculated_model_spread_abs
-
-        min_spread_ticks_from_config = AVELLANEDA_CONFIG.get("min_spread", 3.0) # Defaulting to 3.0 ticks
+        min_spread_ticks_from_config = ORDERBOOK_CONFIG.get("min_spread", 3.0) # Defaulting to 3.0 ticks
         min_abs_spread_monetary = min_spread_ticks_from_config * self.tick
         
         final_spread = max(min_abs_spread_monetary, calculated_model_spread_abs)
@@ -2074,6 +1906,24 @@ class PerpQuoter:
                 self.logger.warning("Missing ticker, price history, or valid mark price for optimal quotes calculation")
                 return 0, 0, 0, 0
 
+            if self.ticker.best_bid_price is None or self.ticker.best_ask_price is None:
+                self.logger.warning(
+                    f"PerpQuoter: Ticker missing best_bid_price ({self.ticker.best_bid_price}) or best_ask_price ({self.ticker.best_ask_price}). Cannot calculate optimal quotes."
+                )
+                return 0, 0, 0, 0
+
+            best_bid = self.ticker.best_bid_price
+            best_ask = self.ticker.best_ask_price
+
+            if not (best_bid > 0 and best_ask > 0 and best_ask > best_bid):
+                self.logger.warning(f"PerpQuoter: Invalid BBO prices from ticker: bid={best_bid}, ask={best_ask}. Cannot calculate optimal quotes.")
+                return 0, 0, 0, 0
+
+            mid_price = (best_bid + best_ask) / 2
+            if mid_price <= 0:
+                self.logger.warning(f"PerpQuoter: Calculated mid_price ({mid_price}) from BBO is invalid. Cannot calculate optimal quotes.")
+                return 0, 0, 0, 0
+
             # Correctly source vol_window from TRADING_CONFIG["volatility"]
             vol_config = TRADING_CONFIG.get("volatility", {})
             vol_window = vol_config.get("window")
@@ -2081,8 +1931,6 @@ class PerpQuoter:
             if vol_window is None or len(self.price_history) < vol_window:
                 self.logger.warning(f"Insufficient price history: {len(self.price_history)} < {vol_window if vol_window is not None else 'N/A'} for volatility calculation.")
                 return 0,0,0,0
-
-            mid_price = self.ticker.mark_price
 
             # Avellaneda parameters from AVELLANEDA_CONFIG (TRADING_CONFIG["avellaneda"])
             gamma = AVELLANEDA_CONFIG.get("gamma", 0.1) # Risk aversion
@@ -2318,6 +2166,103 @@ class PerpQuoter:
             logging.error(f"Error validating order parameters: {str(e)}")
             return 0, 0
 
+    async def manage_new_take_profit(self):
+        """Manages take profit based on time and overall profit of a paired position."""
+        current_time = time.time()
+        if current_time - self.last_take_profit_check_time < 1.0: # Throttle to once per second
+            return
+        self.last_take_profit_check_time = current_time
+
+        if self.position_size == 0 or self.position_entry_time is None:
+            return
+
+        # 1. Profit-based override
+        current_leg_pnl = self.calculate_position_pnl() 
+        # self.other_leg_pnl_placeholder is assumed to be updated by an external strategy component
+        
+        is_current_leg_profitable = isinstance(current_leg_pnl, (float, int)) and current_leg_pnl > 0
+        is_other_leg_profitable = isinstance(self.other_leg_pnl_placeholder, (float, int)) and self.other_leg_pnl_placeholder > 0
+
+        if is_current_leg_profitable and is_other_leg_profitable:
+            self.logger.info(f"Profit override: Both positions profitable (Leg1 PnL: {current_leg_pnl:.4f}, Leg2 PnL: {self.other_leg_pnl_placeholder:.4f}). Closing all positions.")
+            await self.close_all_positions_market()
+            return
+
+        # 2. Time-based closure
+        if current_time - self.position_entry_time >= self.take_profit_duration_seconds:
+            self.logger.info(f"Time-based take profit: {self.take_profit_duration_seconds}s elapsed. Closing all positions for {self.perp_name}.")
+            await self.close_all_positions_market()
+            return
+
+    def calculate_aggressive_exit_price(self, direction: th.Direction) -> float:
+        """Calculate an aggressive exit price to simulate a market order."""
+        if not self.ticker or not self.tick or self.ticker.mark_price <= 0:
+            self.logger.error("Missing ticker, tick size, or valid mark price for aggressive exit price.")
+            return 0.0 
+
+        buffer_pct = 0.005 # 0.5% buffer
+
+        if direction == th.Direction.SELL: # Selling a long position
+            price_base = self.ticker.best_bid_price if self.ticker.best_bid_price and self.ticker.best_bid_price > 0 else self.ticker.mark_price
+            price = price_base * (1 - buffer_pct / (2 if self.ticker.best_bid_price else 1))
+        else: # Buying to cover a short position
+            price_base = self.ticker.best_ask_price if self.ticker.best_ask_price and self.ticker.best_ask_price > 0 else self.ticker.mark_price
+            price = price_base * (1 + buffer_pct / (2 if self.ticker.best_ask_price else 1))
+        
+        rounded_price = self.round_to_tick(price)
+        if rounded_price <= 0:
+            self.logger.warning(f"Aggressive exit price calculated to {rounded_price}, using mark_price fallback.")
+            fallback_buffer = 0.01 # Wider buffer for direct mark price fallback
+            if direction == th.Direction.SELL:
+                return self.round_to_tick(self.ticker.mark_price * (1 - fallback_buffer))
+            else:
+                return self.round_to_tick(self.ticker.mark_price * (1 + fallback_buffer))
+        return rounded_price
+
+    async def close_all_positions_market(self):
+        """Closes the position in self.perp_name aggressively."""
+        self.logger.info(f"Attempting to close position for {self.perp_name} due to take-profit condition.")
+        
+        # Ensure we use the most up-to-date position size from portfolio if possible, or rely on internal
+        # self.get_position_size() should handle reconciliation
+        current_position_size = self.get_position_size()
+
+        if abs(current_position_size) > 0:
+            direction = th.Direction.SELL if current_position_size > 0 else th.Direction.BUY
+            amount_to_close = abs(current_position_size)
+            aligned_amount = self.align_amount(amount_to_close) 
+
+            if aligned_amount <= 0.00001: # Use a small epsilon for float comparison
+                self.logger.info(f"Position size for {self.perp_name} is too small to close ({aligned_amount}).")
+                return
+
+            exit_price = self.calculate_aggressive_exit_price(direction)
+
+            if exit_price <= 0:
+                self.logger.error(f"Could not determine a valid aggressive exit price for {self.perp_name}. Cannot close position.")
+                return
+
+            try:
+                self.logger.info(f"Placing market-like order to close {aligned_amount} of {self.perp_name} at price {exit_price} (Direction: {direction.value})")
+                await self.thalex.insert(
+                    direction=direction,
+                    instrument_name=self.perp_name,
+                    amount=aligned_amount,
+                    price=exit_price,
+                    client_order_id=self.client_order_id,
+                    id=self.client_order_id,
+                    post_only=False # Ensure it can take liquidity
+                )
+                self.client_order_id += 1
+                # self.position_entry_time = None # Reset by portfolio_callback when fill is confirmed
+            except Exception as e:
+                self.logger.error(f"Error placing order to close position for {self.perp_name}: {e}")
+        else:
+            self.logger.info(f"No position to close for {self.perp_name}.")
+
+        # Placeholder for closing the other leg of the strategy
+        self.logger.info("If this is part of a paired strategy, logic to close the other leg would be triggered from here or by the strategy orchestrator.")
+
 class ConfigValidator:
     @staticmethod
     def validate_config():
@@ -2340,23 +2285,35 @@ if __name__ == "__main__":
         format="%(asctime)s - %(levelname)s - %(message)s"
     )
     
-    async def shutdown(thalex, tasks):
+    async def shutdown(thalex_client, tasks_to_cancel): # Renamed params for clarity
         """Graceful shutdown handler"""
-        if thalex.connected():  # Remove await since connected() returns bool
-            await thalex.cancel_session(id=CALL_ID_CANCEL_SESSION)
-            await thalex.disconnect()
-        for task in tasks:
+        if thalex_client.connected(): 
+            await thalex_client.cancel_session(id=CALL_ID_CANCEL_SESSION)
+            await thalex_client.disconnect()
+        for task in tasks_to_cancel:
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
 
     async def run_quoter():
         while True:
-            thalex = th.Thalex(network=NETWORK)
-            perp_quoter = PerpQuoter(thalex)
+            thalex_instance = th.Thalex(network=NETWORK) # Renamed for clarity
+            perp_quoter_instance = PerpQuoter(thalex_instance) # Renamed for clarity
+            
+            # Ensure market_maker attribute exists if listen_task uses it.
+            # If market_maker is another class instance it needs to be initialized here.
+            # For now, assuming it's okay or handled within PerpQuoter if necessary.
+            # If self.market_maker was part of PerpQuoter, it needs to be initialized in PerpQuoter.__init__
+            # Example: perp_quoter_instance.market_maker = SomeMarketMakerClass() 
+            # For now, I will assume listen_task does not depend on an external market_maker being set on perp_quoter_instance itself.
+            # If `self.market_maker.set_tick_size(self.tick)` is in `listen_task`, 
+            # `market_maker` needs to be an attribute of `PerpQuoter`.
+            # Let's assume for now this is handled, or `listen_task` will be reviewed.
+
             tasks = [
-                asyncio.create_task(perp_quoter.listen_task()),
-                asyncio.create_task(perp_quoter.quote_task()),
-                asyncio.create_task(perp_quoter.log_pnl()),  # Add PnL logging task
+                asyncio.create_task(perp_quoter_instance.listen_task()),
+                asyncio.create_task(perp_quoter_instance.quote_task()),
+                asyncio.create_task(perp_quoter_instance.log_pnl()),
+                asyncio.create_task(perp_quoter_instance.manage_new_take_profit()), # ADDED NEW TASK
             ]
             
             try:
@@ -2364,15 +2321,15 @@ if __name__ == "__main__":
                 await asyncio.gather(*tasks)
             except (websockets.ConnectionClosed, socket.gaierror) as e:
                 logging.error(f"Connection error ({e}). Reconnecting...")
-                await shutdown(thalex, tasks)
+                await shutdown(thalex_instance, tasks)
                 await asyncio.sleep(1)
             except KeyboardInterrupt:
                 logging.info("Shutting down...")
-                await shutdown(thalex, tasks)
+                await shutdown(thalex_instance, tasks)
                 break
             except Exception as e:
                 logging.exception("Unexpected error:")
-                await shutdown(thalex, tasks)
+                await shutdown(thalex_instance, tasks)
                 await asyncio.sleep(1)
 
     try:
