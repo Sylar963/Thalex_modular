@@ -19,6 +19,9 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import shared_memory
 
+# Define a small threshold for zero comparisons
+ZERO_THRESHOLD = 1e-9
+
 import thalex as th
 from thalex import Network
 from thalex_py.Thalex_modular.config.market_config import (
@@ -29,6 +32,7 @@ from thalex_py.Thalex_modular.config.market_config import (
     TRADING_CONFIG
 )
 from thalex_py.Thalex_modular.models.data_models import Ticker, Order, OrderStatus, Quote
+from thalex_py.Thalex_modular.models.position_tracker import PositionTracker, Fill
 from thalex_py.Thalex_modular.components.risk_manager import RiskManager
 from thalex_py.Thalex_modular.components.order_manager import OrderManager
 from thalex_py.Thalex_modular.components.avellaneda_market_maker import AvellanedaMarketMaker
@@ -119,9 +123,10 @@ class AvellanedaQuoter:
         self.tasks: Dict[str, Optional[asyncio.Task]] = {}
         
         # Set up the market maker components
-        self.market_maker = AvellanedaMarketMaker(exchange_client=self.thalex)
+        self.position_tracker = PositionTracker() # Initialize PositionTracker first
+        self.market_maker = AvellanedaMarketMaker(exchange_client=self.thalex, position_tracker=self.position_tracker) # MODIFIED: Pass position_tracker
         self.order_manager = OrderManager(self.thalex)
-        self.risk_manager = RiskManager()
+        self.risk_manager = RiskManager(self.position_tracker) # Then pass it to RiskManager
         self.performance_monitor = PerformanceMonitor()
         
         # Register risk breach handler
@@ -135,6 +140,9 @@ class AvellanedaQuoter:
         self.ticker = None
         self.index = None
         self.perp_name = None
+        self.futures_instrument_name = None
+        self.futures_ticker = None
+        self.futures_tick_size = 0.0 # Added for futures, if needed for order placement
         self.market_data = MarketDataBuffer(
             volatility_window=TRADING_CONFIG["volatility"]["window"],
             capacity=TRADING_CONFIG["volatility"]["min_samples"]
@@ -286,6 +294,9 @@ class AvellanedaQuoter:
         """Handles actions to take when a risk limit is breached."""
         price_display = f"{price_at_breach:.2f}" if price_at_breach is not None else "N/A"
         self.logger.critical(f"RISK LIMIT BREACHED: {reason}. Price at check: {price_display}")
+        # Ensure this is also logged if it's for a specific instrument or both
+        # For now, reason should ideally include which leg caused it if it's specific.
+
         if not self.active_trading:
             self.logger.info("Trading already halted, risk breach handling skipped further action to prevent re-entry.")
             return
@@ -329,102 +340,110 @@ class AvellanedaQuoter:
                 current_price = None
                 if self.ticker and hasattr(self.ticker, 'mark_price') and self.ticker.mark_price > 0:
                     current_price = self.ticker.mark_price
-                elif self.market_data and self.market_data.get_last_price() > 0: # Fallback to market_data buffer
-                    current_price = self.market_data.get_last_price()
+                elif self.market_data and len(self.market_data.prices) > 0 and self.market_data.prices[-1] > 0: # Fallback to market_data buffer
+                    current_price = self.market_data.prices[-1]
                 else:
                     self.logger.warning("Risk monitoring: No valid current_price available (ticker or market_data). Skipping this check cycle.")
-                    if self.risk_manager.position_size != 0: # If in position without price, this is risky
-                        self.logger.error("CRITICAL: In position but no current price for risk checks. Consider manual intervention or halting.")
+                    current_pos_size_for_log = self.risk_manager.position_tracker.get_position_metrics().get("position", 0.0)
+                    if abs(current_pos_size_for_log) > ZERO_THRESHOLD: # If in position without price, this is risky
+                        self.logger.error(f"CRITICAL: In position ({current_pos_size_for_log:.4f}) but no current price for risk checks. Consider manual intervention or halting.")
                         # Potentially call _handle_risk_breach here if no price is a critical failure
                         # await self._handle_risk_breach("Critical: No price for risk check while in position", None)
                     continue
+
+                # Update unrealized PnL for Perpetual
+                if current_price is not None and self.position_tracker and self.perp_name:
+                    self.position_tracker.update_unrealized_pnl(current_price, self.perp_name)
+
+                # Get futures price and update its PnL
+                current_price_futures = None
+                if self.futures_ticker and hasattr(self.futures_ticker, 'mark_price') and self.futures_ticker.mark_price > 0:
+                    current_price_futures = self.futures_ticker.mark_price
+                elif self.market_data and self.futures_instrument_name and len(self.market_data.get_prices(self.futures_instrument_name)) > 0: # Assuming market_data can be instrument specific
+                    current_price_futures = self.market_data.get_prices(self.futures_instrument_name)[-1]
+
+                if current_price_futures is not None and self.position_tracker and self.futures_instrument_name:
+                    self.position_tracker.update_unrealized_pnl(current_price_futures, self.futures_instrument_name)
+                elif self.futures_instrument_name: # Log if futures instrument is configured but no price
+                    self.logger.warning(f"Risk monitoring: No valid current_price_futures available for {self.futures_instrument_name}.")
 
                 # If trading is no longer active (e.g. due to a breach in another task), exit
                 if not self.active_trading:
                     self.logger.info("Risk monitoring task: active_trading became false during cycle. Exiting.")
                     break
 
-                # Check overall limits first, as this might halt trading
-                if not await self.risk_manager.check_risk_limits(current_market_price=current_price):
-                    self.logger.warning(f"Overall risk limits breached during periodic check at price {current_price:.2f}. _handle_risk_breach was invoked.")
+                # Check overall risk limits for perpetual
+                perp_risk_limits_breached = False
+                if current_price and self.perp_name:
+                    if not await self.risk_manager.check_risk_limits(current_market_price=current_price, instrument_name=self.perp_name):
+                        self.logger.warning(f"PERPETUAL risk limits breached ({self.perp_name}) during periodic check at price {current_price:.2f}. _handle_risk_breach will be invoked.")
+                        perp_risk_limits_breached = True
+
+                # Check overall risk limits for futures
+                futures_risk_limits_breached = False
+                if current_price_futures and self.futures_instrument_name:
+                    if not await self.risk_manager.check_risk_limits(current_market_price=current_price_futures, instrument_name=self.futures_instrument_name):
+                        self.logger.warning(f"FUTURES risk limits breached ({self.futures_instrument_name}) during periodic check at price {current_price_futures:.2f}. _handle_risk_breach will be invoked.")
+                        futures_risk_limits_breached = True
+
+                if perp_risk_limits_breached or futures_risk_limits_breached:
+                    reason_breach = []
+                    if perp_risk_limits_breached: reason_breach.append(f"Perp {self.perp_name} limit breach")
+                    if futures_risk_limits_breached: reason_breach.append(f"Futures {self.futures_instrument_name} limit breach")
+                    await self._handle_risk_breach(f"Overall risk limits breached: {'; '.join(reason_breach)}", current_price if perp_risk_limits_breached else current_price_futures)
                     # _handle_risk_breach sets active_trading = False, loop will terminate.
                     continue # Allow _handle_risk_breach to stop activity
 
-                if self.risk_manager.position_size == 0: # No position, no stop-loss or take-profit to check
+                current_pos_size_check = self.risk_manager.position_tracker.get_position_metrics().get("position", 0.0)
+                if abs(current_pos_size_check) < ZERO_THRESHOLD: # No position, no stop-loss or take-profit to check
                     continue
 
-                # 1. Check Stop Loss
-                if self.risk_manager.check_stop_loss(current_price):
-                    position_size_at_stop = self.risk_manager.position_size
-                    self.logger.warning(f"STOP-LOSS triggered at price {current_price:.2f}. Position: {position_size_at_stop:.4f}. Attempting to close entire position.")
-                    
-                    if abs(position_size_at_stop) > 0:
-                        close_direction = "sell" if position_size_at_stop > 0 else "buy"
-                        close_size = abs(position_size_at_stop)
-                        
-                        # Round size to minimum step (assuming 0.001 for now, should ideally come from config/instrument data)
-                        # This should align with OrderManager's own rounding or instrument spec
-                        min_size_increment = TRADING_CONFIG.get("execution", {}).get("size_increment", 0.001)
-                        close_size = round(close_size / min_size_increment) * min_size_increment
-                        
-                        if close_size >= min_size_increment: # Ensure we are closing a valid amount
-                            self.logger.info(f"Stop-Loss: Placing MARKET {close_direction} order for {close_size:.4f} of {self.perp_name}")
-                            try:
-                                order_id = await self.order_manager.place_order(
-                                    instrument=self.perp_name,
-                                    direction=close_direction,
-                                    price=None, # Indicates Market Order
-                                    amount=close_size,
-                                    label="StopLossMarketClose",
-                                    post_only=False
-                                )
-                                if order_id:
-                                    self.logger.info(f"Stop-Loss: Market close order ({order_id}) placed successfully.")
-                                else:
-                                    self.logger.error("Stop-Loss: Failed to place market close order (order_id is None).")
-                            except Exception as e:
-                                self.logger.error(f"Stop-Loss: Exception placing market close order: {str(e)}", exc_info=True)
-                        else:
-                            self.logger.warning(f"Stop-Loss: Calculated close size {close_size:.4f} is less than min increment {min_size_increment}. Cannot place market order.")
-                    
-                    await self._handle_risk_breach(f"Stop-loss triggered at {current_price:.2f}. Closed position.", current_price)
+                # 1. Check Stop Loss for Perpetual
+                stop_loss_perp_triggered = False
+                if self.perp_name and current_price and abs(current_pos_size_check) > ZERO_THRESHOLD:
+                    if self.risk_manager.check_stop_loss(current_price, self.perp_name):
+                        self.logger.warning(f"PERPETUAL STOP-LOSS triggered for {self.perp_name} at price {current_price:.2f}. Position: {current_pos_size_check:.4f}.")
+                        stop_loss_perp_triggered = True
+                
+                # 2. Check Stop Loss for Futures
+                stop_loss_futures_triggered = False
+                if self.futures_instrument_name and current_price_futures and abs(current_pos_size_check) > ZERO_THRESHOLD:
+                    if self.risk_manager.check_stop_loss(current_price_futures, self.futures_instrument_name):
+                        self.logger.warning(f"FUTURES STOP-LOSS triggered for {self.futures_instrument_name} at price {current_price_futures:.2f}. Position: {current_pos_size_check:.4f}.")
+                        stop_loss_futures_triggered = True
+
+                if stop_loss_perp_triggered or stop_loss_futures_triggered:
+                    sl_reason_parts = []
+                    if stop_loss_perp_triggered: sl_reason_parts.append(f"Perp {self.perp_name} SL at {current_price:.2f}")
+                    if stop_loss_futures_triggered: sl_reason_parts.append(f"Futures {self.futures_instrument_name} SL at {current_price_futures:.2f}")
+                    sl_reason = f"Stop-loss triggered: {'; '.join(sl_reason_parts)}"
+                    self.logger.info(f"{sl_reason}. Attempting to close both positions.")
+                    await self._close_both_positions(sl_reason)
+                    await self._handle_risk_breach(sl_reason, current_price if stop_loss_perp_triggered else current_price_futures)
                     continue # Stop-loss hit, _handle_risk_breach will stop trading
 
-                # 2. Check Take Profit (Full position closure)
-                take_profit_triggered, tp_reason, _ = self.risk_manager.check_take_profit(current_price) # portion_to_close is ignored
-                if take_profit_triggered:
-                    position_size_at_tp = self.risk_manager.position_size
-                    self.logger.info(f"TAKE-PROFIT triggered: {tp_reason}. Position: {position_size_at_tp:.4f}. Attempting to close entire position.")
+                # 3. Check Take Profit for Perpetual
+                take_profit_perp_triggered, tp_reason_perp, _ = (False, "", 0.0)
+                if self.perp_name and current_price and abs(current_pos_size_check) > ZERO_THRESHOLD:
+                    take_profit_perp_triggered, tp_reason_perp, _ = self.risk_manager.check_take_profit(current_price, self.perp_name)
+                    if take_profit_perp_triggered:
+                        self.logger.info(f"PERPETUAL TAKE-PROFIT triggered for {self.perp_name}: {tp_reason_perp}. Position: {current_pos_size_check:.4f}.")
 
-                    if abs(position_size_at_tp) > 0:
-                        close_direction = "sell" if position_size_at_tp > 0 else "buy"
-                        close_size = abs(position_size_at_tp)
+                # 4. Check Take Profit for Futures
+                take_profit_futures_triggered, tp_reason_futures, _ = (False, "", 0.0)
+                if self.futures_instrument_name and current_price_futures and abs(current_pos_size_check) > ZERO_THRESHOLD:
+                    take_profit_futures_triggered, tp_reason_futures, _ = self.risk_manager.check_take_profit(current_price_futures, self.futures_instrument_name)
+                    if take_profit_futures_triggered:
+                        self.logger.info(f"FUTURES TAKE-PROFIT triggered for {self.futures_instrument_name}: {tp_reason_futures}. Position: {current_pos_size_check:.4f}.")
 
-                        min_size_increment = TRADING_CONFIG.get("execution", {}).get("size_increment", 0.001)
-                        close_size = round(close_size / min_size_increment) * min_size_increment
-
-                        if close_size >= min_size_increment:
-                            self.logger.info(f"Take-Profit: Placing MARKET {close_direction} order for {close_size:.4f} of {self.perp_name}")
-                            try:
-                                order_id = await self.order_manager.place_order(
-                                    instrument=self.perp_name,
-                                    direction=close_direction,
-                                    price=None, # Indicates Market Order
-                                    amount=close_size,
-                                    label="TakeProfitMarketClose",
-                                    post_only=False
-                                )
-                                if order_id:
-                                    self.logger.info(f"Take-Profit: Market close order ({order_id}) placed successfully.")
-                                else:
-                                    self.logger.error("Take-Profit: Failed to place market close order (order_id is None).")
-                            except Exception as e:
-                                self.logger.error(f"Take-Profit: Exception placing market close order: {str(e)}", exc_info=True)
-                        else:
-                            self.logger.warning(f"Take-Profit: Calculated close size {close_size:.4f} is less than min increment {min_size_increment}. Cannot place market order.")
-                    
-                    # For take-profit, we also halt trading as per implication of full close.
-                    await self._handle_risk_breach(f"Take-profit triggered ({tp_reason}). Closed position.", current_price)
+                if take_profit_perp_triggered or take_profit_futures_triggered:
+                    tp_overall_reason_parts = []
+                    if take_profit_perp_triggered: tp_overall_reason_parts.append(f"Perp {self.perp_name} TP ({tp_reason_perp})")
+                    if take_profit_futures_triggered: tp_overall_reason_parts.append(f"Futures {self.futures_instrument_name} TP ({tp_reason_futures})")
+                    tp_overall_reason = f"Take-profit triggered: {'; '.join(tp_overall_reason_parts)}"
+                    self.logger.info(f"{tp_overall_reason}. Attempting to close both positions.")
+                    await self._close_both_positions(tp_overall_reason)
+                    await self._handle_risk_breach(tp_overall_reason, current_price if take_profit_perp_triggered else current_price_futures)
                     continue # Take-profit hit, _handle_risk_breach will stop trading
                 
             except asyncio.CancelledError:
@@ -468,6 +487,8 @@ class AvellanedaQuoter:
                 # Wait up to 30 seconds for instrument data
                 await asyncio.wait_for(self.await_instruments(), timeout=30.0)
                 self.logger.info("Instrument data retrieved successfully")
+                # Log the configured instrument details
+                self.logger.info(f"POST-SETUP: self.perp_name='{self.perp_name}', self.tick_size={self.tick_size}, self.contract_size={getattr(self, 'contract_size', 'N/A')}")
             except asyncio.TimeoutError:
                 self.logger.error("Timed out waiting for instrument data")
             except Exception as e:
@@ -615,6 +636,13 @@ class AvellanedaQuoter:
                 contract_size = self.instrument_data['contractSize']
                 self.logger.info(f"Setting contract size to {contract_size}")
                 self.contract_size = float(contract_size)
+            
+            # Set futures instrument name from config
+            self.futures_instrument_name = MARKET_CONFIG.get("futures_instrument")
+            if not self.futures_instrument_name:
+                self.logger.warning("FUTURES_INSTRUMENT not configured in MARKET_CONFIG. Futures leg P&L will not be monitored.")
+            else:
+                self.logger.info(f"Futures instrument for P&L monitoring: {self.futures_instrument_name}")
             
             # Subscribe to WebSocket topics with retry logic
             self.logger.info("Setting up WebSocket subscriptions...")
@@ -828,6 +856,7 @@ class AvellanedaQuoter:
                 # Find perpetual contract 
                 instruments = result
                 perpetual = None
+                futures_contract = None # For the futures leg
                 underlying = MARKET_CONFIG["underlying"]
                 
                 # Try different underlying formats - prioritize BTC-PERPETUAL format
@@ -900,17 +929,46 @@ class AvellanedaQuoter:
                     self.logger.debug(f"Available instruments: {instruments}")
                     return False
                 
+                # Find futures contract if configured
+                if self.futures_instrument_name:
+                    self.logger.info(f"Searching for FUTURES instrument: {self.futures_instrument_name}")
+                    for instrument in instruments:
+                        instrument_asset = instrument.get("asset") or instrument.get("name") or instrument.get("symbol") or ""
+                        if instrument_asset == self.futures_instrument_name:
+                            futures_contract = instrument
+                            self.logger.info(f"Found FUTURES instrument: {instrument_asset}")
+                            break
+                    if not futures_contract:
+                        self.logger.warning(f"Configured FUTURES instrument '{self.futures_instrument_name}' not found in API results.")
+                        # self.futures_instrument_name = None # Optionally disable if not found
+
+                if not perpetual and not self.futures_instrument_name: # If only perp was configured and not found
+                    self.logger.error("Could not find PERPETUAL instrument and no FUTURES instrument configured.")
+                    return False
+                elif not perpetual and self.futures_instrument_name and not futures_contract: # If both configured but neither found
+                    self.logger.error(f"Could not find PERPETUAL instrument OR the configured FUTURES instrument {self.futures_instrument_name}.")
+                    return False
+
                 # Set perpetual contract details
-                self.perp_name = perpetual.get("name") or perpetual.get("asset") or perpetual.get("symbol")
-                self.tick_size = float(perpetual.get("tick_size") or perpetual.get("tickSize") or 1.0)
-                self.contract_size = float(perpetual.get("contract_size") or perpetual.get("contractSize") or 1.0)
-                
-                # Pass tick size to market maker
-                self.market_maker.set_tick_size(self.tick_size)
-                self.order_manager.set_tick_size(self.tick_size)
-                
-                self.logger.info(f"Found perpetual: {self.perp_name} with tick size {self.tick_size}")
-                
+                if perpetual:
+                    self.perp_name = perpetual.get("name") or perpetual.get("asset") or perpetual.get("symbol")
+                    self.tick_size = float(perpetual.get("tick_size") or perpetual.get("tickSize") or 1.0) # Assuming primary tick_size is for perp
+                    self.contract_size = float(perpetual.get("contract_size") or perpetual.get("contractSize") or 1.0)
+                    self.market_maker.set_tick_size(self.tick_size) # Market maker quotes the perp
+                    self.order_manager.set_tick_size(self.tick_size) # Order manager primarily uses perp tick for quotes
+                    self.logger.info(f"Found perpetual: {self.perp_name} with tick size {self.tick_size}, contract size {self.contract_size}")
+                elif not self.futures_instrument_name: # If only perp was sought and not found
+                    self.logger.error(f"Perpetual instrument for {underlying} not found and no futures configured. Cannot proceed.")
+                    return False
+
+                # Set futures contract details (primarily tick_size if needed for order placement, though market orders are less sensitive)
+                if futures_contract:
+                    self.futures_tick_size = float(futures_contract.get("tick_size") or futures_contract.get("tickSize") or 1.0)
+                    # contract_size_futures = float(futures_contract.get("contract_size") or futures_contract.get("contractSize") or 1.0) # If needed
+                    self.logger.info(f"Futures instrument {self.futures_instrument_name} tick size: {self.futures_tick_size}")
+                elif self.futures_instrument_name:
+                    self.logger.warning(f"Futures instrument {self.futures_instrument_name} configured but not found. Risk monitoring for futures P&L might be impaired if price data isn't received.")
+
                 return True
                 
             except Exception as e:
@@ -1708,6 +1766,47 @@ class AvellanedaQuoter:
                     f"Order filled: {order.id} - {order.direction.upper()} {order.amount:.4f} @ {order.price:.2f}"
                 )
                 
+                # Update PositionTracker
+                if self.position_tracker:
+                    try:
+                        # Ensure timestamp is available and in datetime format for Fill object
+                        fill_timestamp_raw = order_data.get("timestamp", order_data.get("create_time", time.time()))
+                        if isinstance(fill_timestamp_raw, (int, float)):
+                            fill_time = datetime.fromtimestamp(fill_timestamp_raw, tz=timezone.utc)
+                        elif isinstance(fill_timestamp_raw, str):
+                            # Attempt to parse if it's a string timestamp (e.g., ISO format)
+                            # This part might need adjustment based on actual timestamp format from exchange
+                            try:
+                                fill_time = datetime.fromisoformat(fill_timestamp_raw.replace("Z", "+00:00"))
+                            except ValueError:
+                                self.logger.warning(f"Could not parse fill timestamp string '{fill_timestamp_raw}', using current time.")
+                                fill_time = datetime.now(timezone.utc)
+                        elif isinstance(fill_timestamp_raw, datetime):
+                            fill_time = fill_timestamp_raw
+                        else:
+                            self.logger.warning(f"Unknown fill timestamp format '{type(fill_timestamp_raw)}', using current time.")
+                            fill_time = datetime.now(timezone.utc)
+
+                        # Determine if the fill was a maker or taker
+                        # This often depends on specific fields in the fill notification (e.g., 'liquidity', 'type')
+                        # Assuming 'maker' by default if not specified in order_data.
+                        # Example: is_maker = order_data.get("liquidity_ind", "MAKER") == "MAKER"
+                        # For now, let's default to True as this info might not be directly in order_data
+                        is_maker_fill = order_data.get("is_maker", True) # Defaulting to True
+
+                        fill_object = Fill(
+                            order_id=str(order.id), # PositionTracker Fill expects string order_id
+                            fill_price=order.price,
+                            fill_size=order.amount,
+                            fill_time=fill_time,
+                            side=order.direction.lower(),
+                            is_maker=is_maker_fill 
+                        )
+                        self.position_tracker.update_on_fill(fill_object)
+                        self.logger.info(f"PositionTracker updated with fill: {fill_object.order_id}")
+                    except Exception as pt_e:
+                        self.logger.error(f"Error updating PositionTracker: {str(pt_e)}", exc_info=True)
+                
                 # Update market maker with fill information
                 self.market_maker.on_order_filled(
                     order_id=order.id,
@@ -2047,6 +2146,8 @@ class AvellanedaQuoter:
                         # is invalidated if some component relies on self.current_quotes reflecting *placed* or *attempted* quotes.
                         # However, self.current_quotes is typically what *was* generated.
                         # The primary goal here is to not proceed with placing new orders.
+                        # However, self.current_quotes is typically what *was* generated.
+                        # The primary goal here is to not proceed with placing new orders.
                         return # Stop placing quotes for this cycle if stuck
             
             # Store current quotes before sending to properly track what was sent
@@ -2323,21 +2424,49 @@ class AvellanedaQuoter:
                 
                 # Try to get metrics from market maker if it supports it
                 if hasattr(self.market_maker, 'get_position_metrics'):
-                    metrics = self.market_maker.get_position_metrics()
-                    position = metrics.get('position', 0.0) if metrics else 0.0
-                    realized_pnl = metrics.get('realized_pnl', 0.0) if metrics else 0.0
-                    unrealized_pnl = metrics.get('unrealized_pnl', 0.0) if metrics else 0.0
+                    mm_metrics = self.market_maker.get_position_metrics() # Renamed to avoid conflict
+                    position = mm_metrics.get('position', 0.0) if mm_metrics else 0.0
+                    realized_pnl = mm_metrics.get('realized_pnl', 0.0) if mm_metrics else 0.0
+                    unrealized_pnl = mm_metrics.get('unrealized_pnl', 0.0) if mm_metrics else 0.0
                 
+                # Get metrics from PositionTracker
+                pt_pos = 0.0
+                pt_avg_entry = 0.0
+                pt_rpnl = 0.0
+                pt_upnl = 0.0
+                pt_total_vol = 0.0
+                pt_fills = 0
+                if self.position_tracker:
+                    pt_metrics = self.position_tracker.get_position_metrics()
+                    pt_pos = pt_metrics.get("position", 0.0)
+                    pt_avg_entry = pt_metrics.get("average_entry", 0.0)
+                    pt_rpnl = pt_metrics.get("realized_pnl", 0.0)
+                    pt_upnl = pt_metrics.get("unrealized_pnl", 0.0)
+                    pt_total_vol = pt_metrics.get("total_volume", 0.0)
+                    pt_fills = pt_metrics.get("fill_count", 0)
+
                 # Get current mark price
-                mark_price = self.ticker.mark_price if self.ticker else 0.0
+                mark_price = self.ticker.mark_price if self.ticker and self.ticker.mark_price is not None else 0.0
                 
                 # Calculate basic stats
                 active_orders = len(self.order_manager.active_bids) + len(self.order_manager.active_asks) if hasattr(self.order_manager, 'active_bids') else 0
                 
                 # Log status with HFT optimization metrics
+                # Ensure all formatted variables have a fallback if None to prevent TypeError
+                pos_mm_str = f"{position:.3f}" if position is not None else "N/A"
+                rpnl_mm_str = f"{realized_pnl:.2f}" if realized_pnl is not None else "N/A"
+                upnl_mm_str = f"{unrealized_pnl:.2f}" if unrealized_pnl is not None else "N/A"
+                pt_pos_str = f"{pt_pos:.3f}" if pt_pos is not None else "N/A"
+                pt_avg_entry_str = f"{pt_avg_entry:.2f}" if pt_avg_entry is not None else "N/A"
+                pt_rpnl_str = f"{pt_rpnl:.2f}" if pt_rpnl is not None else "N/A"
+                pt_upnl_str = f"{pt_upnl:.2f}" if pt_upnl is not None else "N/A"
+                pt_total_vol_str = f"{pt_total_vol:.2f}" if pt_total_vol is not None else "N/A"
+                mark_price_str = f"{mark_price:.1f}" if mark_price is not None else "N/A"
+
                 self.logger.info(
-                    f"Status: Pos={position:.3f} | PnL=[R:{realized_pnl:.2f} U:{unrealized_pnl:.2f}] | "
-                    f"Price={mark_price:.1f} | Orders={active_orders} | "
+                    f"Status: Pos(MM)={pos_mm_str} PnL(MM)=[R:{rpnl_mm_str} U:{upnl_mm_str}] | "
+                    f"Pos(PT)={pt_pos_str} AvgEntry(PT)={pt_avg_entry_str} PnL(PT)=[R:{pt_rpnl_str} U:{pt_upnl_str}] Vol(PT)={pt_total_vol_str} Fills(PT)={pt_fills} | "
+                    f"Price={mark_price_str} | Orders={active_orders} | "
                     f"HFT=[Pools:{len(self.order_pool.items)}/{len(self.quote_pool.items)}]"
                 )
                 

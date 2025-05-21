@@ -1,10 +1,11 @@
 import numpy as np
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any, NamedTuple
 import time
 from collections import deque
 import math
 import random
 from datetime import datetime
+import logging
 
 from ..config.market_config import TRADING_CONFIG, RISK_LIMITS, ORDERBOOK_CONFIG
 from ..models.data_models import Ticker, Quote
@@ -12,10 +13,14 @@ from ..models.position_tracker import PositionTracker, Fill
 from ..thalex_logging import LoggerFactory
 from ..ringbuffer.volume_candle_buffer import VolumeBasedCandleBuffer
 
+# Constants
+DEFAULT_RESERVATION_PRICE_BOUND = TRADING_CONFIG["avellaneda"].get("reservation_price_bound", 0.005)
+MIN_SPREAD_TICK_MULTIPLIER = 2  # Minimum spread as a multiple of tick size
+
 class AvellanedaMarketMaker:
     """Avellaneda-Stoikov market making strategy implementation"""
     
-    def __init__(self, exchange_client=None):
+    def __init__(self, exchange_client=None, position_tracker: PositionTracker = None):
         # Initialize logger
         self.logger = LoggerFactory.configure_component_logger(
             "avellaneda_market_maker",
@@ -32,8 +37,7 @@ class AvellanedaMarketMaker:
         self.kappa = self.k_default
         
         # Position tracking
-        self.position_tracker = PositionTracker()
-        self.monetary_position = 0.0  # Monetary value of position (USD)
+        self.position_tracker = position_tracker
         
         # Market parameters
         self.volatility = TRADING_CONFIG["volatility"]["default"]
@@ -106,17 +110,10 @@ class AvellanedaMarketMaker:
         self.market_state = "normal"  # Market state: normal, trending, ranging
         
         # Market making state
-        self.position_size = 0.0
-        self.entry_price = None
         self.last_quote_time = 0.0
         self.min_tick = 0.0
         self.last_position_check = 0
         self.last_quote_update = 0
-        
-        # Enhanced position tracking
-        self.position_start_time = 0  # Time when current position was opened
-        self.unrealized_pnl = 0.0     # Current unrealized PnL
-        self.position_value = 0.0     # Current position value in USD
         
         # VAMP calculation variables
         self.vwap = 0.0
@@ -165,109 +162,6 @@ class AvellanedaMarketMaker:
         self.tick_size = tick_size
         self.min_tick = tick_size
         self.logger.info(f"Tick size set to {tick_size}")
-
-    def update_position(self, size: float, price: float):
-        """
-        Update current position information with enhanced metrics tracking
-        
-        Args:
-            size: Current position size
-            price: Current position price/mark price
-        """
-        old_position = self.position_size
-        old_position_value = getattr(self, 'position_value', 0.0)
-        
-        # Track position start time for new positions
-        if self.position_size == 0 and size != 0:
-            self.position_start_time = time.time()
-            self.logger.info(f"Starting new position tracking at {time.strftime('%H:%M:%S')}")
-        
-        # Update core position data
-        self.position_size = size
-        self.entry_price = price if not hasattr(self, 'entry_price') else self.entry_price
-        
-        # Calculate position value (absolute value of position in USD)
-        self.position_value = abs(size * price)
-        
-        # Calculate unrealized PnL if we have an entry price
-        if hasattr(self, 'entry_price') and self.entry_price > 0:
-            if size > 0:  # Long position
-                self.unrealized_pnl = (price - self.entry_price) * size
-            elif size < 0:  # Short position
-                self.unrealized_pnl = (self.entry_price - price) * abs(size)
-            else:  # No position
-                self.unrealized_pnl = 0.0
-        else:
-            self.unrealized_pnl = 0.0
-        
-        # Calculate PnL as percentage for reference
-        pnl_percentage = 0.0
-        if self.position_value > 0 and self.unrealized_pnl != 0:
-            pnl_percentage = (self.unrealized_pnl / self.position_value) * 100
-        
-        # Log position update with PnL info
-        if old_position != size:
-            self.logger.info(
-                f"Position updated: {old_position:.4f} -> {size:.4f} @ {price:.2f} "
-                f"(PnL: {self.unrealized_pnl:.2f} USD, {pnl_percentage:.2f}%)"
-            )
-        
-        # Update position tracker for advanced metrics
-        self.position_tracker.update_position(size, price)
-        
-        # If hedging is enabled, update the hedge manager with new position information
-        if self.use_hedging and self.hedge_manager is not None:
-            # The try/except is important here as the hedge manager might not be ready
-            try:
-                self.hedge_manager.update_position(self.instrument or "unknown", size, price)
-            except Exception as e:
-                self.logger.error(f"Error updating hedge manager: {str(e)}")
-                
-        # Calculate the monetary position based on position size
-        self.update_monetary_position()
-
-    def update_position_size(self, size: float):
-        """
-        Update only the position size without changing entry price
-        (Fast method to be used with fill-based position tracking)
-        
-        Args:
-            size: Current position size
-        """
-        if size == self.position_size:
-            return  # No change
-            
-        old_position = self.position_size
-        self.position_size = size
-        
-        # If position is reset to zero, clear entry price
-        if size == 0:
-            self.entry_price = 0
-            self.unrealized_pnl = 0
-            self.position_value = 0
-            self.logger.info(f"Position reset to zero (from {old_position:.4f})")
-        else:
-            # Calculate position value (if we have a price)
-            current_price = getattr(self, 'last_mid_price', 0)
-            if current_price > 0:
-                self.position_value = abs(size * current_price)
-                
-                # Calculate unrealized PnL if we have an entry price
-                if hasattr(self, 'entry_price') and self.entry_price and self.entry_price > 0:
-                    if size > 0:  # Long position
-                        self.unrealized_pnl = (current_price - self.entry_price) * size
-                    elif size < 0:  # Short position
-                        self.unrealized_pnl = (self.entry_price - current_price) * abs(size)
-                
-                self.logger.info(f"Position size updated: {old_position:.4f} -> {size:.4f} @ {current_price:.2f}")
-            else:
-                self.logger.info(f"Position size updated: {old_position:.4f} -> {size:.4f} (no price info)")
-        
-        # Update position tracker for advanced metrics
-        self.position_tracker.update_position_size(size)
-        
-        # Calculate the monetary position based on position size
-        self.update_monetary_position()
 
     def update_market_conditions(self, volatility: float, market_impact: float):
         """Update the market conditions used for quote generation"""
@@ -513,7 +407,7 @@ class AvellanedaMarketMaker:
                     self.position_limit = 0.1  # Minimum valid value
                     self.logger.warning(f"Invalid position_limit, using minimum: {self.position_limit}")
             
-            inventory_risk = abs(self.position_size) / max(self.position_limit, 0.001)
+            inventory_risk = abs(self.position_tracker.current_position) / max(self.position_limit, 0.001)
             inventory_component = self.inventory_factor * inventory_risk * volatility_term
             
             # 5. Market state component (trending/ranging adjustment)
@@ -579,7 +473,7 @@ class AvellanedaMarketMaker:
             inventory_skew = 0
             
             if position_limit > 0:
-                inventory_skew = (self.position_size / position_limit) * spread * inventory_skew_factor
+                inventory_skew = (self.position_tracker.current_position / position_limit) * spread * inventory_skew_factor
             
             # Apply predictive reservation price offset (store original for logging)
             original_mid_price = mid_price
@@ -671,21 +565,21 @@ class AvellanedaMarketMaker:
                 position_limit = TRADING_CONFIG["avellaneda"].get("position_limit", 0.1)
                 
             # Calculate position ratio (how full our position capacity is)
-            position_ratio = min(1.0, abs(self.position_size) / max(position_limit, 0.001))
+            position_ratio = min(1.0, abs(self.position_tracker.current_position) / max(position_limit, 0.001))
             
             # Calculate base bid and ask sizes
             bid_size = base_size
             ask_size = base_size
             
             # 1. Adjust based on position direction (asymmetric sizing)
-            if self.position_size > 0:  # Long position - reduce bids, increase asks
+            if self.position_tracker.current_position > 0:  # Long position - reduce bids, increase asks
                 # Decrease bid size as position grows (down to 20% of base size at position limit)
                 bid_size = bid_size * max(0.2, (1.0 - position_ratio * 0.8))
                 
                 # Increase ask size as position grows (up to 150% of base size at position limit)
                 ask_size = ask_size * min(1.5, (1.0 + position_ratio * 0.5))
                 
-            elif self.position_size < 0:  # Short position - increase bids, reduce asks
+            elif self.position_tracker.current_position < 0:  # Short position - increase bids, reduce asks
                 # Increase bid size as position grows (up to 150% of base size at position limit)
                 bid_size = bid_size * min(1.5, (1.0 + position_ratio * 0.5))
                 
@@ -710,8 +604,8 @@ class AvellanedaMarketMaker:
             
             # 4. Risk checks - ensure we don't exceed position limits
             # Calculate remaining capacity
-            buy_capacity = position_limit - self.position_size
-            sell_capacity = position_limit + self.position_size
+            buy_capacity = position_limit - self.position_tracker.current_position
+            sell_capacity = position_limit + self.position_tracker.current_position
             
             # Cap sizes to available capacity
             bid_size = min(bid_size, max(0, buy_capacity))
@@ -736,11 +630,11 @@ class AvellanedaMarketMaker:
             
     def can_increase_position(self) -> bool:
         """Check if we can increase our position (buy more)"""
-        return self.position_size < self.position_limit
+        return self.position_tracker.current_position < self.position_limit
         
     def can_decrease_position(self) -> bool:
         """Check if we can decrease our position (sell some)"""
-        return self.position_size > -self.position_limit
+        return self.position_tracker.current_position > -self.position_limit
 
     def generate_quotes(self, ticker: Ticker, market_conditions: Dict, max_orders: int = None) -> Tuple[List[Quote], List[Quote]]:
         """Generate quotes using Avellaneda-Stoikov market making model with dynamic grid updates"""
@@ -1220,9 +1114,9 @@ class AvellanedaMarketMaker:
             position_check_interval = TRADING_CONFIG["quoting"].get("position_check_interval", 5.0)
             significant_position_threshold = 0.05
             
-            if abs(self.position_size) > significant_position_threshold and current_time - self.last_position_check > position_check_interval:
+            if abs(self.position_tracker.current_position) > significant_position_threshold and current_time - self.last_position_check > position_check_interval:
                 self.last_position_check = current_time
-                self.logger.info(f"Should update quotes: Position check with significant position {self.position_size:.2f}")
+                self.logger.info(f"Should update quotes: Position check with significant position {self.position_tracker.current_position:.2f}")
                 return True
                 
             # 5. Check for forced regular updates (ensure quotes refresh periodically)
@@ -1230,16 +1124,16 @@ class AvellanedaMarketMaker:
             max_update_interval = min(60.0, quote_lifetime * 0.8)  # 80% of quote lifetime or 60s max
             
             # More frequent updates with larger position
-            if abs(self.position_size) > 0:
+            if abs(self.position_tracker.current_position) > 0:
                 # Scale update frequency based on position size
-                position_scale_factor = min(1.0, abs(self.position_size) / TRADING_CONFIG["avellaneda"]["position_limit"])
+                position_scale_factor = min(1.0, abs(self.position_tracker.current_position) / TRADING_CONFIG["avellaneda"]["position_limit"])
                 # More frequent updates as position grows (interval between min and max)
                 update_interval = max_update_interval - (max_update_interval - min_update_interval) * position_scale_factor
                 
                 if time_elapsed > update_interval:
                     self.logger.info(
                         f"Should update quotes: Position-scaled interval reached - "
-                        f"Elapsed: {time_elapsed:.1f}s, Interval: {update_interval:.1f}s, Position: {self.position_size:.3f}"
+                        f"Elapsed: {time_elapsed:.1f}s, Interval: {update_interval:.1f}s, Position: {self.position_tracker.current_position:.3f}"
                     )
                     return True
             # Default update interval for no position
@@ -1356,8 +1250,8 @@ class AvellanedaMarketMaker:
             self.position_tracker.update_on_fill(fill)
             
             # Update market maker state
-            self.position_size = self.position_tracker.current_position
-            self.entry_price = self.position_tracker.average_entry_price
+            # self.position_size = self.position_tracker.current_position # REMOVED - No longer needed as direct access will use position_tracker
+            # self.entry_price = self.position_tracker.average_entry_price # REMOVED - No longer needed as direct access will use position_tracker
             
             # Update VAMP calculations
             self.update_vamp(fill_price, fill_size, is_buy, False)
@@ -1366,7 +1260,7 @@ class AvellanedaMarketMaker:
             self.volume_buffer.update(fill_price, fill_size, is_buy, int(time.time() * 1000))
             
             # Update monetary position (which will trigger hedge updates if needed)
-            self.update_monetary_position()
+            # self.update_monetary_position() # REMOVED - Method was deleted
             
             # Check if we're using the hedge manager and have a valid instrument
             if self.use_hedging and self.hedge_manager is not None:
@@ -1390,7 +1284,7 @@ class AvellanedaMarketMaker:
             
             self.logger.info(
                 f"Order filled: {fill_size} @ {fill_price} ({'BUY' if is_buy else 'SELL'})"
-                f" - New position: {self.position_size:.4f}, Avg entry: {self.entry_price:.2f}"
+                f" - New position: {self.position_tracker.current_position:.4f}, Avg entry: {self.position_tracker.average_entry_price:.2f}" # MODIFIED
             )
             
         except Exception as e:
@@ -1459,8 +1353,8 @@ class AvellanedaMarketMaker:
     def get_position_metrics(self) -> Dict:
         """Get position and performance metrics"""
         metrics = {
-            'position': self.position_size,
-            'entry_price': self.entry_price,
+            'position': self.position_tracker.current_position,
+            'entry_price': self.position_tracker.average_entry_price,
             'realized_pnl': self.position_tracker.realized_pnl,
             'unrealized_pnl': self.position_tracker.unrealized_pnl,
             'total_pnl': self.position_tracker.realized_pnl + self.position_tracker.unrealized_pnl,
@@ -1558,7 +1452,7 @@ class AvellanedaMarketMaker:
             
             if hasattr(self, 'position_limit') and self.position_limit > 0:
                 # Calculate position utilization ratio (how much of our limit we're using)
-                position_utilization = min(1.0, abs(self.position_size) / self.position_limit)
+                position_utilization = min(1.0, abs(self.position_tracker.current_position) / self.position_limit)
                 
                 # Progressive scaling as position grows (more aggressive scaling)
                 # This creates a non-linear increase in gamma as we approach position limits
@@ -1574,8 +1468,8 @@ class AvellanedaMarketMaker:
                 # Additional profitability-based adjustment
                 # If we have a profitable position, we can be more aggressive (lower gamma)
                 # If we have a losing position, we need to be more conservative (higher gamma)
-                if hasattr(self, 'unrealized_pnl') and hasattr(self, 'position_value') and self.position_value > 0:
-                    pnl_percentage = self.unrealized_pnl / self.position_value
+                if self.position_tracker.unrealized_pnl is not None and self.position_tracker.current_value_usd != 0: # MODIFIED (checking current_value_usd != 0)
+                    pnl_percentage = self.position_tracker.unrealized_pnl / self.position_tracker.current_value_usd # MODIFIED
                     
                     # Adjust gamma based on profitability
                     if pnl_percentage >= 0.01:  # >= 1% profit
@@ -1589,8 +1483,8 @@ class AvellanedaMarketMaker:
             
             # Add time-based risk ramp-up for positions held too long
             time_factor = 1.0
-            if hasattr(self, 'position_start_time') and self.position_size != 0:
-                position_duration = time.time() - self.position_start_time
+            if self.position_tracker.current_position != 0 and self.position_tracker.position_start_time is not None: # MODIFIED
+                position_duration = time.time() - self.position_tracker.position_start_time # MODIFIED
                 # If position held more than 30 minutes, start increasing gamma
                 if position_duration > 1800:  # 30 minutes
                     time_multiplier = min(2.0, 1.0 + (position_duration - 1800) / 7200)  # Increase up to 2x over 2 hours
@@ -1610,7 +1504,7 @@ class AvellanedaMarketMaker:
                 f"  - Base gamma:          {base_gamma:.3f}\n"
                 f"  - Volatility:          {volatility:.5f} (factor: {volatility_factor:.2f})\n"
                 f"  - Market impact:       {market_impact:.5f} (factor: {impact_factor:.2f})\n"
-                f"  - Position:            {self.position_size if hasattr(self, 'position_size') else 0} (factor: {position_factor:.2f})\n"
+                f"  - Position:            {self.position_tracker.current_position if hasattr(self, 'position_tracker') else 0} (factor: {position_factor:.2f})\n"
                 f"  - Profitability:       factor: {profitability_factor:.2f}\n"
                 f"  - Time-based risk:     factor: {time_factor:.2f}\n"
                 f"  - Result (unclamped):  {base_gamma * volatility_factor * impact_factor * position_factor * profitability_factor * time_factor:.3f}\n"
@@ -1866,34 +1760,13 @@ class AvellanedaMarketMaker:
                 
         self.logger.info("Cleanup complete")
 
-    def update_monetary_position(self):
-        """Update and log the monetary position value"""
-        if self.last_mid_price > 0:
-            old_monetary = self.monetary_position
-            self.monetary_position = self.position_size * self.last_mid_price
-            
-            # Log the monetary position
-            self.logger.info(f"Monetary position: ${self.monetary_position:.2f} from {self.position_size} {self.instrument} @ {self.last_mid_price}")
-            
-            # Check if monetary position changed significantly
-            if abs(self.monetary_position - old_monetary) > 100:  # $100 change threshold
-                # Update hedge if enabled
-                if self.use_hedging and self.hedge_manager is not None:
-                    self.hedge_manager.update_position(
-                        self.instrument,
-                        self.position_size,
-                        self.last_mid_price
-                    )
-                    # Report hedge status after update
-                    self.report_hedge_status()
-    
     def report_hedge_status(self):
         """Report on monetary position and hedge status"""
         if not self.use_hedging or self.hedge_manager is None:
             return
         
         # Calculate and log monetary position
-        monetary_position = self.position_size * self.last_mid_price
+        monetary_position = self.position_tracker.current_position * self.last_mid_price
         
         # Get hedge position
         hedge_position = self.hedge_manager.get_hedged_position(self.instrument)
@@ -1902,7 +1775,7 @@ class AvellanedaMarketMaker:
             net_monetary = monetary_position + hedge_monetary
             
             self.logger.info(f"=== HEDGE STATUS ===")
-            self.logger.info(f"Primary: {self.position_size} {self.instrument} @ {self.last_mid_price:.2f} = ${monetary_position:.2f}")
+            self.logger.info(f"Primary: {self.position_tracker.current_position} {self.instrument} @ {self.last_mid_price:.2f} = ${monetary_position:.2f}")
             self.logger.info(f"Hedge: {hedge_position.hedge_position} {hedge_position.hedge_asset} @ {hedge_position.hedge_price:.2f} = ${hedge_monetary:.2f}")
             self.logger.info(f"Net monetary exposure: ${net_monetary:.2f}")
             if monetary_position != 0:
@@ -1910,42 +1783,3 @@ class AvellanedaMarketMaker:
             self.logger.info(f"Current P&L: ${hedge_position.pnl:.2f}")
         else:
             self.logger.info(f"No active hedge for {self.instrument} position (${monetary_position:.2f})")
-    
-    def force_hedge_rebalance(self):
-        """Force an immediate rebalance of all hedges"""
-        if self.use_hedging and self.hedge_manager is not None:
-            # Get current position information
-            current_position = self.position_size
-            current_price = self.last_mid_price
-            
-            # Update the position to force hedge calculation
-            result = self.hedge_manager.update_position(
-                self.instrument, 
-                current_position,
-                current_price
-            )
-            
-            self.logger.info(f"Forced hedge rebalance for {self.instrument} position: {current_position} @ {current_price}")
-            
-            # Report on hedge operations
-            if result["hedges"]:
-                for hedge in result["hedges"]:
-                    self.logger.info(f"Hedge operation: {hedge['side']} {hedge['size']} {hedge['hedge_asset']} @ {hedge['price']}")
-            
-            # Report hedge status
-            self.report_hedge_status() 
-
-    def set_volume_candle_buffer(self, volume_candle_buffer):
-        """Set the volume candle buffer for real-time predictions"""
-        # Clean up existing buffer if it exists
-        if hasattr(self, 'volume_buffer') and self.volume_buffer:
-            if hasattr(self.volume_buffer, 'stop'):
-                self.volume_buffer.stop()
-                
-        self.volume_buffer = volume_candle_buffer
-        
-        # Update instrument in the new buffer if we have it set
-        if self.instrument and hasattr(self.volume_buffer, 'instrument'):
-            self.volume_buffer.instrument = self.instrument
-            
-        self.logger.info("Volume candle buffer connected for real-time predictions")

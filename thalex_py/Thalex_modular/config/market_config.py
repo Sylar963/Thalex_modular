@@ -15,7 +15,7 @@ This file defines the configuration for the Thalex Avellaneda-Stoikov market mak
 BOT_CONFIG = {
     # Market parameters
     "market": {
-        "underlying": "BTC-21MAY25",
+        "underlying": "BTC-22MAY25",
         "network": Network.TEST,
         "label": "F",
     },
@@ -59,7 +59,7 @@ BOT_CONFIG = {
             "pa_kappa_adj_threshold": 0.05,
             "pa_res_price_offset_adj_threshold": 0.00005,
             "pa_volatility_adj_threshold": 0.05,
-            "pa_prediction_max_age_seconds": 300,
+            "pa_prediction_max_age_seconds": 5,
         },
         
         # Order execution parameters
@@ -127,8 +127,9 @@ BOT_CONFIG = {
     
     # Risk management
     "risk": {
-        "max_position": 0.02,           # Maximum position size
+        "max_position": 2,           # Maximum position size
         "stop_loss_pct": 0.06,         # Stop loss percentage
+        "take_profit_pct": 0.0022,       # Take profit percentage (NEW - Changed to 0.22%)
         "max_drawdown": 0.10,          # Maximum drawdown
         "max_consecutive_losses": 5,   # Maximum consecutive losses
         "inventory_target": 0.0,       # Target inventory level
@@ -308,17 +309,23 @@ TRADING_CONFIG = {
     "volume_candle": BOT_CONFIG["trading_strategy"]["volume_candle"],
     "volatility": DEFAULT_VOLATILITY_CONFIG,
     "vamp": BOT_CONFIG["trading_strategy"]["vamp"],
-    "volatility_threshold": 0.05
 }
 
-RISK_LIMITS = {
+# RISK_LIMITS - Direct access to risk parameters
+RISK_LIMITS: Dict[str, Any] = {
     "max_position": BOT_CONFIG["risk"]["max_position"],
     "max_notional": BOT_CONFIG["risk"]["max_notional"],
     "max_position_notional": BOT_CONFIG["risk"]["max_position_notional"],
     "stop_loss_pct": BOT_CONFIG["risk"]["stop_loss_pct"],
+    "take_profit_pct": BOT_CONFIG["risk"]["take_profit_pct"],
     "max_drawdown": BOT_CONFIG["risk"]["max_drawdown"],
     "max_consecutive_losses": BOT_CONFIG["risk"]["max_consecutive_losses"],
-    "volatility_threshold": 0.05
+    "inventory_target": BOT_CONFIG["risk"]["inventory_target"],
+    "inventory_imbalance_limit": BOT_CONFIG["risk"]["inventory_imbalance_limit"],
+    "position_rebalance_threshold": BOT_CONFIG["risk"]["position_rebalance_threshold"],
+    "market_impact_threshold": BOT_CONFIG["risk"]["market_impact_threshold"],
+    "rebalance_cooldown": BOT_CONFIG["risk"]["rebalance_cooldown"],
+    # Ensure all keys from BOT_CONFIG["risk"] are present if needed by RiskManager
 }
 
 CONNECTION_CONFIG = BOT_CONFIG["connection"]

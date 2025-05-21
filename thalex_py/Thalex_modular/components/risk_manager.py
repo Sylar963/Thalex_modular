@@ -2,6 +2,7 @@ from typing import Optional, Tuple, Dict, List, Callable, Any
 import numpy as np
 from collections import deque
 import time
+import asyncio
 
 from ..config.market_config import (
     RISK_LIMITS,
@@ -9,9 +10,13 @@ from ..config.market_config import (
 )
 from ..models.data_models import Ticker, Order
 from ..thalex_logging import LoggerFactory
+from ..models.position_tracker import PositionTracker
+
+# Define a tolerance for floating point comparisons (e.g., for position size)
+ZERO_THRESHOLD = 1e-9
 
 class RiskManager:
-    def __init__(self) -> None:
+    def __init__(self, position_tracker: PositionTracker) -> None:
         """Initialize RiskManager with simplified position tracking and risk metrics"""
         # Initialize logger
         self.logger = LoggerFactory.configure_component_logger(
@@ -20,39 +25,21 @@ class RiskManager:
             high_frequency=False
         )
         
-        # Position tracking (core metrics only)
-        self.position_size = 0.0
-        self.entry_price = 0.0
-        self.position_value = 0.0
-        self.position_start_time = 0.0
+        self.position_tracker = position_tracker
         
-        # PnL tracking (simplified)
-        self.realized_pnl = 0.0
-        self.unrealized_pnl = 0.0
-        self.current_drawdown = 0.0
-        self.max_drawdown = 0.0
-        self.peak_profit = 0.0
+        # Load risk parameters from config
+        self.max_position_abs = RISK_LIMITS.get("max_position", float('inf'))
+        self.max_notional_value = RISK_LIMITS.get("max_notional", float('inf'))
+        self.stop_loss_pct = RISK_LIMITS.get("stop_loss_pct")
+        self.take_profit_pct = RISK_LIMITS.get("take_profit_pct")
+        self.max_drawdown = RISK_LIMITS.get("max_drawdown")
+        self.max_consecutive_losses = RISK_LIMITS.get("max_consecutive_losses")
         
-        # Risk utilization
-        self.position_utilization = 0.0
-        self.notional_utilization = 0.0
+        # Position entry time for time-based take profit - To be revisited in Step 3
+        self.position_entry_time_for_current_cycle: Optional[float] = None
         
-        # Core risk limits from config
-        self.max_position = RISK_LIMITS["max_position"]
-        self.max_notional = RISK_LIMITS["max_notional"]
-        self.max_drawdown_pct = RISK_LIMITS["max_drawdown"]
-        self.stop_loss_pct = RISK_LIMITS["stop_loss_pct"]
-        self.take_profit_pct = RISK_LIMITS["take_profit_pct"]
-        
-        # Tracking for reporting
-        self.limit_breaches = {
-            "position_size": 0,
-            "notional_value": 0,
-            "drawdown": 0
-        }
-        
-        # Callback for risk events
-        self.on_risk_limit_breached: Optional[Callable[[str, float], Any]] = None
+        # Callbacks for risk events
+        self.callbacks: Dict[str, Callable[[str, Optional[float]], Any]] = {}
         
         self.logger.info("Simplified risk manager initialized")
         
@@ -63,503 +50,283 @@ class RiskManager:
         """Validate core risk parameters to ensure they are within reasonable ranges"""
         try:
             # Check position limit
-            if self.max_position <= 0:
-                self.logger.warning(f"Invalid max_position: {self.max_position}, using default of 1.0")
-                self.max_position = 1.0
+            if self.max_position_abs <= 0:
+                self.logger.warning(f"Invalid max_position: {self.max_position_abs}, using default of 1.0")
+                self.max_position_abs = 1.0
             
             # Check notional limit
-            if self.max_notional <= 0:
-                self.logger.warning(f"Invalid max_notional: {self.max_notional}, using default of 50000")
-                self.max_notional = 50000
+            if self.max_notional_value <= 0:
+                self.logger.warning(f"Invalid max_notional: {self.max_notional_value}, using default of 50000")
+                self.max_notional_value = 50000
             
             # Check stop loss percentage
-            if self.stop_loss_pct <= 0 or self.stop_loss_pct > 0.5:
+            if self.stop_loss_pct is not None and (self.stop_loss_pct <= 0 or self.stop_loss_pct > 0.5):
                 self.logger.warning(f"Unusual stop_loss_pct: {self.stop_loss_pct}, recommended range is 0.01-0.1")
             
             # Check take profit percentage
-            if self.take_profit_pct <= 0 or self.take_profit_pct > 0.5:
+            if self.take_profit_pct is not None and (self.take_profit_pct <= 0 or self.take_profit_pct > 0.5):
                 self.logger.warning(f"Unusual take_profit_pct: {self.take_profit_pct}, recommended range is 0.01-0.1")
             
             # Check max drawdown
-            if self.max_drawdown_pct <= 0 or self.max_drawdown_pct > 0.5:
-                self.logger.warning(f"Unusual max_drawdown: {self.max_drawdown_pct}, recommended range is 0.05-0.2")
+            if self.max_drawdown is not None and (self.max_drawdown <= 0 or self.max_drawdown > 0.5):
+                self.logger.warning(f"Unusual max_drawdown: {self.max_drawdown}, recommended range is 0.05-0.2")
                 
             self.logger.info("Risk parameters validated")
         except Exception as e:
             self.logger.error(f"Error validating risk parameters: {str(e)}")
 
-    def update_position(self, size: float, price: float, timestamp: Optional[float] = None) -> Dict[str, Any]:
-        """
-        Update position tracking with simplified risk checks
-        
-        Args:
-            size: Position size change (positive for buy, negative for sell)
-            price: Price at which the position change occurred
-            timestamp: Optional timestamp for the update
-            
-        Returns:
-            Dict containing current position metrics and risk status
-        """
-        current_time = timestamp or time.time()
-        
-        # Calculate PnL before update if we have a position
-        if self.position_size != 0:
-            old_pnl = self.calculate_pnl_percentage(price)
-            
-            # Update drawdown
-            if old_pnl < 0:
-                self.current_drawdown = abs(old_pnl)
-                self.max_drawdown = max(self.max_drawdown, self.current_drawdown)
-            else:
-                self.current_drawdown = 0
-                # Track peak profit for take profit logic
-                if old_pnl > self.peak_profit:
-                    self.peak_profit = old_pnl
-        
-        # Update position
-        old_position = self.position_size
-        if self.position_size == 0:
-            self.position_start_time = current_time
-            self.entry_price = price
-        else:
-            # Calculate new entry price based on weighted average
-            total_value = (self.position_size * self.entry_price) + (size * price)
-            self.entry_price = total_value / (self.position_size + size)
-        
-        self.position_size += size
-        self.position_value = abs(self.position_size * price)
-        
-        # Update utilization metrics
-        self.position_utilization = abs(self.position_size) / self.max_position
-        self.notional_utilization = self.position_value / self.max_notional
-        
-        # Check risk limits 
-        exceeded_limit, reason = self.check_position_limits(price)
-        
-        # Log position update
-        if exceeded_limit:
-            self.logger.warning(
-                f"Position updated: {old_position:.3f} -> {self.position_size:.3f} @ {price:.2f} "
-                f"(util: pos={self.position_utilization:.2%}, notional={self.notional_utilization:.2%}). "
-                f"Risk limit exceeded: {reason}"
-            )
-        else:
-            self.logger.info(
-                f"Position updated: {old_position:.3f} -> {self.position_size:.3f} @ {price:.2f} "
-                f"(util: pos={self.position_utilization:.2%}, notional={self.notional_utilization:.2%})"
-            )
-        
-        return {
-            "position_size": self.position_size,
-            "entry_price": self.entry_price,
-            "position_value": self.position_value,
-            "risk_limit_exceeded": exceeded_limit,
-            "reason": reason if exceeded_limit else ""
-        }
-
     def check_position_limits(self, current_price: float) -> Tuple[bool, str]:
         """
-        Check if current position is within the three core risk limits
-        
-        Args:
-            current_price: Current market price
-            
-        Returns:
-            Tuple of (boolean indicating if any limit is exceeded, reason if exceeded)
+        Check if current position size or notional value exceeds defined limits.
+        Uses PositionTracker for current position data.
         """
-        # No position, always within limits
-        if self.position_size == 0:
-            return False, ""
-            
-        # 1. Check absolute position limit
-        if abs(self.position_size) > self.max_position:
-            return True, f"Position size {abs(self.position_size):.3f} exceeds max {self.max_position:.3f}"
-            
-        # 2. Check notional value limit
-        position_value = abs(self.position_size * current_price)
-        if position_value > self.max_notional:
-            return True, f"Position value {position_value:.2f} exceeds max {self.max_notional:.2f}"
-                          
-        # 3. Check max drawdown
-        pnl_pct = self.calculate_pnl_percentage(current_price)
-        if pnl_pct < 0 and abs(pnl_pct) > self.max_drawdown_pct:
-            return True, f"Drawdown {abs(pnl_pct):.2%} exceeds max {self.max_drawdown_pct:.2%}"
-            
-        # All checks passed
+        metrics = self.position_tracker.get_position_metrics()
+        current_pos_size = metrics.get("position", 0.0)
+        
+        # Check absolute position size limit
+        if abs(current_pos_size) > self.max_position_abs:
+            reason = f"Absolute position size |{current_pos_size:.4f}| exceeds limit {self.max_position_abs:.4f}"
+            self.logger.warning(reason)
+            return True, reason
+
+        # Check notional value limit
+        if current_price > 0: # Only check if price is valid
+            notional_value = abs(current_pos_size) * current_price
+            if notional_value > self.max_notional_value:
+                reason = f"Position notional value {notional_value:.2f} USD exceeds limit {self.max_notional_value:.2f} USD"
+                self.logger.warning(reason)
+                return True, reason
+        
         return False, ""
 
     def calculate_pnl_percentage(self, current_price: float) -> float:
         """
-        Calculate PnL as a percentage of the position value
-        
-        Args:
-            current_price: Current market price
-            
-        Returns:
-            Float representing PnL percentage (positive for profit, negative for loss)
+        Calculate the P&L percentage of the current position.
+        Uses PositionTracker for average entry price and position size.
         """
-        # Can't calculate PnL without a position or valid entry price
-        if self.position_size == 0 or self.entry_price == 0:
+        metrics = self.position_tracker.get_position_metrics()
+        avg_entry_price = metrics.get("average_entry")
+        current_pos_size = metrics.get("position", 0.0)
+
+        if abs(current_pos_size) < ZERO_THRESHOLD or avg_entry_price is None or avg_entry_price == 0:
+            return 0.0
+
+        if current_pos_size > 0:  # Long position
+            pnl_per_unit = current_price - avg_entry_price
+        else:  # Short position
+            pnl_per_unit = avg_entry_price - current_price
+        
+        # Total PnL for the current position based on its average entry
+        current_unrealized_pnl = pnl_per_unit * abs(current_pos_size)
+        
+        # Cost basis of the current position
+        cost_basis = avg_entry_price * abs(current_pos_size)
+        if abs(cost_basis) < ZERO_THRESHOLD:
             return 0.0
             
-        # For long positions, profit when current > entry
-        if self.position_size > 0:
-            return (current_price - self.entry_price) / self.entry_price
-        # For short positions, profit when entry > current
-        else:
-            return (self.entry_price - current_price) / self.entry_price
+        return current_unrealized_pnl / cost_basis
 
     def check_stop_loss(self, current_price: float) -> bool:
         """
-        Check if stop loss should be triggered based on current position and price
-        
-        Returns:
-            Boolean indicating if stop loss has been triggered
+        Check if stop-loss condition is met based on P&L percentage.
         """
-        if self.position_size == 0:
+        if self.stop_loss_pct is None:
+            return False # Stop loss is not configured
+
+        metrics = self.position_tracker.get_position_metrics()
+        current_pos_size = metrics.get("position", 0.0)
+
+        if abs(current_pos_size) < ZERO_THRESHOLD:
+            return False # No position to stop out
+
+        # Update unrealized PnL in PositionTracker before checking
+        self.position_tracker.update_unrealized_pnl(current_price)
+        # Fetch updated metrics
+        metrics_after_upnl_update = self.position_tracker.get_position_metrics()
+        unrealized_pnl_value = metrics_after_upnl_update.get("unrealized_pnl", 0.0)
+        avg_entry_price = metrics_after_upnl_update.get("average_entry")
+
+        if avg_entry_price is None or abs(avg_entry_price * current_pos_size) < ZERO_THRESHOLD : # Avoid division by zero if cost basis is zero
+            self.logger.debug("Stop-loss check: No valid cost basis for PnL calculation.")
             return False
-            
-        pnl_pct = self.calculate_pnl_percentage(current_price)
+
+        # PnL percentage is calculated as UnrealizedPnL / CostBasis
+        # CostBasis = abs(position_size * average_entry_price)
+        cost_basis = abs(current_pos_size * avg_entry_price)
+        if cost_basis == 0: # Should be caught by above, but defensive check
+             return False
         
-        # Dynamic stop-loss adjustment - if in profit, widen the stop-loss
-        effective_stop_loss = self.stop_loss_pct
+        current_pnl_pct = unrealized_pnl_value / cost_basis
         
-        # If we're in profit, dynamically adjust the stop loss to be wider
-        # This lets winners run while protecting capital
-        if pnl_pct > 0:
-            # Gradually widen stop loss as profit increases (up to 2x wider at take_profit level)
-            profit_ratio = min(1.0, pnl_pct / self.take_profit_pct)
-            stop_loss_multiplier = 1.0 + profit_ratio  # Ranges from 1.0 to 2.0
-            effective_stop_loss = self.stop_loss_pct * stop_loss_multiplier
-            
-            # For significant profits (>2x take_profit), use a trailing stop
-            if pnl_pct > self.take_profit_pct * 2:
-                # Trailing stop at 50% of current profit
-                trailing_stop = pnl_pct * 0.5
-                effective_stop_loss = max(effective_stop_loss, trailing_stop)
-        
-        # Check stop loss percentage threshold with dynamic adjustment
-        if pnl_pct <= -effective_stop_loss:
+        # Stop loss is triggered if P&L percentage is less than or equal to negative stop_loss_pct
+        if current_pnl_pct <= -self.stop_loss_pct:
             self.logger.warning(
-                f"Stop loss triggered: PnL {pnl_pct:.2%} below threshold -{effective_stop_loss:.2%}. "
-                f"Position: {self.position_size:.3f} @ {self.entry_price:.2f}, current price: {current_price:.2f}"
+                f"Stop-loss triggered. Position: {current_pos_size:.4f}, Entry: {avg_entry_price:.2f}, "
+                f"Current Price: {current_price:.2f}, P&L %: {current_pnl_pct:.4%}, Stop Loss %: {-self.stop_loss_pct:.2%}"
             )
             return True
-            
-        # Check drawdown threshold 
-        if self.current_drawdown >= self.max_drawdown_pct:
-            self.logger.warning(
-                f"Stop loss triggered: Drawdown {self.current_drawdown:.2%} exceeded max {self.max_drawdown_pct:.2%}. "
-                f"Position: {self.position_size:.3f} @ {self.entry_price:.2f}, current price: {current_price:.2f}"
-            )
-            return True
-            
         return False
-        
+
     def check_take_profit(self, current_price: float) -> Tuple[bool, str, float]:
         """
-        Check if take profit should be triggered with enhanced partial profit taking
-        
-        Args:
-            current_price: Current market price
-            
-        Returns:
-            Tuple of (boolean indicating if take profit triggered, reason string, portion to close)
+        Check if take-profit conditions are met.
+        Currently only checks P&L percentage based take profit.
+        Time-based take-profit needs to be re-evaluated in Step 3.
+        Returns: (triggered, reason, portion_to_close) - portion_to_close is always 1.0 for now
         """
-        if self.position_size == 0:
+        if self.take_profit_pct is None:
+            return False, "", 0.0 # Take profit P&L not configured
+
+        metrics = self.position_tracker.get_position_metrics()
+        current_pos_size = metrics.get("position", 0.0)
+
+        if abs(current_pos_size) < ZERO_THRESHOLD:
+            return False, "", 0.0 # No position
+
+        # Update unrealized PnL in PositionTracker before checking
+        self.position_tracker.update_unrealized_pnl(current_price)
+        # Fetch updated metrics
+        metrics_after_upnl_update = self.position_tracker.get_position_metrics()
+        unrealized_pnl_value = metrics_after_upnl_update.get("unrealized_pnl", 0.0)
+        avg_entry_price = metrics_after_upnl_update.get("average_entry")
+
+        if avg_entry_price is None or abs(avg_entry_price * current_pos_size) < ZERO_THRESHOLD:
+            self.logger.debug("Take-profit check: No valid cost basis for PnL calculation.")
             return False, "", 0.0
-            
-        pnl_pct = self.calculate_pnl_percentage(current_price)
         
-        # No take profit if we're in a loss
-        if pnl_pct <= 0:
+        cost_basis = abs(current_pos_size * avg_entry_price)
+        if cost_basis == 0:
             return False, "", 0.0
-            
-        # Enhanced take profit with progressive profit-taking strategy
-        # Take partial profits at different levels
+
+        current_pnl_pct = unrealized_pnl_value / cost_basis
+
+        # P&L based take profit
+        if self.take_profit_pct is not None and current_pnl_pct >= self.take_profit_pct:
+            reason = (
+                f"P&L take profit triggered. Position: {current_pos_size:.4f}, Entry: {avg_entry_price:.2f}, "
+                f"Current Price: {current_price:.2f}, P&L %: {current_pnl_pct:.4%}, Target TP %: {self.take_profit_pct:.2%}"
+            )
+            self.logger.info(reason)
+            return True, reason, 1.0 # Close entire position
+
+        # Time-based take profit (Placeholder - to be refined in Step 3)
+        # if self.position_entry_time_for_current_cycle and self.take_profit_duration_seconds:
+        #     position_duration = time.time() - self.position_entry_time_for_current_cycle
+        #     if position_duration >= self.take_profit_duration_seconds:
+        #         # Ensure minimum profit for time-based closure, e.g. PNL % > 0.001 (0.1%)
+        #         if current_pnl_pct > RISK_LIMITS.get("min_profit_for_timed_exit_pct", 0.001):
+        #             reason = (
+        #                 f"Time-based take profit triggered. Duration: {position_duration:.0f}s >= {self.take_profit_duration_seconds}s "
+        #                 f"with P&L %: {current_pnl_pct:.4%}"
+        #             )
+        #             self.logger.info(reason)
+        #             return True, reason, 1.0 # Close entire position
         
-        # Stage 1: Take 25% at the main take profit threshold
-        if pnl_pct >= self.take_profit_pct:
-            portion_to_close = 0.25
-            reason = f"Take profit level 1: {pnl_pct:.2%} >= {self.take_profit_pct:.2%}, closing {portion_to_close:.0%}"
-            return True, reason, portion_to_close
-        
-        # Stage 2: Take another 25% at 1.5x the take profit threshold    
-        if pnl_pct >= self.take_profit_pct * 1.5:
-            portion_to_close = 0.25
-            reason = f"Take profit level 2: {pnl_pct:.2%} >= {self.take_profit_pct*1.5:.2%}, closing {portion_to_close:.0%}"
-            return True, reason, portion_to_close
-            
-        # Stage 3: Take another 25% at 2x the take profit threshold
-        if pnl_pct >= self.take_profit_pct * 2.0:
-            portion_to_close = 0.25
-            reason = f"Take profit level 3: {pnl_pct:.2%} >= {self.take_profit_pct*2.0:.2%}, closing {portion_to_close:.0%}"
-            return True, reason, portion_to_close
-            
-        # Stage 4: Close final 25% at 3x the take profit threshold
-        if pnl_pct >= self.take_profit_pct * 3.0:
-            portion_to_close = 0.25  # Close the remainder
-            reason = f"Take profit level 4: {pnl_pct:.2%} >= {self.take_profit_pct*3.0:.2%}, closing final {portion_to_close:.0%}"
-            return True, reason, portion_to_close
-        
-        # Simple trailing take profit logic as a safety net
-        if self.peak_profit > self.take_profit_pct * 0.5:  # Only apply trailing if we've seen significant profit
-            profit_drawdown = (self.peak_profit - pnl_pct) / self.peak_profit if self.peak_profit > 0 else 0
-            if profit_drawdown > 0.5:  # Don't give back more than 50% of peak profit
-                reason = f"Trailing take profit: Given back {profit_drawdown:.2%} of peak profit {self.peak_profit:.2%}"
-                return True, reason, 1.0  # Close the entire position to protect profit
-            
         return False, "", 0.0
 
     async def check_risk_limits(self, current_market_price: Optional[float] = None) -> bool:
         """
-        Check all risk limits and return whether trading should continue.
-        Uses provided current_market_price for more accurate checks if available.
-        
-        Args:
-            current_market_price: Optional current market price for up-to-date calculations.
-            
-        Returns:
-            Boolean indicating if risk limits are within acceptable range (True = OK, False = Breach)
+        Centralized method to check all relevant risk limits.
+        Returns True if NO limits are breached, False if ANY limit is breached.
         """
-        # Skip if no position
-        if self.position_size == 0:
-            return True # True means OK, no limits breached
-            
-        price_for_check = current_market_price
-        source_of_price = "provided current_market_price"
+        if current_market_price is None:
+            self.logger.warning("Risk check: current_market_price is None. Cannot perform all checks.")
+            # Potentially allow some checks that don't need price, or return False to be safe.
+            # For now, if price is critical for most checks, let's consider it a failure.
+            if self.callbacks.get("risk_limit"):
+                asyncio.create_task(self.callbacks["risk_limit"]("No market price for risk check", None))
+            return False # Cannot reliably check all limits
 
-        if current_market_price is None or current_market_price <= 0:
-            self.logger.warning(
-                "current_market_price not provided or invalid for check_risk_limits. "
-                "Falling back to potentially stale internal self.position_value and self.current_drawdown."
-            )
-            price_for_check = self.entry_price # Or some other fallback like last known price if entry_price is 0
-            if hasattr(self, 'last_known_price') and self.last_known_price > 0: # Assuming self.last_known_price could be a thing
-                 price_for_check = self.last_known_price
-            elif self.entry_price <= 0 and self.position_size != 0: # Critical fallback if no price info
-                 self.logger.error("Cannot perform accurate risk check without a valid price. Breaching for safety.")
-                 if self.on_risk_limit_breached:
-                     await self.on_risk_limit_breached("Critical: No valid price for risk check", 0.0)
-                 return False # Breach for safety
-            source_of_price = "internal last known/entry price"
+        # 1. Check Position Limits (Size and Notional Value)
+        limit_exceeded, reason = self.check_position_limits(current_market_price)
+        if limit_exceeded:
+            self.logger.critical(f"Risk Breach: {reason}")
+            if self.callbacks.get("risk_limit"):
+                 # If callback is async, ensure it's awaited or created as a task
+                callback_fn = self.callbacks["risk_limit"]
+                if asyncio.iscoroutinefunction(callback_fn):
+                    asyncio.create_task(callback_fn(reason, current_market_price))
+                else:
+                    callback_fn(reason, current_market_price) # Assume sync
+            return False # Limit breached
 
+        # If in a position, check for Stop-Loss and Take-Profit
+        metrics = self.position_tracker.get_position_metrics()
+        current_pos_size = metrics.get("position", 0.0)
 
-        calculated_position_value = abs(self.position_size * price_for_check)
-        
-        # Recalculate PnL and drawdown potential with the price_for_check
-        pnl_pct_at_check_price = self.calculate_pnl_percentage(price_for_check)
-        drawdown_at_check_price = abs(pnl_pct_at_check_price) if pnl_pct_at_check_price < 0 else 0.0
-        
-        try:
-            # 1. Position size limit (independent of current_market_price)
-            if abs(self.position_size) > self.max_position:
-                reason = f"Position size limit exceeded: {abs(self.position_size):.3f} > {self.max_position:.3f}"
-                self.logger.warning(reason)
-                self.limit_breaches["position_size"] += 1
-                if self.on_risk_limit_breached:
-                    await self.on_risk_limit_breached(reason, price_for_check) # Pass the price used for context
-                return False # False means breach
-                
-            # 2. Notional value limit (uses calculated_position_value)
-            if calculated_position_value > self.max_notional:
-                reason = (
-                    f"Notional value limit exceeded: {calculated_position_value:.2f} (using {source_of_price} @ {price_for_check:.2f}) "
-                    f"> {self.max_notional:.2f}"
-                )
-                self.logger.warning(reason)
-                self.limit_breaches["notional_value"] += 1
-                if self.on_risk_limit_breached:
-                    await self.on_risk_limit_breached(reason, price_for_check)
-                return False
-                
-            # 3. Drawdown limit (uses drawdown_at_check_price)
-            # Note: self.current_drawdown is historical. drawdown_at_check_price is 'what if' at current price.
-            # The limit self.max_drawdown_pct should apply to the potential drawdown at current market conditions.
-            if drawdown_at_check_price > self.max_drawdown_pct:
-                reason = (
-                    f"Potential drawdown limit exceeded: {drawdown_at_check_price:.2%} (using {source_of_price} @ {price_for_check:.2f}) "
-                    f"> {self.max_drawdown_pct:.2%}"
-                )
-                self.logger.warning(reason)
-                self.limit_breaches["drawdown"] += 1
-                if self.on_risk_limit_breached:
-                    await self.on_risk_limit_breached(reason, price_for_check)
-                return False
-                
-            return True # True means OK
-            
-        except Exception as e:
-            self.logger.error(f"Error checking risk limits: {str(e)}")
-            if self.on_risk_limit_breached:
-                await self.on_risk_limit_breached(f"Error during risk check: {str(e)}", price_for_check if price_for_check else 0.0)
-            return False  # Default to safety (breach) in case of errors
+        if abs(current_pos_size) > ZERO_THRESHOLD: # Only if there's an open position
+            # 2. Check Stop Loss
+            if self.check_stop_loss(current_market_price):
+                # The reason is logged within check_stop_loss.
+                # The callback here indicates a general risk breach due to stop-loss.
+                if self.callbacks.get("risk_limit"):
+                    reason_sl = f"Stop-loss triggered at price {current_market_price:.2f}"
+                    asyncio.create_task(self.callbacks["risk_limit"](reason_sl, current_market_price))
+                return False # Stop-loss triggered, considered a risk breach
 
-    def register_callback(self, event_type: str, callback: Callable[[str, float], Any]) -> None:
-        """Register a callback function for risk limit breaches"""
-        if event_type == "risk_limit":
-            self.on_risk_limit_breached = callback
-        else:
-            self.logger.warning(f"Unknown event type for callback registration: {event_type}")
-    
+            # 3. Check Take Profit (if configured to also halt/notify on TP)
+            # Current AvellanedaQuoter handles TP closures and then calls _handle_risk_breach.
+            # So, we might not need to explicitly return False from here on TP,
+            # but the check can be performed for logging or other actions.
+            # For consistency, if a TP action leads to halting, it's a "risk management action".
+            # tp_triggered, tp_reason, _ = self.check_take_profit(current_market_price)
+            # if tp_triggered:
+            #     self.logger.info(f"Risk Info: Take-profit condition met: {tp_reason}")
+            #     # Depending on bot policy, TP might not be a "breach" that stops all quoting
+            #     # but rather a desired outcome. If it implies halting, then:
+            #     # if self.callbacks.get("risk_limit"):
+            #     #     asyncio.create_task(self.callbacks["risk_limit"](tp_reason, current_market_price))
+            #     # return False 
+
+        # Add checks for max_drawdown, max_consecutive_losses if implemented
+        # For max_drawdown, you'd need to track portfolio value over time.
+        # For max_consecutive_losses, you'd need to track outcomes of individual trades/cycles.
+        # These are more complex and are not fully implemented with PositionTracker alone yet.
+
+        return True # No limits breached
+
+    def register_callback(self, event_type: str, callback: Callable[[str, Optional[float]], Any]) -> None:
+        """Register a callback for a specific risk event type."""
+        self.callbacks[event_type] = callback
+        self.logger.info(f"Callback registered for risk event: {event_type}")
+
     def get_risk_summary(self) -> Dict[str, Any]:
         """
-        Get summary of current risk metrics
-        
-        Returns:
-            Dictionary containing current risk metrics
+        Provide a summary of current risk exposure and P&L.
         """
-        return {
-            "position_size": self.position_size,
-            "entry_price": self.entry_price,
-            "position_value": self.position_value,
-            "position_utilization": self.position_utilization,
-            "notional_utilization": self.notional_utilization,
-            "current_drawdown": self.current_drawdown,
-            "max_drawdown": self.max_drawdown,
-            "limit_breaches": self.limit_breaches,
-            "position_duration": time.time() - self.position_start_time if self.position_size != 0 else 0
+        metrics = self.position_tracker.get_position_metrics()
+        current_pos_size = metrics.get("position", 0.0)
+        avg_entry = metrics.get("average_entry")
+        real_pnl = metrics.get("realized_pnl", 0.0)
+        unreal_pnl = metrics.get("unrealized_pnl", 0.0) # Will be updated by AvellanedaQuoter
+
+        summary = {
+            "current_position_size": current_pos_size,
+            "average_entry_price": avg_entry if avg_entry is not None else 0.0,
+            "realized_pnl": real_pnl,
+            "unrealized_pnl": unreal_pnl, # This needs current market price to be accurate
+            "max_position_limit": self.max_position_abs,
+            "max_notional_limit": self.max_notional_value,
+            "stop_loss_threshold_pct": self.stop_loss_pct,
+            "take_profit_threshold_pct": self.take_profit_pct,
+            # "active_stop_loss_price": self.calculate_stop_loss_price(), # Would need current_price to calc
+            # "active_take_profit_price": self.calculate_take_profit_price() # Would need current_price
         }
+        return summary
 
-    async def update_trade_metrics(self, trade_data: Dict) -> None:
+    # Helper method to potentially get/set the position_entry_time_for_current_cycle
+    # This is a placeholder concept for how time-based logic might be managed.
+    def set_position_entry_time_for_cycle(self, entry_time: Optional[float]):
         """
-        Update metrics based on trade data (simplified)
-        
-        Args:
-            trade_data: Dictionary containing trade information
+        Sets the entry time for the current position cycle.
+        This is a conceptual method for time-based rule management and will be refined.
         """
-        try:
-            # Extract trade info
-            price = trade_data.get("price", 0.0)
-            amount = trade_data.get("amount", 0.0)
-            direction = trade_data.get("direction", "")
-            
-            # Skip if invalid data
-            if price <= 0 or amount <= 0 or direction not in ["buy", "sell"]:
-                return
-                
-            # Update PnL if applicable
-            if direction == "buy":
-                self.realized_pnl += trade_data.get("realized_pnl", 0.0)
-            elif direction == "sell":
-                self.realized_pnl += trade_data.get("realized_pnl", 0.0)
-                
-            # Check risk limits after trades
-            current_time = time.time()
-            trade_record = {
-                "timestamp": current_time,
-                "price": price,
-                "amount": amount, 
-                "direction": direction,
-                "realized_pnl": trade_data.get("realized_pnl", 0.0)
-            }
-            
-            # No need to store extensive trade history
-            
-        except Exception as e:
-            self.logger.error(f"Error updating trade metrics: {str(e)}")
-
-    async def update_position_fill(self, direction: str, price: float, size: float, timestamp: Optional[float] = None) -> Dict[str, Any]:
-        """
-        Update position tracking directly from order fill events (faster, more accurate)
-        
-        Args:
-            direction: Order direction ('buy' or 'sell')
-            price: Fill price
-            size: Fill size
-            timestamp: Optional timestamp for the update
-            
-        Returns:
-            Dict containing current position metrics and risk status
-        """
-        current_time = timestamp or time.time()
-        
-        # Adjust size based on direction
-        position_change = size if direction.lower() == 'buy' else -size
-        
-        # Calculate PnL before update if we have a position
-        if self.position_size != 0:
-            old_pnl = self.calculate_pnl_percentage(price)
-            
-            # Update drawdown
-            if old_pnl < 0:
-                self.current_drawdown = abs(old_pnl)
-                self.max_drawdown = max(self.max_drawdown, self.current_drawdown)
-            else:
-                self.current_drawdown = 0
-                # Track peak profit for take profit logic
-                if old_pnl > self.peak_profit:
-                    self.peak_profit = old_pnl
-        
-        # Update position
-        old_position = self.position_size
-        new_position = self.position_size + position_change
-        
-        # Calculate if this is a new position, adding to position, or reducing position
-        is_new_position = (old_position == 0)
-        is_reducing_position = (abs(new_position) < abs(old_position) and 
-                                ((old_position > 0 and new_position > 0) or 
-                                 (old_position < 0 and new_position < 0)))
-        is_closing_position = (new_position == 0)
-        is_reversing_position = (old_position * new_position < 0)  # Sign change
-        
-        # Handle entry price updates
-        if is_new_position:
-            # New position - set entry price to fill price
-            self.position_start_time = current_time
-            self.entry_price = price
-            self.logger.info(f"New position opened: {position_change:.4f} @ {price:.2f}")
-        elif is_reducing_position or is_closing_position:
-            # Reducing position - calculate realized PnL
-            pnl = position_change * (price - self.entry_price) * (-1 if old_position < 0 else 1)
-            self.realized_pnl += pnl
-            
-            if is_closing_position:
-                # Position closed - reset entry price
-                self.entry_price = 0
-                self.logger.info(f"Position closed: realized PnL: {pnl:.2f}")
-            else:
-                # Keep same entry price when reducing
-                self.logger.info(f"Position reduced: {old_position:.4f} -> {new_position:.4f}, realized PnL: {pnl:.2f}")
-        elif is_reversing_position:
-            # Position reversal - close old position, open new position
-            # Calculate realized PnL on the closed portion
-            pnl = old_position * (price - self.entry_price) * (-1 if old_position < 0 else 1)
-            self.realized_pnl += pnl
-            
-            # Set new entry price
-            self.entry_price = price
-            self.position_start_time = current_time
-            self.logger.info(f"Position reversed: {old_position:.4f} -> {new_position:.4f}, realized PnL: {pnl:.2f}")
+        self.position_entry_time_for_current_cycle = entry_time
+        if entry_time:
+            self.logger.info(f"Position entry time for current cycle set to: {time.ctime(entry_time)}")
         else:
-            # Adding to position - update entry price with weighted average
-            total_value = (self.position_size * self.entry_price) + (position_change * price)
-            self.entry_price = total_value / new_position
-            self.logger.info(f"Position increased: {old_position:.4f} -> {new_position:.4f} @ {price:.2f}, new avg: {self.entry_price:.2f}")
-        
-        # Update position size
-        self.position_size = new_position
-        self.position_value = abs(self.position_size * price)
-        
-        # Update utilization metrics
-        self.position_utilization = abs(self.position_size) / self.max_position
-        self.notional_utilization = self.position_value / self.max_notional
-        
-        # Check risk limits 
-        exceeded_limit, reason = self.check_position_limits(price)
-        
-        # Log position update
-        if exceeded_limit:
-            self.logger.warning(
-                f"Position updated from fills: {old_position:.3f} -> {self.position_size:.3f} @ {price:.2f} "
-                f"(util: pos={self.position_utilization:.2%}, notional={self.notional_utilization:.2%}). "
-                f"Risk limit exceeded: {reason}"
-            )
-        
-        return {
-            "position_size": self.position_size,
-            "entry_price": self.entry_price,
-            "position_value": self.position_value,
-            "risk_limit_exceeded": exceeded_limit,
-            "reason": reason if exceeded_limit else ""
-        }
+            self.logger.info("Position entry time for current cycle cleared.")
+
+    def get_position_entry_time_for_cycle(self) -> Optional[float]:
+        """Gets the entry time for the current position cycle."""
+        return self.position_entry_time_for_current_cycle

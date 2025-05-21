@@ -22,31 +22,18 @@ from ..config.market_config import (
     BOT_CONFIG,
     MARKET_CONFIG,
     TRADING_CONFIG,
-    RISK_LIMITS, # Changed from RISK_CONFIG
-    ORDERBOOK_CONFIG # Added import for ORDERBOOK_CONFIG
+    RISK_LIMITS,
+    ORDERBOOK_CONFIG
 )
-from ..thalex_logging import LoggerFactory # Added import
+from ..thalex_logging import LoggerFactory
 
 # Basic configuration - use values from MARKET_CONFIG
 UNDERLYING = MARKET_CONFIG["underlying"]
 LABEL = MARKET_CONFIG["label"]
 NETWORK = MARKET_CONFIG["network"]
 
-# Order book configuration - use values from TRADING_CONFIG
-# REMOVED global constants: AMEND_THRESHOLD, SPREAD, BID_STEP, ASK_STEP, BID_SIZES, ASK_SIZES
-# These were problematic as TRADING_CONFIG does not have an "order" subkey as previously assumed.
-# Functionality should rely on QUOTING_CONFIG or AVELLANEDA_CONFIG.
-
-# These configuration dictionaries have been moved to market_config.py
-# Reference them from the imported configurations
-# POSITION_LIMITS now comes from RISK_LIMITS
-# QUOTING_CONFIG now comes from TRADING_CONFIG["quoting"]
-# INVENTORY_CONFIG now comes from RISK_CONFIG["inventory"]
-# SIGNAL_CONFIG now comes from BOT_CONFIG["technical"]["signal"]
-# AVELLANEDA_CONFIG now comes from TRADING_CONFIG["avellaneda"]
-
 # Define convenience variables for imported configurations
-POSITION_LIMITS = RISK_LIMITS # Changed from RISK_CONFIG["limits"]
+POSITION_LIMITS = RISK_LIMITS
 
 # Construct QUOTING_CONFIG from modern config sources
 _quoting_config_source = {
@@ -56,7 +43,7 @@ _quoting_config_source = {
     "adverse_selection_threshold": TRADING_CONFIG.get("avellaneda", {}).get("adverse_selection_threshold"), # For amend_threshold mapping
     "size_multipliers": TRADING_CONFIG.get("avellaneda", {}).get("size_multipliers"), # For base_levels logic
     "max_levels": TRADING_CONFIG.get("avellaneda", {}).get("max_levels"), # For base_levels logic
-    "base_size": TRADING_CONFIG.get("avellaneda", {}).get("base_size"), # For base_levels logic
+    "base_size": TRADING_CONFIG.get("avellaneda", {}).get("base_size"),
 
     # From TRADING_CONFIG["quote_timing"]
     "min_quote_interval": TRADING_CONFIG.get("quote_timing", {}).get("min_interval"),
@@ -94,18 +81,15 @@ _inventory_config_source = {
     "inventory_skew_factor": TRADING_CONFIG.get("avellaneda", {}).get("inventory_weight"),
     "max_position_notional": RISK_LIMITS.get("max_position_notional"),
     "min_profit_rebalance": TRADING_CONFIG.get("avellaneda", {}).get("min_profit_rebalance"),
-    "gradual_exit_steps": TRADING_CONFIG.get("avellaneda", {}).get("max_loss_threshold"), # Note: source key name is max_loss_threshold
+    "gradual_exit_steps": TRADING_CONFIG.get("avellaneda", {}).get("max_loss_threshold"),
     "inventory_cost_factor": TRADING_CONFIG.get("avellaneda", {}).get("inventory_cost_factor"),
 }
 INVENTORY_CONFIG = {k: v for k, v in _inventory_config_source.items() if v is not None}
 
-# Ensure keys used in data_models.py are present with defaults if necessary
-# e.g. the key "max_loss_threshold" is used in handle_position_loss, 
-# and its value was sourced from "gradual_exit_steps" in the legacy config.
+# Ensure "max_loss_threshold" is present if "gradual_exit_steps" was sourced.
 if "max_loss_threshold" not in INVENTORY_CONFIG and INVENTORY_CONFIG.get("gradual_exit_steps") is not None:
     INVENTORY_CONFIG["max_loss_threshold"] = INVENTORY_CONFIG["gradual_exit_steps"]
 
-# SIGNAL_CONFIG = BOT_CONFIG.get("technical", {}).get("signal", {}) # Removed SIGNAL_CONFIG
 AVELLANEDA_CONFIG = TRADING_CONFIG["avellaneda"] if "avellaneda" in TRADING_CONFIG else {}
 
 # Performance metrics
@@ -190,7 +174,7 @@ class Order:
     @classmethod
     def from_dict(cls, data: Dict) -> 'Order':
         order = cls(
-            id=data["id"],  # Changed from oid to id
+            id=data["id"],
             price=data["price"],
             amount=data["amount"],
             status=OrderStatus(data["status"]) if data.get("status") else None
@@ -261,18 +245,12 @@ class Quote:
             side=data.get("side", ""),
             timestamp=data.get("timestamp", time.time())
         )
-
 class PerpQuoter:
     def __init__(self, thalex: th.Thalex):
         self.thalex = thalex
         self.ticker = None
         self.instruments = []
         self.perp_instrument_name = None
-        # self.tick = 0 # Replaced by Optional[float] below
-        # self.position_size = 0 # Replaced by float below
-        # self.entry_price = 0 # Replaced by Optional[float] below
-        # self.realized_pnl = 0 # Replaced by float below
-        # self.unrealized_pnl = 0 # Replaced by float below
         
         # Initialize operation semaphore with concurrency limit
         self.operation_semaphore = asyncio.Semaphore(TRADING_CONFIG["quoting"]["max_pending_operations"])
@@ -280,12 +258,12 @@ class PerpQuoter:
         self.portfolio: Dict[str, float] = {}
         self.orders: List[List[Order]] = [[], []]  # bids, asks
         self.client_order_id: int = 100
-        self.tick: Optional[float] = None # This is critical, should be set (e.g. in await_instruments)
+        self.tick: Optional[float] = None # Critical, set in await_instruments
         self.perp_name: Optional[str] = None
         
         # Position management
         self.position_size: float = 0.0
-        self.entry_price: Optional[float] = None  # Initialize as None to distinguish between no position and zero price
+        self.entry_price: Optional[float] = None
         self.last_rebalance = 0
         
         # Initialize price tracking
@@ -296,15 +274,15 @@ class PerpQuoter:
         self.price_history = deque(maxlen=100)
         self.last_alert_time = {}
         self.quoting_enabled = True
-        self.entry_prices = {}  # Dictionary to track entry prices for partial positions
+        self.entry_prices = {} # Track entry prices for partial positions
         # Add parameters for Avellaneda-Stoikov model
         self.gamma = 0.1  # Risk aversion parameter
         self.k = 1.5     # Order flow intensity
         self.sigma = 0.0 # Market volatility (dynamic)
         self.T = 1.0     # Time horizon
         self.price_window = deque(maxlen=100)
-        self.pnl_history = []  # List to store cumulative PnL over time
-        self.time_history = []  # List to store timestamps for plotting
+        self.pnl_history = []
+        self.time_history = []
         
         # Add PnL tracking attributes
         self.realized_pnl: float = 0.0
@@ -314,11 +292,10 @@ class PerpQuoter:
         self.pending_operations = set()
         self.last_operation_times = {}
         self.last_quote_task = 0
-        self.last_quote_update = 0  # Also add this for quote update tracking
+        self.last_quote_update = 0
         self.last_position_check = 0
         self.last_rebalance_time = 0
         self.last_stop_loss = 0
-        # self.last_take_profit = 0 # Removed
         self.last_close_attempt = 0
         self.last_emergency_close = 0
         self.orders_lock = asyncio.Lock()
@@ -365,14 +342,14 @@ class PerpQuoter:
 
         if abs(position) >= POSITION_LIMITS.get("max_position", float('inf')):
             logging.warning(f"Position {position} exceeds limit of {POSITION_LIMITS.get('max_position')}")
-            await self.handle_risk_breach() # Added await
+            await self.handle_risk_breach()
             return False
         
         # Calculate notional value
         notional = abs(position * entry_price)
         if notional >= POSITION_LIMITS.get("max_notional", float('inf')):
             logging.warning(f"Notional value {notional} exceeds limit of {POSITION_LIMITS.get('max_notional')}")
-            await self.handle_risk_breach() # Added await
+            await self.handle_risk_breach()
             return False
             
         # Check rebalance threshold from BOT_CONFIG directly as it's not in RISK_LIMITS
@@ -618,7 +595,7 @@ class PerpQuoter:
             self.logger.warning("Ticker or mark_price not available for dynamic spread calculation.")
             # Fallback: use configured min_spread_ticks * self.tick if possible, or a small default if not.
             if self.tick and self.tick > 0:
-                min_spread_ticks = QUOTING_CONFIG.get("min_spread", 3.0) # Default to 3.0 ticks
+                min_spread_ticks = QUOTING_CONFIG.get("min_spread", 3.0)
                 return min_spread_ticks * self.tick
             return 0.01 # Small absolute fallback if no tick size
 
@@ -1121,26 +1098,36 @@ class PerpQuoter:
             self.portfolio[instrument] = new_position
             
             if instrument == self.perp_name:
+                self.logger.info(f"Portfolio callback for {self.perp_name}. Old_pos_internal: {self.position_size:.4f}, Old_pos_portfolio_msg: {old_position:.4f}, New_pos_portfolio_msg: {new_position:.4f}") # Modified Log
                 # Update position_entry_time
                 if old_position == 0 and new_position != 0:
                     self.position_entry_time = time.time()
-                    self.logger.info(f"New position detected for {self.perp_name}. Entry time set to: {self.position_entry_time}")
+                    self.logger.info(f"New position DETECTED for {self.perp_name}. old_portfolio_pos_msg: {old_position:.4f}, new_portfolio_pos_msg: {new_position:.4f}. Entry time SET to: {self.position_entry_time}") # Modified Log
                 elif old_position != 0 and new_position == 0:
                     self.position_entry_time = None # Reset when position is closed
-                    self.logger.info(f"Position for {self.perp_name} closed. Entry time reset.")
+                    self.logger.info(f"Position CLOSED for {self.perp_name}. old_portfolio_pos_msg: {old_position:.4f}, new_portfolio_pos_msg: {new_position:.4f}. Entry time RESET.") # Modified Log
+                elif old_position != 0 and new_position != 0 and self.position_entry_time is None: 
+                    self.position_entry_time = time.time() # Or try to recover a more accurate time if possible
+                    self.logger.warning(f"Position ONGOING for {self.perp_name} but P_E_T was None. old_portfolio_pos_msg: {old_position:.4f}, new_portfolio_pos_msg: {new_position:.4f}. P_E_T RESET to current time: {self.position_entry_time}") # Modified Log
+                elif self.position_entry_time is not None: # Log if P_E_T is already set
+                    self.logger.info(f"Position ONGOING for {self.perp_name}. old_portfolio_pos_msg: {old_position:.4f}, new_portfolio_pos_msg: {new_position:.4f}. P_E_T already set: {self.position_entry_time}")
+
 
                 drift = abs(self.position_size - new_position)
-                if drift > 0.001:
-                    self.logger.info(f"Position adjustment: internal={self.position_size}, portfolio={new_position}")
+                if drift > 0.000001: # Using a smaller epsilon for float comparison
+                    self.logger.info(f"Position size DRIFT for {self.perp_name}. Internal: {self.position_size:.4f} -> Portfolio_msg: {new_position:.4f}. Updating internal size.") # Modified Log
                     self.position_size = new_position
-                    
+                else: 
+                    self.logger.info(f"Position size for {self.perp_name} consistent. Internal: {self.position_size:.4f}, Portfolio_msg: {new_position:.4f}.")
+
+
                 if new_position != 0 and (self.entry_price is None or self.entry_price <= 0):
                     if self.ticker and self.ticker.mark_price > 0:
                         self.entry_price = self.round_to_tick(self.ticker.mark_price)
-                        self.logger.info(f"Updated entry price to {self.entry_price}")
+                        self.logger.info(f"Updated entry price for {self.perp_name} to {self.entry_price} as it was invalid/None with an active position ({new_position:.4f}).") # Modified Log
             
-            if abs(new_position - old_position) > 0.001: # Check for all instruments
-                self.logger.info(f"Portfolio change for {instrument}: {old_position:.3f} -> {new_position:.3f}")
+            if abs(new_position - old_position) > 0.000001: # Check for all instruments, smaller epsilon
+                self.logger.info(f"Portfolio MSG for {instrument}: {old_position:.4f} -> {new_position:.4f}") # Clarified Log
                 if instrument == self.perp_name: # Only check risk limits for the main instrument
                      asyncio.create_task(self.check_risk_limits())
 
@@ -2169,8 +2156,11 @@ class PerpQuoter:
     async def manage_new_take_profit(self):
         """Manages take profit based on time and overall profit of a paired position."""
         current_time = time.time()
+        self.logger.info(f"Entering manage_new_take_profit. Position Size: {self.position_size}, Entry Time: {self.position_entry_time}, Current Time: {current_time}, Last Check: {self.last_take_profit_check_time}") # New log
         if current_time - self.last_take_profit_check_time < 1.0: # Throttle to once per second
+            # self.logger.debug("Throttling manage_new_take_profit") # Optional: for very verbose debugging
             return
+        self.logger.info(f"Proceeding with manage_new_take_profit checks. Position Size: {self.position_size}, Entry Time: {self.position_entry_time}") # New log
         self.last_take_profit_check_time = current_time
 
         if self.position_size == 0 or self.position_entry_time is None:
@@ -2189,10 +2179,14 @@ class PerpQuoter:
             return
 
         # 2. Time-based closure
-        if current_time - self.position_entry_time >= self.take_profit_duration_seconds:
-            self.logger.info(f"Time-based take profit: {self.take_profit_duration_seconds}s elapsed. Closing all positions for {self.perp_name}.")
+        if self.position_entry_time is not None and current_time - self.position_entry_time >= self.take_profit_duration_seconds: # Added self.position_entry_time is not None check for safety
+            self.logger.info(f"Time-based condition MET. Position duration: {current_time - self.position_entry_time:.2f}s >= {self.take_profit_duration_seconds}s. Attempting to close.") # New log
             await self.close_all_positions_market()
             return
+        elif self.position_entry_time is not None: # New log block
+            self.logger.info(f"Time-based condition NOT MET. Position duration: {current_time - self.position_entry_time:.2f}s < {self.take_profit_duration_seconds}s.")
+        elif self.position_entry_time is None and self.position_size != 0 : # New log
+             self.logger.warning(f"Time-based check: Position exists but position_entry_time is None.")
 
     def calculate_aggressive_exit_price(self, direction: th.Direction) -> float:
         """Calculate an aggressive exit price to simulate a market order."""
@@ -2221,6 +2215,7 @@ class PerpQuoter:
 
     async def close_all_positions_market(self):
         """Closes the position in self.perp_name aggressively."""
+        self.logger.info(f"Entering close_all_positions_market for {self.perp_name}. Current Position: {self.position_size}") # New Log
         self.logger.info(f"Attempting to close position for {self.perp_name} due to take-profit condition.")
         
         # Ensure we use the most up-to-date position size from portfolio if possible, or rely on internal
@@ -2278,7 +2273,6 @@ class ConfigValidator:
             RISK_LIMITS.get("rebalance_threshold", 0) > 0 and RISK_LIMITS.get("rebalance_threshold", 0) < 1
         ]
         return all(checks)
-
 if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,
@@ -2336,3 +2330,5 @@ if __name__ == "__main__":
         asyncio.run(run_quoter())
     except KeyboardInterrupt:
         logging.info("Shutting down gracefully...")
+
+
