@@ -140,6 +140,7 @@ class Order:
     amount: float
     status: OrderStatus = OrderStatus.PENDING
     direction: Optional[str] = None
+    timestamp: float = field(default_factory=time.time)  # Order creation timestamp - Added 2024-12-19
     
     def __post_init__(self):
         """Initialize additional fields after constructor"""
@@ -168,7 +169,8 @@ class Order:
             "creation_time": self.creation_time,
             "last_update_time": self.last_update_time,
             "filled_amount": self.filled_amount,
-            "average_fill_price": self.average_fill_price
+            "average_fill_price": self.average_fill_price,
+            "timestamp": self.timestamp  # Added 2024-12-19
         }
 
     @classmethod
@@ -177,7 +179,8 @@ class Order:
             id=data["id"],
             price=data["price"],
             amount=data["amount"],
-            status=OrderStatus(data["status"]) if data.get("status") else None
+            status=OrderStatus(data["status"]) if data.get("status") else None,
+            timestamp=data.get("timestamp", time.time())  # Added 2024-12-19
         )
         order.creation_time = data.get("creation_time", 0.0)
         order.last_update_time = data.get("last_update_time", 0.0)
@@ -199,6 +202,15 @@ class Ticker:
         self.open_interest: float = float(data.get("open_interest", 0.0))
         # Add timestamp field with default value to avoid the error
         self.timestamp: float = float(data.get("timestamp", time.time()))
+        # Calculate bid-ask spread for HFT analysis - Added 2024-12-19
+        self.bid_ask_spread: float = self._calculate_bid_ask_spread()
+
+    def _calculate_bid_ask_spread(self) -> float:
+        """Calculate bid-ask spread with validation - Added 2024-12-19"""
+        if self.best_bid_price is not None and self.best_ask_price is not None:
+            if self.best_bid_price > 0 and self.best_ask_price > 0:
+                return self.best_ask_price - self.best_bid_price
+        return 0.0
 
     def to_dict(self) -> Dict:
         return {
@@ -209,7 +221,8 @@ class Ticker:
             "mark_timestamp": self.mark_ts,
             "funding_rate": self.funding_rate,
             "volume": self.volume,
-            "open_interest": self.open_interest
+            "open_interest": self.open_interest,
+            "bid_ask_spread": self.bid_ask_spread  # Added 2024-12-19
         }
 
     @classmethod
@@ -245,6 +258,33 @@ class Quote:
             side=data.get("side", ""),
             timestamp=data.get("timestamp", time.time())
         )
+    
+    def validate_notional_value(self, max_notional: float = 1000.0) -> bool:
+        """
+        Validate quote notional value against maximum limit - Added 2024-12-19
+        
+        Args:
+            max_notional: Maximum allowed notional value
+            
+        Returns:
+            bool: True if quote is valid, False otherwise
+        """
+        try:
+            if self.price <= 0 or self.amount <= 0:
+                logging.warning(f"Quote validation failed: invalid price ({self.price}) or amount ({self.amount})")
+                return False
+                
+            notional_value = self.price * self.amount
+            
+            if notional_value > max_notional:
+                logging.warning(f"Quote validation failed: notional value ({notional_value}) exceeds limit ({max_notional})")
+                return False
+                
+            return True
+            
+        except Exception as e:
+            logging.error(f"Error in quote notional validation: {str(e)}")
+            return False
 class PerpQuoter:
     def __init__(self, thalex: th.Thalex):
         self.thalex = thalex
@@ -1370,33 +1410,27 @@ class PerpQuoter:
             logging.error(f"Error handling order {order_id}: {str(e)}")
 
     def calculate_optimal_spread(self) -> float:
-        """Calculate optimal spread using Avellaneda-Stoikov formula"""
+        """Calculate optimized spread using enhanced Avellaneda-Stoikov with microstructure adjustments - Updated 2024-12-19"""
         if len(self.price_window) < 2:
             if not self.tick:
                 self.logger.warning("Tick size not available for default spread. Returning 0.0")
                 return 0.0
             # Using min_spread from config as the default if price window is too short
-            min_spread_ticks_from_config = ORDERBOOK_CONFIG.get("min_spread", 3.0) # Assuming 3.0 ticks as default
+            min_spread_ticks_from_config = ORDERBOOK_CONFIG.get("min_spread", 3.0)
             self.logger.debug(f"Price window too short, returning default min_spread: {min_spread_ticks_from_config * self.tick}")
             return min_spread_ticks_from_config * self.tick
             
-        # Calculate volatility
-        # self.sigma is set by update_model_parameters or needs to be calculated here if not.
-        # Assuming self.sigma is already up-to-date via another mechanism (e.g., update_model_parameters).
-        # If not, it should be: self.sigma = self.calculate_volatility() or similar
-        # For this function, we rely on self.sigma being current.
-        if self.sigma is None or self.sigma <= 0:
-            self.logger.warning(f"Invalid market volatility (sigma: {self.sigma}), cannot calculate optimal spread accurately.")
+        # Get current volatility using improved EWMA method
+        volatility = self.calculate_volatility()
+        if volatility <= 0:
+            self.logger.warning(f"Invalid market volatility ({volatility}), cannot calculate optimal spread accurately.")
             if not self.tick:
                 self.logger.warning("Tick size not available for fallback spread. Returning 0.0")
                 return 0.0
             min_spread_ticks_from_config = ORDERBOOK_CONFIG.get("min_spread", 3.0)
             return min_spread_ticks_from_config * self.tick
 
-        # Optimal spread = γσ²(T-t) + 2/γ log(1 + γ/k)
-        # Note: self.T is time horizon. (T-t) implies remaining time. If self.T is total horizon, this might be just self.T.
-        # Assuming self.T represents the relevant time factor for the formula.
-        # Ensure self.gamma and self.k are valid.
+        # Validate Avellaneda parameters
         if self.gamma <= 0 or self.k <= 0:
             self.logger.warning(f"Invalid Avellaneda params: gamma={self.gamma}, k={self.k}. Using default min_spread.")
             if not self.tick:
@@ -1405,8 +1439,43 @@ class PerpQuoter:
             min_spread_ticks_from_config = ORDERBOOK_CONFIG.get("min_spread", 3.0)
             return min_spread_ticks_from_config * self.tick
             
-        calculated_model_spread_abs = (self.gamma * self.sigma**2 * self.T + 
-                 2/self.gamma * np.log(1 + self.gamma/self.k))
+        # Enhanced Avellaneda-Stoikov formula with microstructure adjustments - Updated 2024-12-19
+        # Base spread: γσ²T + (2/γ) * ln(1 + γ/k)
+        base_spread = (self.gamma * volatility**2 * self.T + 
+                      2/self.gamma * np.log(1 + self.gamma/self.k))
+        
+        # Market microstructure adjustments - Added 2024-12-19
+        microstructure_factor = 1.0
+        
+        # 1. Order book imbalance adjustment
+        if self.ticker and self.ticker.best_bid_price and self.ticker.best_ask_price:
+            current_spread = self.ticker.best_ask_price - self.ticker.best_bid_price
+            if current_spread > 0:
+                # Adjust based on current market spread
+                market_spread_factor = min(2.0, max(0.5, current_spread / (volatility * self.ticker.mark_price)))
+                microstructure_factor *= market_spread_factor
+        
+        # 2. Inventory pressure adjustment
+        position = self.get_position_size()
+        max_position = POSITION_LIMITS.get("max_position", 1.0)
+        inventory_ratio = abs(position) / max_position if max_position > 0 else 0
+        inventory_adjustment = 1 + (inventory_ratio * 0.3)  # Up to 30% increase for high inventory
+        microstructure_factor *= inventory_adjustment
+        
+        # 3. Volatility regime adjustment
+        if hasattr(self, 'price_history') and len(self.price_history) >= 20:
+            recent_vol = np.std(np.diff(np.log(list(self.price_history)[-20:])))
+            if recent_vol > 0:
+                vol_regime_factor = min(1.5, max(0.7, volatility / recent_vol))
+                microstructure_factor *= vol_regime_factor
+        
+        # 4. Time-of-day adjustment (if applicable)
+        current_hour = time.localtime().tm_hour
+        if 0 <= current_hour <= 6 or 22 <= current_hour <= 23:  # Low liquidity hours
+            microstructure_factor *= 1.2
+        
+        # Apply microstructure adjustments
+        calculated_model_spread_abs = base_spread * microstructure_factor
         
         if not (np.isfinite(calculated_model_spread_abs) and calculated_model_spread_abs > 0):
             self.logger.warning(f"Calculated model spread is not valid: {calculated_model_spread_abs}. Using configured min_spread.")
@@ -1414,11 +1483,11 @@ class PerpQuoter:
                 self.logger.warning("Tick size not available, cannot enforce tick-based min spread. Returning model spread.")
                 return calculated_model_spread_abs
 
-        min_spread_ticks_from_config = ORDERBOOK_CONFIG.get("min_spread", 3.0) # Defaulting to 3.0 ticks
+        min_spread_ticks_from_config = ORDERBOOK_CONFIG.get("min_spread", 3.0)
         min_abs_spread_monetary = min_spread_ticks_from_config * self.tick
         
         final_spread = max(min_abs_spread_monetary, calculated_model_spread_abs)
-        self.logger.debug(f"Calculated optimal spread: {final_spread} (model: {calculated_model_spread_abs}, floor: {min_abs_spread_monetary})")
+        self.logger.debug(f"Optimized spread: {final_spread:.6f} (base: {base_spread:.6f}, micro_factor: {microstructure_factor:.3f}, floor: {min_abs_spread_monetary:.6f})")
         return final_spread
         
     def get_position_size(self) -> float:
@@ -1437,6 +1506,79 @@ class PerpQuoter:
         position = self.get_position_size()
         q = position / POSITION_LIMITS["max_position"]
         return self.gamma * self.sigma**2 * self.T * q
+
+    def calculate_value_at_risk(self, confidence_level: float = 0.95, time_horizon_hours: float = 1.0) -> float:
+        """
+        Calculate Value at Risk (VaR) for current position - Added 2024-12-19
+        
+        Args:
+            confidence_level: Confidence level (e.g., 0.95 for 95% VaR)
+            time_horizon_hours: Time horizon in hours
+            
+        Returns:
+            float: VaR in USD (positive value represents potential loss)
+        """
+        try:
+            if self.position_size == 0 or not self.ticker:
+                return 0.0
+                
+            # Get current volatility
+            volatility = self.calculate_volatility()
+            if volatility <= 0:
+                self.logger.warning("Invalid volatility for VaR calculation")
+                return 0.0
+                
+            # Calculate position notional value
+            current_price = self.ticker.mark_price
+            if current_price <= 0:
+                self.logger.warning("Invalid mark price for VaR calculation")
+                return 0.0
+                
+            notional_value = abs(self.position_size * current_price)
+            
+            # Scale volatility to time horizon (assuming daily volatility)
+            # Convert hours to fraction of day and scale volatility
+            time_scaling_factor = np.sqrt(time_horizon_hours / 24.0)
+            scaled_volatility = volatility * time_scaling_factor
+            
+            # Calculate z-score for given confidence level
+            # For normal distribution: 95% -> 1.645, 99% -> 2.326
+            from scipy import stats
+            z_score = stats.norm.ppf(confidence_level)
+            
+            # Calculate VaR
+            var_value = notional_value * scaled_volatility * z_score
+            
+            self.logger.debug(f"VaR calculation: notional={notional_value:.2f}, vol={scaled_volatility:.6f}, z={z_score:.3f}, VaR={var_value:.2f}")
+            return var_value
+            
+        except ImportError:
+            # Fallback if scipy not available
+            self.logger.warning("scipy not available, using normal approximation for VaR")
+            try:
+                # Manual z-score approximation
+                if confidence_level >= 0.99:
+                    z_score = 2.326
+                elif confidence_level >= 0.95:
+                    z_score = 1.645
+                elif confidence_level >= 0.90:
+                    z_score = 1.282
+                else:
+                    z_score = 1.0
+                    
+                notional_value = abs(self.position_size * self.ticker.mark_price)
+                time_scaling_factor = np.sqrt(time_horizon_hours / 24.0)
+                scaled_volatility = self.calculate_volatility() * time_scaling_factor
+                
+                return notional_value * scaled_volatility * z_score
+                
+            except Exception as e:
+                self.logger.error(f"Error in VaR fallback calculation: {str(e)}")
+                return 0.0
+                
+        except Exception as e:
+            self.logger.error(f"Error calculating VaR: {str(e)}")
+            return 0.0
 
     def calculate_level_size(self, base_size: float, side: str, level: int) -> float:
         """Calculate size for each quote level based on reconciled inventory with safety checks"""
@@ -2038,27 +2180,27 @@ class PerpQuoter:
             return 0, 0, 0, 0
 
     def calculate_volatility(self) -> float:
-        """Calculate rolling volatility of log returns for the configured window."""
+        """Calculate EWMA volatility of log returns for improved responsiveness - Updated 2024-12-19"""
         try:
             vol_config = TRADING_CONFIG.get("volatility", {})
-            vol_window = vol_config.get("window") # Correctly sourced
-            vol_floor = vol_config.get("floor", 0.0001) # Min volatility (e.g. 0.01% if returns are daily)
-            vol_ceiling = vol_config.get("ceiling", 1.0)  # Max volatility (e.g. 100%)
-            # The annualization factor depends on how frequently price_history is updated and what T represents.
-            # If T (time_horizon in A-S) is 1 (representing 1 day), then volatility should be daily.
-            # If price_history has per-second data, need to sample or adjust. Assuming it aligns with T or is raw.
-            # For now, this returns standard deviation of log returns for the window. A-S will use time_horizon_t.
+            vol_window = vol_config.get("window") # Minimum required window
+            vol_floor = vol_config.get("floor", 0.0001) # Min volatility
+            vol_ceiling = vol_config.get("ceiling", 1.0)  # Max volatility
+            ewma_alpha = vol_config.get("ewma_alpha", 0.06)  # EWMA decay factor - Added 2024-12-19
 
-            if vol_window is None or len(self.price_history) < vol_window:
+            if vol_window is None or len(self.price_history) < max(2, vol_window // 2):
                 return 0.0 
                 
-            # Use the most recent `vol_window` elements from the deque
-            prices_in_window = list(itertools.islice(self.price_history, max(0, len(self.price_history) - vol_window), len(self.price_history)))
-            if len(prices_in_window) < vol_window:
-                 self.logger.debug(f"Not enough price points in deque slice ({len(prices_in_window)}) for volatility window {vol_window}.")
-                 return 0.0
+            # Use sufficient price points for EWMA calculation
+            min_points = max(10, vol_window // 2) if vol_window else 10
+            if len(self.price_history) < min_points:
+                self.logger.debug(f"Insufficient price history ({len(self.price_history)}) for EWMA volatility calculation.")
+                return 0.0
 
-            prices = np.array(prices_in_window)
+            # Get recent prices for calculation
+            recent_prices = list(self.price_history)[-min_points:]
+            prices = np.array(recent_prices)
+            
             if np.any(prices <= 0):
                 self.logger.warning("Invalid (zero/negative) prices in history window for volatility.")
                 return 0.0
@@ -2068,19 +2210,32 @@ class PerpQuoter:
                  self.logger.debug("Not enough price points (after diff) to calculate log returns for volatility.")
                  return 0.0
 
-            calculated_vol_std = np.std(log_returns)
+            # Calculate EWMA volatility - Added 2024-12-19
+            if not hasattr(self, '_ewma_variance'):
+                # Initialize with simple variance of first few returns
+                self._ewma_variance = np.var(log_returns[:5]) if len(log_returns) >= 5 else np.var(log_returns)
             
-            if not (np.isfinite(calculated_vol_std) and calculated_vol_std >= 0):
-                self.logger.warning(f"Volatility calculation resulted in non-finite/negative value: {calculated_vol_std}")
-                return 0.0
+            # Update EWMA variance with most recent return
+            latest_return = log_returns[-1]
+            self._ewma_variance = ewma_alpha * (latest_return ** 2) + (1 - ewma_alpha) * self._ewma_variance
+            
+            # Calculate volatility as square root of variance
+            calculated_vol_ewma = np.sqrt(self._ewma_variance)
+            
+            if not (np.isfinite(calculated_vol_ewma) and calculated_vol_ewma >= 0):
+                self.logger.warning(f"EWMA volatility calculation resulted in non-finite/negative value: {calculated_vol_ewma}")
+                # Fallback to simple standard deviation
+                calculated_vol_ewma = np.std(log_returns)
+                if not (np.isfinite(calculated_vol_ewma) and calculated_vol_ewma >= 0):
+                    return vol_floor
             
             # Apply floor and ceiling
-            final_vol = max(vol_floor, min(calculated_vol_std, vol_ceiling))
-            self.logger.debug(f"Calculated volatility: {final_vol:.6f} (std of {log_returns.size} log returns, window: {vol_window})")
+            final_vol = max(vol_floor, min(calculated_vol_ewma, vol_ceiling))
+            self.logger.debug(f"Calculated EWMA volatility: {final_vol:.6f} (alpha={ewma_alpha}, variance={self._ewma_variance:.8f}, returns={log_returns.size})")
             return final_vol
             
         except Exception as e:
-            self.logger.error(f"Error calculating volatility: {str(e)}, Trace: {traceback.format_exc()}")
+            self.logger.error(f"Error calculating EWMA volatility: {str(e)}, Trace: {traceback.format_exc()}")
             return 0.0
 
     def calculate_optimal_size(self, side: str, q: float, volatility: float) -> float:
