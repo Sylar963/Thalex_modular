@@ -25,7 +25,7 @@ BOT_CONFIG = {
         # Avellaneda-Stoikov model parameters
         "avellaneda": {
             # Core model parameters
-            "gamma": 0.2,                  # Risk aversion (reduced from 0.3 for more frequent executions)
+            "gamma": 0.1,                  # Risk aversion (reduced from 0.2 to 0.1 for less aggressive trading) # Updated 2024-12-19
             "kappa": 0.5,                  # Inventory risk factor
             "time_horizon": 3600,          # Time horizon in seconds (1 hour)
             "order_flow_intensity": 2.0,   # Order flow intensity parameter
@@ -142,6 +142,7 @@ BOT_CONFIG = {
         # Position management
         "max_notional": 1000,  # Maximum notional value in USD
         "max_position_notional": 800,  # Maximum notional position (80% of max_notional)
+        "max_daily_loss_pct": 0.05,  # Maximum daily loss percentage (5%) - Added 2024-12-19
     },
     
     # Hedging configuration
@@ -325,6 +326,7 @@ RISK_LIMITS: Dict[str, Any] = {
     "position_rebalance_threshold": BOT_CONFIG["risk"]["position_rebalance_threshold"],
     "market_impact_threshold": BOT_CONFIG["risk"]["market_impact_threshold"],
     "rebalance_cooldown": BOT_CONFIG["risk"]["rebalance_cooldown"],
+    "max_daily_loss_pct": BOT_CONFIG["risk"]["max_daily_loss_pct"],  # Added 2024-12-19
     # Ensure all keys from BOT_CONFIG["risk"] are present if needed by RiskManager
 }
 

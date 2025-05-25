@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import socket
 import time
 import traceback
@@ -15,7 +16,6 @@ from dataclasses import dataclass, field
 import itertools
 
 import thalex as th
-from .keys import *  # Import from the local keys.py file
 
 # Import configurations from market_config.py
 from ..config.market_config import (
@@ -941,7 +941,7 @@ class PerpQuoter:
         await self.await_instruments()
         self.market_maker.set_tick_size(self.tick)
         self.market_maker.set_instrument(self.perp_name)
-        await self.thalex.login(key_ids[NETWORK], private_keys[NETWORK], id=CALL_ID_LOGIN)
+        await self.thalex.login(os.getenv('THALEX_KEY_ID'), os.getenv('THALEX_PRIVATE_KEY'), id=CALL_ID_LOGIN)
         await self.thalex.set_cancel_on_disconnect(6, id=CALL_ID_SET_COD)
         await self.thalex.private_subscribe(["session.orders", "account.portfolio", "account.trade_history"], id=CALL_ID_SUBSCRIBE)
         await self.thalex.public_subscribe([f"ticker.{self.perp_name}.raw", f"price_index.{UNDERLYING}"], id=CALL_ID_SUBSCRIBE)
