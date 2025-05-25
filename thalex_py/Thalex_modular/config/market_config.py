@@ -253,7 +253,18 @@ DEFAULT_VOLATILITY_CONFIG = {
     "floor": 0.015,
     "ceiling": 0.18,
     "ewm_span": 15,
-    "cache_duration": 30
+    "cache_duration": 30,
+    "ewma_alpha": 0.06,  # EWMA decay factor for improved volatility calculation - Added 2024-12-19
+}
+
+# VaR (Value at Risk) Configuration - Added 2024-12-19
+VAR_CONFIG = {
+    "confidence_levels": [0.95, 0.99],  # Standard confidence levels
+    "time_horizons": [1.0, 4.0, 24.0],  # Time horizons in hours
+    "calculation_interval": 60,  # Calculate VaR every 60 seconds
+    "alert_threshold_95": 500.0,  # Alert if 95% VaR exceeds $500
+    "alert_threshold_99": 1000.0,  # Alert if 99% VaR exceeds $1000
+    "max_var_position_ratio": 0.1,  # Maximum VaR as ratio of max position
 }
 
 TRADING_CONFIG = {
@@ -289,6 +300,11 @@ TRADING_CONFIG = {
         "position_limit": BOT_CONFIG["risk"]["max_position"],
         "exchange_fee_rate": 0.0001,
         "fixed_volatility": 0.01,
+        # Enhanced spread calculation parameters - Added 2024-12-19
+        "collar_buffer_pct": 0.005,  # Price collar buffer percentage
+        "desired_margin_rate_above_fee": 0.00025,  # Desired margin above exchange fees
+        "min_spread": 3.0,  # Minimum spread in ticks
+        "max_spread": 25.0,  # Maximum spread in ticks
     },
     "quoting": {
         "levels": BOT_CONFIG["trading_strategy"]["avellaneda"]["max_levels"],
@@ -310,6 +326,12 @@ TRADING_CONFIG = {
     "volume_candle": BOT_CONFIG["trading_strategy"]["volume_candle"],
     "volatility": DEFAULT_VOLATILITY_CONFIG,
     "vamp": BOT_CONFIG["trading_strategy"]["vamp"],
+    # New configurations for Phase 3 enhancements - Added 2024-12-19
+    "var": VAR_CONFIG,  # Value at Risk configuration
+    "market_impact": {
+        "threshold": BOT_CONFIG["risk"]["market_impact_threshold"],
+        "fast_cancel_threshold": 0.005,  # Fast cancel threshold for price movement
+    },
 }
 
 # RISK_LIMITS - Direct access to risk parameters

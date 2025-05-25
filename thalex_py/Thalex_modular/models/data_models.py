@@ -26,6 +26,15 @@ from ..config.market_config import (
     ORDERBOOK_CONFIG
 )
 from ..thalex_logging import LoggerFactory
+# Import event bus for cross-component communication - Added 2024-12-19
+from ..components.event_bus import (
+    get_event_bus, 
+    EventType, 
+    publish_price_update, 
+    publish_position_change, 
+    publish_var_alert, 
+    publish_pnl_update
+)
 
 # Basic configuration - use values from MARKET_CONFIG
 UNDERLYING = MARKET_CONFIG["underlying"]
@@ -354,9 +363,75 @@ class PerpQuoter:
             log_file="perp_quoter.log",
             high_frequency=False
         )
+        
+        # Initialize event bus integration - Added 2024-12-19
+        self.event_bus = get_event_bus()
+        self.component_name = "perp_quoter"
+        self._setup_event_subscriptions()
 
     def round_to_tick(self, value):
         return self.tick * round(value / self.tick)
+
+    def _setup_event_subscriptions(self):
+        """Setup event bus subscriptions for cross-component communication - Added 2024-12-19"""
+        try:
+            # Subscribe to risk events from other components
+            self.event_bus.subscribe(
+                EventType.RISK_LIMIT_BREACH, 
+                self._handle_risk_event, 
+                self.component_name
+            )
+            
+            # Subscribe to emergency stop events
+            self.event_bus.subscribe(
+                EventType.EMERGENCY_STOP, 
+                self._handle_emergency_stop, 
+                self.component_name
+            )
+            
+            # Subscribe to component ready events
+            self.event_bus.subscribe(
+                EventType.COMPONENT_READY, 
+                self._handle_component_ready, 
+                self.component_name
+            )
+            
+            self.logger.info("Event bus subscriptions setup completed")
+            
+        except Exception as e:
+            self.logger.error(f"Error setting up event subscriptions: {str(e)}")
+
+    async def _handle_risk_event(self, event):
+        """Handle risk events from other components - Added 2024-12-19"""
+        try:
+            self.logger.warning(f"Received risk event from {event.source}: {event.data}")
+            
+            # React to risk events by reducing position or stopping quoting
+            if event.data.get("severity") == "high":
+                self.quoting_enabled = False
+                await self.emergency_close()
+                
+        except Exception as e:
+            self.logger.error(f"Error handling risk event: {str(e)}")
+
+    async def _handle_emergency_stop(self, event):
+        """Handle emergency stop events - Added 2024-12-19"""
+        try:
+            self.logger.critical(f"Emergency stop received from {event.source}: {event.data}")
+            self.quoting_enabled = False
+            await self.emergency_close()
+            
+        except Exception as e:
+            self.logger.error(f"Error handling emergency stop: {str(e)}")
+
+    async def _handle_component_ready(self, event):
+        """Handle component ready events - Added 2024-12-19"""
+        try:
+            component = event.data.get("component_name")
+            self.logger.info(f"Component {component} is ready")
+            
+        except Exception as e:
+            self.logger.error(f"Error handling component ready event: {str(e)}")
 
     def calculate_zscore(self) -> float:
         """Calculate Z-score for current price"""
@@ -1029,6 +1104,16 @@ class PerpQuoter:
         try:
             self.ticker = Ticker(ticker)
             self.price_history.append(self.ticker.mark_price)
+            
+            # Publish price update event - Added 2024-12-19
+            await publish_price_update(
+                source=self.component_name,
+                instrument=self.perp_name or "unknown",
+                price=self.ticker.mark_price,
+                bid=self.ticker.best_bid_price,
+                ask=self.ticker.best_ask_price
+            )
+            
             async with self.quote_cv:
                 self.quote_cv.notify()
         except Exception as e:
@@ -1156,6 +1241,16 @@ class PerpQuoter:
                 drift = abs(self.position_size - new_position)
                 if drift > 0.000001: # Using a smaller epsilon for float comparison
                     self.logger.info(f"Position size DRIFT for {self.perp_name}. Internal: {self.position_size:.4f} -> Portfolio_msg: {new_position:.4f}. Updating internal size.") # Modified Log
+                    
+                    # Publish position change event - Added 2024-12-19
+                    asyncio.create_task(publish_position_change(
+                        source=self.component_name,
+                        instrument=self.perp_name,
+                        old_position=self.position_size,
+                        new_position=new_position,
+                        entry_price=self.entry_price
+                    ))
+                    
                     self.position_size = new_position
                 else: 
                     self.logger.info(f"Position size for {self.perp_name} consistent. Internal: {self.position_size:.4f}, Portfolio_msg: {new_position:.4f}.")
@@ -1548,6 +1643,21 @@ class PerpQuoter:
             
             # Calculate VaR
             var_value = notional_value * scaled_volatility * z_score
+            
+            # Check for VaR alerts - Added 2024-12-19
+            var_config = TRADING_CONFIG.get("var", {})
+            if confidence_level >= 0.95:
+                threshold_key = "alert_threshold_95" if confidence_level < 0.99 else "alert_threshold_99"
+                threshold = var_config.get(threshold_key, float('inf'))
+                
+                if var_value > threshold:
+                    asyncio.create_task(publish_var_alert(
+                        source=self.component_name,
+                        var_value=var_value,
+                        confidence_level=confidence_level,
+                        threshold=threshold,
+                        position_size=abs(self.position_size)
+                    ))
             
             self.logger.debug(f"VaR calculation: notional={notional_value:.2f}, vol={scaled_volatility:.6f}, z={z_score:.3f}, VaR={var_value:.2f}")
             return var_value
