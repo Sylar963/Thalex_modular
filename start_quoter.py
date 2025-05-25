@@ -24,6 +24,48 @@ from thalex_py.Thalex_modular.logging import LoggerFactory
 quoter = None
 shutdown_event = asyncio.Event()
 
+def validate_environment_variables():
+    """Validate all required environment variables on startup"""
+    required_vars = {
+        'THALEX_KEY_ID': 'Thalex API Key ID',
+        'THALEX_PRIVATE_KEY': 'Thalex Private Key'
+    }
+    
+    optional_vars = {
+        'THALEX_NETWORK': 'test',  # Default to test network
+        'LOG_LEVEL': 'INFO',       # Default log level
+        'METRICS_ENABLED': 'true'  # Default metrics enabled
+    }
+    
+    missing_vars = []
+    config_summary = {}
+    
+    # Check required variables
+    for var_name, description in required_vars.items():
+        value = os.getenv(var_name)
+        if not value:
+            missing_vars.append(f"{var_name} ({description})")
+        else:
+            config_summary[var_name] = "***REDACTED***"  # Don't log sensitive values
+    
+    # Check optional variables and set defaults
+    for var_name, default_value in optional_vars.items():
+        value = os.getenv(var_name, default_value)
+        os.environ[var_name] = value  # Set default if not present
+        config_summary[var_name] = value
+    
+    # Raise error for missing required variables
+    if missing_vars:
+        error_msg = f"Missing required environment variables: {', '.join(missing_vars)}"
+        raise EnvironmentError(error_msg)
+    
+    # Log configuration summary
+    print("Environment Configuration:")
+    for var_name, value in config_summary.items():
+        print(f"  {var_name}: {value}")
+    
+    return True
+
 async def shutdown():
     """Gracefully shut down the application"""
     print("Shutting down...")
@@ -43,6 +85,9 @@ def signal_handler():
 async def main():
     """Main entry point"""
     global quoter
+    
+    # Validate environment variables first
+    validate_environment_variables()
     
     # Create a directory for logs
     os.makedirs("logs", exist_ok=True)

@@ -1,0 +1,25 @@
+{
+  "active_hedges": {
+    "BTC-PERPETUAL": {
+      "ETH-PERPETUAL": {
+        "primary_asset": "BTC-PERPETUAL",
+        "hedge_asset": "ETH-PERPETUAL",
+        "primary_position": -0.01,
+        "primary_price": 84523.0,
+        "primary_notional": 845.23,
+        "hedge_position": 4.971056142871805,
+        "hedge_price": 1588.1090000000002,
+        "hedge_notional": 7894.579,
+        "hedge_ratio": 9.340154750777895,
+        "entry_time": 1744521511.7330115,
+        "last_update_time": 1744652231.631068,
+        "pnl": 0.0,
+        "metadata": {}
+      }
+    }
+  },
+  "market_prices": {
+    "BTC-PERPETUAL": 84523.0,
+    "ETH-PERPETUAL": 1588.1090000000002
+  }
+}

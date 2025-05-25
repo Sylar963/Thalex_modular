@@ -26,7 +26,6 @@ from thalex_py.Thalex_modular.models.data_models import Ticker, Order, OrderStat
 from thalex_py.Thalex_modular.components.risk_manager import RiskManager
 from thalex_py.Thalex_modular.components.order_manager import OrderManager
 from thalex_py.Thalex_modular.components.avellaneda_market_maker import AvellanedaMarketMaker
-from thalex_py.Thalex_modular.models.keys import key_ids, private_keys
 from thalex_py.Thalex_modular.performance_monitor import PerformanceMonitor
 from thalex_py.Thalex_modular.logging import LoggerFactory
 from thalex_py.Thalex_modular.ringbuffer.market_data_buffer import MarketDataBuffer
@@ -120,9 +119,8 @@ class AvellanedaQuoter:
             
             # Login and setup
             self.logger.info("Logging in and setting up...")
-            network = MARKET_CONFIG["network"]
-            key_id = key_ids[network]
-            private_key = private_keys[network]
+            key_id = os.getenv('THALEX_KEY_ID')
+            private_key = os.getenv('THALEX_PRIVATE_KEY')
             await self.thalex.login(key_id, private_key, id=CALL_IDS["login"])
             
             # Set cancel on disconnect
@@ -344,16 +342,11 @@ class AvellanedaQuoter:
                 # Wait for instruments
                 await asyncio.wait_for(self.await_instruments(), timeout=30)
                 
-                # Login with proper network keys
-                network = MARKET_CONFIG["network"]
-                if network == Network.TEST:
-                    key_id = key_ids[Network.TEST]
-                    private_key = private_keys[Network.TEST]
-                else:
-                    key_id = key_ids[Network.PROD]
-                    private_key = private_keys[Network.PROD]
+                # Login with environment variables
+                key_id = os.getenv('THALEX_KEY_ID')
+                private_key = os.getenv('THALEX_PRIVATE_KEY')
                     
-                self.logger.info(f"Logging in with network: {network}")
+                self.logger.info(f"Logging in with network: {MARKET_CONFIG['network']}")
                 await self.thalex.login(
                     key_id,
                     private_key,
