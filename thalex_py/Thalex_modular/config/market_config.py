@@ -1,4 +1,9 @@
 from thalex import Network
+import threading
+import time
+import json
+import os
+from typing import Dict, Any, Callable, List
 
 # =============================================================================
 # THALEX MARKET MAKER CONFIGURATION
@@ -82,6 +87,216 @@ config = ThalexConfig(
 MARKET_CONFIG = vars(config.market)
 # etc.
 """
+
+def validate_config():
+    """Validate all BOT_CONFIG parameters for type checking, range validation, and logical consistency"""
+    
+    # Type checking for numeric parameters
+    numeric_params = [
+        ("trading_strategy.avellaneda.gamma", BOT_CONFIG["trading_strategy"]["avellaneda"]["gamma"], float),
+        ("trading_strategy.avellaneda.kappa", BOT_CONFIG["trading_strategy"]["avellaneda"]["kappa"], float),
+        ("trading_strategy.avellaneda.time_horizon", BOT_CONFIG["trading_strategy"]["avellaneda"]["time_horizon"], (int, float)),
+        ("trading_strategy.avellaneda.base_spread", BOT_CONFIG["trading_strategy"]["avellaneda"]["base_spread"], (int, float)),
+        ("trading_strategy.avellaneda.min_spread", BOT_CONFIG["trading_strategy"]["avellaneda"]["min_spread"], (int, float)),
+        ("trading_strategy.avellaneda.max_spread", BOT_CONFIG["trading_strategy"]["avellaneda"]["max_spread"], (int, float)),
+        ("risk.max_position", BOT_CONFIG["risk"]["max_position"], (int, float)),
+        ("risk.max_notional", BOT_CONFIG["risk"]["max_notional"], (int, float)),
+        ("connection.rate_limit", BOT_CONFIG["connection"]["rate_limit"], int),
+    ]
+    
+    for param_path, value, expected_type in numeric_params:
+        if not isinstance(value, expected_type):
+            raise TypeError(f"Parameter {param_path} must be {expected_type}, got {type(value)}")
+    
+    # Range validation for positive values
+    positive_params = [
+        ("trading_strategy.avellaneda.gamma", BOT_CONFIG["trading_strategy"]["avellaneda"]["gamma"]),
+        ("trading_strategy.avellaneda.kappa", BOT_CONFIG["trading_strategy"]["avellaneda"]["kappa"]),
+        ("trading_strategy.avellaneda.time_horizon", BOT_CONFIG["trading_strategy"]["avellaneda"]["time_horizon"]),
+        ("risk.max_position", BOT_CONFIG["risk"]["max_position"]),
+        ("risk.max_notional", BOT_CONFIG["risk"]["max_notional"]),
+        ("connection.rate_limit", BOT_CONFIG["connection"]["rate_limit"]),
+    ]
+    
+    for param_path, value in positive_params:
+        if value <= 0:
+            raise ValueError(f"Parameter {param_path} must be positive, got {value}")
+    
+    # Logical consistency checks
+    min_spread = BOT_CONFIG["trading_strategy"]["avellaneda"]["min_spread"]
+    max_spread = BOT_CONFIG["trading_strategy"]["avellaneda"]["max_spread"]
+    if min_spread >= max_spread:
+        raise ValueError(f"min_spread ({min_spread}) must be less than max_spread ({max_spread})")
+    
+    base_spread = BOT_CONFIG["trading_strategy"]["avellaneda"]["base_spread"]
+    if not (min_spread <= base_spread <= max_spread):
+        raise ValueError(f"base_spread ({base_spread}) must be between min_spread ({min_spread}) and max_spread ({max_spread})")
+    
+    max_position_notional = BOT_CONFIG["risk"]["max_position_notional"]
+    max_notional = BOT_CONFIG["risk"]["max_notional"]
+    if max_position_notional > max_notional:
+        raise ValueError(f"max_position_notional ({max_position_notional}) cannot exceed max_notional ({max_notional})")
+    
+    return True
+
+
+# =============================================================================
+# DYNAMIC CONFIGURATION RELOADING
+# =============================================================================
+
+class ConfigReloader:
+    """Thread-safe configuration reloader with file watching and component notifications"""
+    
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._observers: List[Callable[[Dict[str, Any]], None]] = []
+        self._config_file_path = None
+        self._last_reload_time = 0
+        self._reload_cooldown = 2.0  # Minimum 2 seconds between reloads
+        
+    def add_observer(self, callback: Callable[[Dict[str, Any]], None]) -> None:
+        """Add a callback to be notified when configuration changes"""
+        with self._lock:
+            self._observers.append(callback)
+    
+    def remove_observer(self, callback: Callable[[Dict[str, Any]], None]) -> None:
+        """Remove a configuration change observer"""
+        with self._lock:
+            if callback in self._observers:
+                self._observers.remove(callback)
+    
+    def _notify_observers(self, old_config: Dict[str, Any], new_config: Dict[str, Any]) -> None:
+        """Notify all observers of configuration changes"""
+        changes = self._get_config_changes(old_config, new_config)
+        if changes:
+            for observer in self._observers:
+                try:
+                    observer(changes)
+                except Exception as e:
+                    print(f"Error notifying config observer: {e}")
+    
+    def _get_config_changes(self, old_config: Dict[str, Any], new_config: Dict[str, Any]) -> Dict[str, Any]:
+        """Get the differences between old and new configuration"""
+        changes = {}
+        
+        def compare_dicts(old_dict, new_dict, path=""):
+            for key in set(old_dict.keys()) | set(new_dict.keys()):
+                current_path = f"{path}.{key}" if path else key
+                
+                if key not in old_dict:
+                    changes[current_path] = {"action": "added", "new_value": new_dict[key]}
+                elif key not in new_dict:
+                    changes[current_path] = {"action": "removed", "old_value": old_dict[key]}
+                elif isinstance(old_dict[key], dict) and isinstance(new_dict[key], dict):
+                    compare_dicts(old_dict[key], new_dict[key], current_path)
+                elif old_dict[key] != new_dict[key]:
+                    changes[current_path] = {
+                        "action": "modified",
+                        "old_value": old_dict[key],
+                        "new_value": new_dict[key]
+                    }
+        
+        compare_dicts(old_config, new_config)
+        return changes
+    
+    def reload_config(self, new_config: Dict[str, Any] = None) -> bool:
+        """Reload configuration with thread-safe updates and validation"""
+        current_time = time.time()
+        
+        with self._lock:
+            # Rate limiting (only for successful reloads)
+            if current_time - self._last_reload_time < self._reload_cooldown:
+                print(f"Config reload rate limited. Last reload was {current_time - self._last_reload_time:.1f}s ago")
+                return False
+            
+            try:
+                # Save current configuration (deep copy)
+                import copy
+                old_config = copy.deepcopy(BOT_CONFIG)
+                
+                if new_config:
+                    # Create a temporary copy for validation
+                    temp_config = {}
+                    for key, value in BOT_CONFIG.items():
+                        if isinstance(value, dict):
+                            temp_config[key] = dict(value)
+                        else:
+                            temp_config[key] = value
+                    
+                    # Update temp config with new values
+                    self._deep_update(temp_config, new_config)
+                    
+                    # Validate temp configuration by temporarily updating global
+                    original_bot_config = dict(BOT_CONFIG)
+                    BOT_CONFIG.clear()
+                    BOT_CONFIG.update(temp_config)
+                    
+                    try:
+                        validate_config()
+                    except Exception as validation_error:
+                        # Restore original config on validation failure
+                        BOT_CONFIG.clear()
+                        BOT_CONFIG.update(original_bot_config)
+                        raise validation_error
+                
+                # Update derived configurations
+                self._update_derived_configs()
+                
+                # Notify observers of changes
+                self._notify_observers(old_config, BOT_CONFIG)
+                
+                self._last_reload_time = current_time
+                print(f"Configuration reloaded successfully at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                return True
+                
+            except Exception as e:
+                print(f"Configuration reload failed: {e}")
+                return False
+    
+    def _deep_update(self, target: Dict[str, Any], source: Dict[str, Any]) -> None:
+        """Deep update target dictionary with source values"""
+        for key, value in source.items():
+            if key in target and isinstance(target[key], dict) and isinstance(value, dict):
+                self._deep_update(target[key], value)
+            else:
+                target[key] = value
+    
+    def _update_derived_configs(self) -> None:
+        """Update all derived configuration objects"""
+        global MARKET_CONFIG, TRADING_CONFIG, RISK_CONFIG, PERFORMANCE_CONFIG
+        global ORDERBOOK_CONFIG, RISK_LIMITS, TRADING_PARAMS, PERFORMANCE_METRICS
+        global INVENTORY_CONFIG, QUOTING_CONFIG, CONNECTION_CONFIG, CALL_IDS
+        
+        # Update simple pass-through configs
+        MARKET_CONFIG.clear()
+        MARKET_CONFIG.update(BOT_CONFIG["market"])
+        
+        CONNECTION_CONFIG.clear()
+        CONNECTION_CONFIG.update(BOT_CONFIG["connection"])
+        
+        CALL_IDS.clear()
+        CALL_IDS.update(BOT_CONFIG["call_ids"])
+        
+        # Update consolidated configs (these are more complex and would need full reconstruction)
+        # For now, we'll just log that they need manual update
+        print("Note: Consolidated configs (TRADING_CONFIG, RISK_CONFIG, etc.) may need manual restart for full effect")
+
+
+# Global configuration reloader instance
+_config_reloader = ConfigReloader()
+
+def reload_config(new_config: Dict[str, Any] = None) -> bool:
+    """Public interface for reloading configuration"""
+    return _config_reloader.reload_config(new_config)
+
+def add_config_observer(callback: Callable[[Dict[str, Any]], None]) -> None:
+    """Add a callback to be notified when configuration changes"""
+    _config_reloader.add_observer(callback)
+
+def remove_config_observer(callback: Callable[[Dict[str, Any]], None]) -> None:
+    """Remove a configuration change observer"""
+    _config_reloader.remove_observer(callback)
+
 
 # =============================================================================
 # PRIMARY CONFIGURATION - SINGLE SOURCE OF TRUTH
@@ -510,3 +725,9 @@ QUOTING_CONFIG = {
         {"size": 0.1, "spread_multiplier": 2.5},  # Level 5 (furthest from mid)
     ]
 }
+
+# =============================================================================
+# CONFIGURATION VALIDATION
+# =============================================================================
+# Validate configuration on module import
+validate_config()
