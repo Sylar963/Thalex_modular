@@ -15,7 +15,7 @@ This file defines the configuration for the Thalex Avellaneda-Stoikov market mak
 BOT_CONFIG = {
     # Market parameters
     "market": {
-        "underlying": "BTC-22MAY25",
+        "underlying": "BTC-26MAY25",
         "network": Network.TEST,
         "label": "F",
     },
@@ -25,7 +25,7 @@ BOT_CONFIG = {
         # Avellaneda-Stoikov model parameters
         "avellaneda": {
             # Core model parameters
-            "gamma": 0.1,                  # Risk aversion (reduced from 0.2 to 0.1 for less aggressive trading) # Updated 2024-12-19
+            "gamma": 0.21,                  # Risk aversion (reduced from 0.2 to 0.1 for less aggressive trading) # Updated 2024-12-19
             "kappa": 0.5,                  # Inventory risk factor
             "time_horizon": 3600,          # Time horizon in seconds (1 hour)
             "order_flow_intensity": 2.0,   # Order flow intensity parameter
