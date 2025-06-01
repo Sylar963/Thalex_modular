@@ -26,8 +26,8 @@ import thalex as th
 from thalex import Network
 from thalex_py.Thalex_modular.config.market_config import (
     BOT_CONFIG,
-    MARKET_CONFIG, 
-    CALL_IDS, 
+    MARKET_CONFIG,
+    CALL_IDS,
     RISK_LIMITS,
     TRADING_CONFIG
 )
