@@ -399,4 +399,173 @@ class PositionTracker:
                     self.logger.debug(f"Position size updated: {old_position:.6f} -> {size:.6f}")
                     
         except Exception as e:
-            self.logger.error(f"Error updating position size: {str(e)}", exc_info=True) 
+            self.logger.error(f"Error updating position size: {str(e)}", exc_info=True)
+
+
+class PortfolioTracker:
+    """
+    Portfolio-wide position tracker that manages multiple instruments
+    using individual PositionTracker instances for each instrument.
+    """
+    def __init__(self):
+        self.logger = LoggerFactory.configure_component_logger(
+            "portfolio_tracker", log_file="portfolio_tracker.log", high_frequency=False
+        )
+        self.instrument_trackers: Dict[str, PositionTracker] = {}  # instrument -> PositionTracker
+        self.mark_prices: Dict[str, float] = {}  # instrument -> current_mark_price
+        self.trading_fees: Dict[str, float] = {}  # instrument -> accumulated_fees
+        self.portfolio_lock = threading.Lock()
+        
+        self.logger.info("Portfolio tracker initialized")
+    
+    def register_instrument(self, instrument: str):
+        """Create PositionTracker for new instrument"""
+        try:
+            with self.portfolio_lock:
+                if instrument not in self.instrument_trackers:
+                    self.instrument_trackers[instrument] = PositionTracker()
+                    self.mark_prices[instrument] = 0.0
+                    self.trading_fees[instrument] = 0.0
+                    self.logger.info(f"Registered instrument: {instrument}")
+        except Exception as e:
+            self.logger.error(f"Error registering instrument {instrument}: {str(e)}")
+    
+    def update_position(self, instrument: str, size: float, price: float, fee: float = 0.0):
+        """Update position and track fees using existing PositionTracker"""
+        try:
+            # Ensure instrument is registered
+            if instrument not in self.instrument_trackers:
+                self.register_instrument(instrument)
+            
+            # Update position without holding portfolio lock to avoid deadlock
+            self.instrument_trackers[instrument].update_position(size, price)
+            
+            # Track accumulated fees with minimal lock
+            with self.portfolio_lock:
+                self.trading_fees[instrument] += fee
+                
+        except Exception as e:
+            self.logger.error(f"Error updating position for {instrument}: {str(e)}")
+    
+    def update_mark_price(self, instrument: str, price: float):
+        """Update current market price for P&L calculation"""
+        try:
+            if instrument in self.mark_prices:
+                # Update mark price with lock
+                with self.portfolio_lock:
+                    self.mark_prices[instrument] = price
+                
+                # Update unrealized P&L without holding portfolio lock to avoid deadlock
+                if instrument in self.instrument_trackers:
+                    self.instrument_trackers[instrument].update_unrealized_pnl(price, instrument)
+        except Exception as e:
+            self.logger.error(f"Error updating mark price for {instrument}: {str(e)}")
+    
+    def get_total_pnl(self) -> float:
+        """Sum of all unrealized + realized P&L across all instruments"""
+        try:
+            total_pnl = 0.0
+            with self.portfolio_lock:
+                for instrument, tracker in self.instrument_trackers.items():
+                    total_pnl += tracker.get_total_pnl()
+            return total_pnl
+        except Exception as e:
+            self.logger.error(f"Error calculating total P&L: {str(e)}")
+            return 0.0
+    
+    def get_net_pnl_after_fees(self) -> float:
+        """Total P&L minus all trading fees"""
+        try:
+            gross_pnl = self.get_total_pnl()
+            total_fees = sum(self.trading_fees.values())
+            return gross_pnl - total_fees
+        except Exception as e:
+            self.logger.error(f"Error calculating net P&L: {str(e)}")
+            return 0.0
+    
+    def calculate_trade_fee(self, notional_value: float, is_maker: bool = True) -> float:
+        """Calculate trading fee for a given trade"""
+        try:
+            # Import fee rates from config
+            from ..config.market_config import TRADING_CONFIG
+            
+            fees_config = TRADING_CONFIG.get("trading_fees", {})
+            fee_rate = fees_config.get("maker_fee_rate", 0.0002) if is_maker else fees_config.get("taker_fee_rate", 0.0005)
+            min_fee = fees_config.get("minimum_fee_usd", 0.0001)
+            
+            calculated_fee = notional_value * fee_rate
+            return max(calculated_fee, min_fee)
+        except Exception as e:
+            self.logger.error(f"Error calculating trade fee: {str(e)}")
+            return 0.0
+    
+    def estimate_closing_fees(self) -> float:
+        """Estimate fees required to close all open positions"""
+        try:
+            total_estimated_fees = 0.0
+            with self.portfolio_lock:
+                for instrument, tracker in self.instrument_trackers.items():
+                    position_size = tracker.current_position
+                    if abs(position_size) > tracker.ZERO_THRESHOLD and instrument in self.mark_prices:
+                        notional = abs(position_size * self.mark_prices[instrument])
+                        total_estimated_fees += self.calculate_trade_fee(notional, is_maker=True)
+            return total_estimated_fees
+        except Exception as e:
+            self.logger.error(f"Error estimating closing fees: {str(e)}")
+            return 0.0
+    
+    def get_net_profit_after_all_fees(self) -> float:
+        """Get total profit minus all fees (paid + estimated closing fees)"""
+        try:
+            gross_pnl = self.get_total_pnl()
+            paid_fees = sum(self.trading_fees.values())
+            estimated_closing_fees = self.estimate_closing_fees()
+            return gross_pnl - paid_fees - estimated_closing_fees
+        except Exception as e:
+            self.logger.error(f"Error calculating net profit after all fees: {str(e)}")
+            return 0.0
+    
+    def get_portfolio_metrics(self) -> Dict[str, Any]:
+        """Get comprehensive portfolio metrics"""
+        try:
+            # Calculate values that don't require extended lock holding
+            total_pnl = self.get_total_pnl()
+            net_pnl_after_fees = self.get_net_pnl_after_fees()
+            net_profit_after_all_fees = self.get_net_profit_after_all_fees()
+            estimated_closing_fees = self.estimate_closing_fees()
+            
+            # Only hold lock for data extraction
+            with self.portfolio_lock:
+                metrics = {
+                    "instruments": list(self.instrument_trackers.keys()),
+                    "total_instruments": len(self.instrument_trackers),
+                    "total_pnl": total_pnl,
+                    "net_pnl_after_fees": net_pnl_after_fees,
+                    "net_profit_after_all_fees": net_profit_after_all_fees,
+                    "total_paid_fees": sum(self.trading_fees.values()),
+                    "estimated_closing_fees": estimated_closing_fees,
+                    "instrument_positions": {},
+                    "instrument_pnls": {},
+                    "mark_prices": self.mark_prices.copy()
+                }
+                
+                # Add per-instrument details
+                for instrument, tracker in self.instrument_trackers.items():
+                    metrics["instrument_positions"][instrument] = tracker.current_position
+                    metrics["instrument_pnls"][instrument] = tracker.get_total_pnl()
+                
+                return metrics
+        except Exception as e:
+            self.logger.error(f"Error getting portfolio metrics: {str(e)}")
+            return {}
+    
+    @property
+    def positions(self) -> Dict[str, float]:
+        """Get current positions for all instruments"""
+        try:
+            with self.portfolio_lock:
+                return {instrument: tracker.current_position 
+                       for instrument, tracker in self.instrument_trackers.items()}
+        except Exception as e:
+            self.logger.error(f"Error getting positions: {str(e)}")
+            return {} 
