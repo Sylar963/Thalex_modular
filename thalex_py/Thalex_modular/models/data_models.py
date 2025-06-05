@@ -2762,6 +2762,124 @@ class PerpQuoter:
         elif self.position_entry_time is None and self.position_size != 0 : # New log
              self.logger.warning(f"Time-based check: Position exists but position_entry_time is None.")
 
+    async def manage_portfolio_take_profit(self):
+        """Portfolio-wide take profit logic - monitors all positions globally"""
+        current_time = time.time()
+        
+        # Throttle to once per 2 seconds for portfolio checks
+        if not hasattr(self, '_last_portfolio_tp_check'):
+            self._last_portfolio_tp_check = 0
+        
+        if current_time - self._last_portfolio_tp_check < 2.0:
+            return
+        
+        self._last_portfolio_tp_check = current_time
+        
+        try:
+            # Get portfolio-wide P&L after all fees
+            net_profit = self.portfolio_tracker.get_net_profit_after_all_fees()
+            
+            # Take profit threshold - configurable with default $1.1
+            tp_threshold = BOT_CONFIG.get("portfolio_take_profit", {}).get("min_profit_usd", 1.1)
+            
+            if net_profit >= tp_threshold:
+                self.logger.info(f"Portfolio take profit triggered: Net profit ${net_profit:.2f} >= ${tp_threshold:.2f}")
+                
+                # Close all positions across the portfolio
+                await self.close_all_portfolio_positions()
+                
+                # Reset position entry times
+                self.position_entry_time = None
+                
+                # Log the profitable close
+                self.logger.info(f"Portfolio positions closed with profit: ${net_profit:.2f}")
+                
+        except Exception as e:
+            self.logger.error(f"Error in portfolio take profit: {str(e)}")
+
+    async def close_all_portfolio_positions(self):
+        """Close all positions across the entire portfolio in coordinated manner"""
+        try:
+            positions_to_close = []
+            
+            # Collect all non-zero positions
+            for instrument, position_size in self.portfolio_tracker.positions.items():
+                if abs(position_size) > 0.001:  # Minimum position threshold
+                    positions_to_close.append({
+                        'instrument': instrument,
+                        'position_size': position_size,
+                        'direction': th.Direction.SELL if position_size > 0 else th.Direction.BUY
+                    })
+            
+            if not positions_to_close:
+                self.logger.info("No positions to close in portfolio")
+                return
+            
+            self.logger.info(f"Closing {len(positions_to_close)} positions in portfolio")
+            
+            # Close positions concurrently
+            closure_tasks = []
+            for position_info in positions_to_close:
+                if position_info['instrument'] == self.perp_name:
+                    # Use existing method for current instrument
+                    task = asyncio.create_task(self.close_all_positions_market())
+                else:
+                    # For other instruments, create market close order
+                    task = asyncio.create_task(
+                        self.close_position_for_instrument(position_info)
+                    )
+                closure_tasks.append(task)
+            
+            # Wait for all positions to close (with timeout)
+            await asyncio.wait_for(
+                asyncio.gather(*closure_tasks, return_exceptions=True), 
+                timeout=30.0
+            )
+            
+            self.logger.info("Portfolio closure completed")
+            
+        except asyncio.TimeoutError:
+            self.logger.error("Portfolio closure timed out after 30 seconds")
+        except Exception as e:
+            self.logger.error(f"Error closing portfolio positions: {str(e)}")
+
+    async def close_position_for_instrument(self, position_info: Dict):
+        """Close position for a specific instrument"""
+        try:
+            instrument = position_info['instrument']
+            position_size = position_info['position_size']
+            direction = position_info['direction']
+            
+            # Get current market price for the instrument
+            mark_price = self.portfolio_tracker.mark_prices.get(instrument)
+            if not mark_price:
+                self.logger.error(f"No mark price available for {instrument}")
+                return
+            
+            # Calculate aggressive exit price (0.5% buffer)
+            price_buffer = 0.005
+            if direction == th.Direction.SELL:
+                exit_price = mark_price * (1 - price_buffer)
+            else:
+                exit_price = mark_price * (1 + price_buffer)
+            
+            # Submit market-like order
+            await self.thalex.insert(
+                direction=direction,
+                instrument_name=instrument,
+                amount=abs(position_size),
+                price=exit_price,
+                client_order_id=self.client_order_id,
+                id=self.client_order_id,
+                collar="clamp"
+            )
+            
+            self.client_order_id += 1
+            self.logger.info(f"Submitted close order for {instrument}: {abs(position_size)} @ {exit_price}")
+            
+        except Exception as e:
+            self.logger.error(f"Error closing position for {position_info['instrument']}: {str(e)}")
+
     def calculate_aggressive_exit_price(self, direction: th.Direction) -> float:
         """Calculate an aggressive exit price to simulate a market order."""
         if not self.ticker or not self.tick or self.ticker.mark_price <= 0:

@@ -402,6 +402,14 @@ class PositionTracker:
             self.logger.error(f"Error updating position size: {str(e)}", exc_info=True)
 
 
+# Thalex fee configuration constants
+THALEX_FEES = {
+    "maker_fee": 0.0002,  # 0.02%
+    "taker_fee": 0.0005,  # 0.05%
+    "minimum_fee": 0.0001  # Minimum fee per trade
+}
+
+
 class PortfolioTracker:
     """
     Portfolio-wide position tracker that manages multiple instruments
@@ -486,12 +494,19 @@ class PortfolioTracker:
     def calculate_trade_fee(self, notional_value: float, is_maker: bool = True) -> float:
         """Calculate trading fee for a given trade"""
         try:
-            # Import fee rates from config
-            from ..config.market_config import TRADING_CONFIG
+            if notional_value <= 0:
+                return 0.0
             
-            fees_config = TRADING_CONFIG.get("trading_fees", {})
-            fee_rate = fees_config.get("maker_fee_rate", 0.0002) if is_maker else fees_config.get("taker_fee_rate", 0.0005)
-            min_fee = fees_config.get("minimum_fee_usd", 0.0001)
+            # Try to get fee rates from config first, fall back to constants
+            try:
+                from ..config.market_config import TRADING_CONFIG
+                fees_config = TRADING_CONFIG.get("trading_fees", {})
+                fee_rate = fees_config.get("maker_fee_rate", THALEX_FEES["maker_fee"]) if is_maker else fees_config.get("taker_fee_rate", THALEX_FEES["taker_fee"])
+                min_fee = fees_config.get("minimum_fee_usd", THALEX_FEES["minimum_fee"])
+            except ImportError:
+                # Fall back to constants if config not available
+                fee_rate = THALEX_FEES["maker_fee"] if is_maker else THALEX_FEES["taker_fee"]
+                min_fee = THALEX_FEES["minimum_fee"]
             
             calculated_fee = notional_value * fee_rate
             return max(calculated_fee, min_fee)
@@ -503,12 +518,25 @@ class PortfolioTracker:
         """Estimate fees required to close all open positions"""
         try:
             total_estimated_fees = 0.0
+            
+            # Get fee estimation buffer from config
+            try:
+                from ..config.market_config import TRADING_CONFIG
+                fee_buffer = TRADING_CONFIG.get("portfolio_take_profit", {}).get("fee_estimation_buffer", 1.1)
+            except ImportError:
+                fee_buffer = 1.1  # Default 10% buffer
+            
             with self.portfolio_lock:
                 for instrument, tracker in self.instrument_trackers.items():
                     position_size = tracker.current_position
                     if abs(position_size) > tracker.ZERO_THRESHOLD and instrument in self.mark_prices:
-                        notional = abs(position_size * self.mark_prices[instrument])
-                        total_estimated_fees += self.calculate_trade_fee(notional, is_maker=True)
+                        mark_price = self.mark_prices[instrument]
+                        if mark_price > 0:
+                            notional = abs(position_size * mark_price)
+                            # Assume maker fees for closing (optimistic) but apply buffer
+                            estimated_fee = self.calculate_trade_fee(notional, is_maker=True)
+                            total_estimated_fees += estimated_fee * fee_buffer
+            
             return total_estimated_fees
         except Exception as e:
             self.logger.error(f"Error estimating closing fees: {str(e)}")
@@ -524,6 +552,46 @@ class PortfolioTracker:
         except Exception as e:
             self.logger.error(f"Error calculating net profit after all fees: {str(e)}")
             return 0.0
+    
+    def get_detailed_fee_breakdown(self) -> Dict[str, Any]:
+        """Get comprehensive fee breakdown and profit analysis"""
+        try:
+            gross_pnl = self.get_total_pnl()
+            paid_fees = sum(self.trading_fees.values())
+            estimated_closing_fees = self.estimate_closing_fees()
+            net_profit = gross_pnl - paid_fees - estimated_closing_fees
+            
+            breakdown = {
+                "gross_pnl": gross_pnl,
+                "total_paid_fees": paid_fees,
+                "estimated_closing_fees": estimated_closing_fees,
+                "total_fee_impact": paid_fees + estimated_closing_fees,
+                "net_profit_after_all_fees": net_profit,
+                "fee_percentage_of_gross": (paid_fees + estimated_closing_fees) / max(abs(gross_pnl), 0.01) * 100,
+                "paid_fees_by_instrument": dict(self.trading_fees),
+                "positions_requiring_closure": {}
+            }
+            
+            # Add position-specific closing fee estimates
+            with self.portfolio_lock:
+                for instrument, tracker in self.instrument_trackers.items():
+                    position_size = tracker.current_position
+                    if abs(position_size) > tracker.ZERO_THRESHOLD and instrument in self.mark_prices:
+                        mark_price = self.mark_prices[instrument]
+                        if mark_price > 0:
+                            notional = abs(position_size * mark_price)
+                            estimated_fee = self.calculate_trade_fee(notional, is_maker=True)
+                            breakdown["positions_requiring_closure"][instrument] = {
+                                "position_size": position_size,
+                                "mark_price": mark_price,
+                                "notional_value": notional,
+                                "estimated_closing_fee": estimated_fee
+                            }
+            
+            return breakdown
+        except Exception as e:
+            self.logger.error(f"Error calculating detailed fee breakdown: {str(e)}")
+            return {}
     
     def get_portfolio_metrics(self) -> Dict[str, Any]:
         """Get comprehensive portfolio metrics"""
