@@ -266,7 +266,7 @@ if __name__ == "__main__":
     # Print startup banner
     print("="*80)
     print(f"Thalex Avellaneda Market Maker - Starting at {datetime.now()}")
-    print(f"Version: 2.0.0 (High Performance)")
+    print(f"Version: 2.2.0 (High Performance)")
     print("="*80)
     
     try:

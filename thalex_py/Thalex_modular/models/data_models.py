@@ -8,12 +8,15 @@ import traceback
 from typing import Union, Dict, Optional, List, Any, Tuple
 import enum
 import websockets
-from threading import Lock
+from threading import Lock, RLock
 import numpy as np
 from collections import deque
 from enum import Enum
 from dataclasses import dataclass, field
 import itertools
+import threading
+import weakref
+import gc
 
 import thalex as th
 
@@ -294,6 +297,156 @@ class Quote:
         except Exception as e:
             logging.error(f"Error in quote notional validation: {str(e)}")
             return False
+
+# Object Pool for Quote optimization - Added for Task P3 Memory Management
+class QuotePool:
+    """Thread-safe object pool for Quote instances to optimize memory allocation in HFT scenarios"""
+    
+    def __init__(self, max_size: int = 1000):
+        self.max_size = max_size
+        self._pool = deque(maxlen=max_size)
+        self._lock = RLock()  # Use RLock for nested locking scenarios
+        self._created_count = 0
+        self._reused_count = 0
+        self._peak_usage = 0
+        self._active_objects = weakref.WeakSet()  # Track active objects for memory monitoring
+        self._memory_stats = {
+            'total_created': 0,
+            'total_reused': 0,
+            'current_pool_size': 0,
+            'peak_pool_size': 0,
+            'active_objects': 0
+        }
+        
+    def get_quote(self, price: float = 0.0, amount: float = 0.0, 
+                  instrument: str = "", side: str = "", timestamp: float = None) -> 'Quote':
+        """Get a Quote object from the pool or create new one if pool is empty"""
+        with self._lock:
+            if self._pool:
+                # Reuse existing object from pool
+                quote = self._pool.popleft()
+                self._reused_count += 1
+                self._memory_stats['total_reused'] += 1
+                
+                # Reset object state
+                quote.price = price
+                quote.amount = amount
+                quote.instrument = instrument
+                quote.side = side
+                quote.timestamp = timestamp if timestamp is not None else time.time()
+            else:
+                # Create new object if pool is empty
+                quote = Quote(
+                    price=price,
+                    amount=amount,
+                    instrument=instrument,
+                    side=side,
+                    timestamp=timestamp if timestamp is not None else time.time()
+                )
+                self._created_count += 1
+                self._memory_stats['total_created'] += 1
+            
+            # Track active object for memory monitoring
+            self._active_objects.add(quote)
+            self._memory_stats['active_objects'] = len(self._active_objects)
+            
+            return quote
+    
+    def return_quote(self, quote: 'Quote') -> None:
+        """Return a Quote object to the pool for reuse"""
+        if quote is None:
+            return
+            
+        with self._lock:
+            # Only add to pool if we haven't reached max size
+            if len(self._pool) < self.max_size:
+                # Clear sensitive data for security
+                quote.price = 0.0
+                quote.amount = 0.0
+                quote.instrument = ""
+                quote.side = ""
+                quote.timestamp = 0.0
+                
+                self._pool.append(quote)
+                self._memory_stats['current_pool_size'] = len(self._pool)
+                
+                # Update peak usage statistics
+                if len(self._pool) > self._peak_usage:
+                    self._peak_usage = len(self._pool)
+                    self._memory_stats['peak_pool_size'] = self._peak_usage
+            
+            # Remove from active tracking regardless of pool addition
+            self._active_objects.discard(quote)
+            self._memory_stats['active_objects'] = len(self._active_objects)
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get memory usage statistics for monitoring"""
+        with self._lock:
+            current_size = len(self._pool)
+            efficiency = (self._reused_count / (self._created_count + self._reused_count)) * 100 if (self._created_count + self._reused_count) > 0 else 0
+            
+            return {
+                'pool_size': current_size,
+                'max_size': self.max_size,
+                'created_count': self._created_count,
+                'reused_count': self._reused_count,
+                'peak_usage': self._peak_usage,
+                'reuse_efficiency': efficiency,
+                'active_objects': len(self._active_objects),
+                'memory_stats': self._memory_stats.copy()
+            }
+    
+    def clear_pool(self) -> None:
+        """Clear the pool and reset statistics - for testing/cleanup"""
+        with self._lock:
+            self._pool.clear()
+            self._created_count = 0
+            self._reused_count = 0
+            self._peak_usage = 0
+            self._active_objects.clear()
+            self._memory_stats = {
+                'total_created': 0,
+                'total_reused': 0,
+                'current_pool_size': 0,
+                'peak_pool_size': 0,
+                'active_objects': 0
+            }
+    
+    def force_gc_cleanup(self) -> Dict[str, int]:
+        """Force garbage collection and return cleanup statistics"""
+        with self._lock:
+            # Update active objects count before GC
+            initial_active = len(self._active_objects)
+            
+            # Force garbage collection
+            collected = gc.collect()
+            
+            # Update stats after GC
+            final_active = len(self._active_objects)
+            self._memory_stats['active_objects'] = final_active
+            
+            return {
+                'objects_collected': collected,
+                'active_before': initial_active,
+                'active_after': final_active,
+                'objects_freed': initial_active - final_active
+            }
+
+# Global Quote pool instance for HFT optimization
+_quote_pool = QuotePool(max_size=1000)
+
+def get_pooled_quote(price: float = 0.0, amount: float = 0.0, 
+                    instrument: str = "", side: str = "", timestamp: float = None) -> Quote:
+    """Factory function to get pooled Quote objects - maintains same interface"""
+    return _quote_pool.get_quote(price, amount, instrument, side, timestamp)
+
+def return_pooled_quote(quote: Quote) -> None:
+    """Return Quote object to pool for reuse"""
+    _quote_pool.return_quote(quote)
+
+def get_quote_pool_stats() -> Dict[str, Any]:
+    """Get Quote pool memory statistics for monitoring"""
+    return _quote_pool.get_stats()
 class PerpQuoter:
     def __init__(self, thalex: th.Thalex):
         self.thalex = thalex
@@ -368,9 +521,59 @@ class PerpQuoter:
         self.event_bus = get_event_bus()
         self.component_name = "perp_quoter"
         self._setup_event_subscriptions()
+        
+        # Memory management optimization - Task P3
+        self._memory_monitor_interval = 50  # Log stats every 50 quote operations
+        self._quote_operations_count = 0
+        self._last_memory_log = time.time()
 
     def round_to_tick(self, value):
         return self.tick * round(value / self.tick)
+    
+    def _log_memory_stats(self):
+        """Log memory statistics for Quote object pool monitoring - Task P3"""
+        try:
+            pool_stats = get_quote_pool_stats()
+            self.logger.info(
+                f"Quote Pool Stats: "
+                f"pool_size={pool_stats['pool_size']}, "
+                f"created={pool_stats['created_count']}, "
+                f"reused={pool_stats['reused_count']}, "
+                f"efficiency={pool_stats['reuse_efficiency']:.1f}%, "
+                f"active={pool_stats['active_objects']}, "
+                f"peak={pool_stats['peak_usage']}"
+            )
+        except Exception as e:
+            self.logger.error(f"Error logging memory stats: {str(e)}")
+    
+    def _cleanup_old_quotes(self, quotes_list: List[Quote]):
+        """Return old quotes to pool for reuse - Task P3 memory management"""
+        try:
+            for quote in quotes_list:
+                if quote is not None:
+                    return_pooled_quote(quote)
+        except Exception as e:
+            self.logger.error(f"Error cleaning up quotes: {str(e)}")
+    
+    def _force_memory_cleanup(self):
+        """Force garbage collection and memory cleanup - Task P3"""
+        try:
+            cleanup_stats = _quote_pool.force_gc_cleanup()
+            if cleanup_stats['objects_freed'] > 0:
+                self.logger.info(f"Memory cleanup freed {cleanup_stats['objects_freed']} objects")
+            return cleanup_stats
+        except Exception as e:
+            self.logger.error(f"Error in force memory cleanup: {str(e)}")
+            return {}
+    
+    async def _async_memory_cleanup(self):
+        """Async wrapper for memory cleanup to avoid blocking quote task"""
+        try:
+            await asyncio.sleep(0)  # Yield control
+            self._force_memory_cleanup()
+            self._log_memory_stats()
+        except Exception as e:
+            self.logger.error(f"Error in async memory cleanup: {str(e)}")
 
     def _setup_event_subscriptions(self):
         """Setup event bus subscriptions for cross-component communication - Added 2024-12-19"""
@@ -835,9 +1038,12 @@ class PerpQuoter:
             return 0.001
 
     async def adjust_quotes(self, desired: List[List[Quote]]):
-        """Optimized quote adjustment with proper order cleanup"""
+        """Optimized quote adjustment with memory management and order cleanup - Task P3"""
         current_time = time.time()
         if current_time - self.last_quote_update < QUOTING_CONFIG["min_quote_interval"]:
+            # Clean up provided quotes if not processing them
+            self._cleanup_old_quotes(desired[0])  # bids
+            self._cleanup_old_quotes(desired[1])  # asks
             return
         
         self.last_quote_update = current_time
@@ -880,8 +1086,15 @@ class PerpQuoter:
                         await self.place_new_quote(quote, side)
                         operations_count += 1
 
+            # Clean up quotes after processing - Task P3 memory management
+            self._cleanup_old_quotes(desired[0])  # bids
+            self._cleanup_old_quotes(desired[1])  # asks
+
         except Exception as e:
             logging.error(f"Error in quote adjustment: {str(e)}")
+            # Still clean up quotes on error
+            self._cleanup_old_quotes(desired[0])  # bids
+            self._cleanup_old_quotes(desired[1])  # asks
             await asyncio.sleep(QUOTING_CONFIG["error_retry_interval"])
 
     async def fast_cancel_order(self, order: Order):
@@ -1004,6 +1217,15 @@ class PerpQuoter:
 
                 quotes = await self.make_quotes()
                 await self.adjust_quotes(quotes)
+                
+                # Memory management - periodic cleanup every 100 quote cycles
+                if hasattr(self, '_quote_cycle_count'):
+                    self._quote_cycle_count += 1
+                else:
+                    self._quote_cycle_count = 1
+                    
+                if self._quote_cycle_count % 100 == 0:
+                    asyncio.create_task(self._async_memory_cleanup())
                 
                 # Non-blocking tasks
                 # asyncio.create_task(self.manage_take_profit()) # REMOVED OLD CALL
@@ -2082,15 +2304,26 @@ class PerpQuoter:
             price_decimals = TRADING_CONFIG.get("execution", {}).get("price_decimals", 2) # Assuming default from BOT_CONFIG
             size_decimals = TRADING_CONFIG.get("execution", {}).get("size_decimals", 3)   # Assuming default from BOT_CONFIG
 
-            # Add base quotes (Level 0)
+            # Add base quotes (Level 0) - Using object pool for memory optimization
             if l0_bid_size >= min_trade_size:
-                bids.append(Quote(price=round(l0_bid_price, price_decimals), 
-                                  amount=round(l0_bid_size, size_decimals), 
-                                  instrument=self.perp_name, side="BUY"))
+                bid_quote = get_pooled_quote(
+                    price=round(l0_bid_price, price_decimals), 
+                    amount=round(l0_bid_size, size_decimals), 
+                    instrument=self.perp_name, 
+                    side="BUY"
+                )
+                bids.append(bid_quote)
+                self._quote_operations_count += 1
+                
             if l0_ask_size >= min_trade_size:
-                asks.append(Quote(price=round(l0_ask_price, price_decimals), 
-                                   amount=round(l0_ask_size, size_decimals), 
-                                   instrument=self.perp_name, side="SELL"))
+                ask_quote = get_pooled_quote(
+                    price=round(l0_ask_price, price_decimals), 
+                    amount=round(l0_ask_size, size_decimals), 
+                    instrument=self.perp_name, 
+                    side="SELL"
+                )
+                asks.append(ask_quote)
+                self._quote_operations_count += 1
                 
             # Config for additional levels from TRADING_CONFIG["avellaneda"] (via QUOTING_CONFIG reconstruction)
             max_levels = QUOTING_CONFIG.get("max_levels", 1) 
@@ -2123,13 +2356,32 @@ class PerpQuoter:
                 level_ask_s = round(l0_ask_size * current_level_size_multiplier, size_decimals)
                 
                 if level_bid_s >= min_trade_size:
-                    bids.append(Quote(price=round(level_bid_p, price_decimals), 
-                                      amount=level_bid_s, 
-                                      instrument=self.perp_name, side="BUY"))
+                    level_bid_quote = get_pooled_quote(
+                        price=round(level_bid_p, price_decimals), 
+                        amount=level_bid_s, 
+                        instrument=self.perp_name, 
+                        side="BUY"
+                    )
+                    bids.append(level_bid_quote)
+                    self._quote_operations_count += 1
+                    
                 if level_ask_s >= min_trade_size:
-                    asks.append(Quote(price=round(level_ask_p, price_decimals), 
-                                       amount=level_ask_s, 
-                                       instrument=self.perp_name, side="SELL"))
+                    level_ask_quote = get_pooled_quote(
+                        price=round(level_ask_p, price_decimals), 
+                        amount=level_ask_s, 
+                        instrument=self.perp_name, 
+                        side="SELL"
+                    )
+                    asks.append(level_ask_quote)
+                    self._quote_operations_count += 1
+            
+            # Memory monitoring - log pool statistics periodically
+            if self._quote_operations_count >= self._memory_monitor_interval:
+                current_time = time.time()
+                if current_time - self._last_memory_log >= 10.0:  # Log every 10 seconds minimum
+                    self._log_memory_stats()
+                    self._last_memory_log = current_time
+                    self._quote_operations_count = 0
             
             self.logger.debug(f"Generated quotes: Bids({len(bids)}), Asks({len(asks)})")
             return [bids, asks]
@@ -2290,13 +2542,18 @@ class PerpQuoter:
             return 0, 0, 0, 0
 
     def calculate_volatility(self) -> float:
-        """Calculate EWMA volatility of log returns for improved responsiveness - Updated 2024-12-19"""
+        """Calculate EWMA volatility of log returns with optimized NumPy operations - Optimized 2024-12-19"""
+        import time as perf_time  # Performance timing import
+        
         try:
+            # Performance measurement start
+            start_time = perf_time.perf_counter()
+            
             vol_config = TRADING_CONFIG.get("volatility", {})
             vol_window = vol_config.get("window") # Minimum required window
             vol_floor = vol_config.get("floor", 0.0001) # Min volatility
             vol_ceiling = vol_config.get("ceiling", 1.0)  # Max volatility
-            ewma_alpha = vol_config.get("ewma_alpha", 0.06)  # EWMA decay factor - Added 2024-12-19
+            ewma_alpha = vol_config.get("ewma_alpha", 0.06)  # EWMA decay factor
 
             if vol_window is None or len(self.price_history) < max(2, vol_window // 2):
                 return 0.0 
@@ -2307,45 +2564,76 @@ class PerpQuoter:
                 self.logger.debug(f"Insufficient price history ({len(self.price_history)}) for EWMA volatility calculation.")
                 return 0.0
 
-            # Get recent prices for calculation
-            recent_prices = list(self.price_history)[-min_points:]
-            prices = np.array(recent_prices)
+            # Optimized NumPy array creation - single conversion from deque
+            prices = np.array(list(self.price_history)[-min_points:], dtype=np.float64)
             
-            if np.any(prices <= 0):
-                self.logger.warning("Invalid (zero/negative) prices in history window for volatility.")
+            # Vectorized validation for invalid prices
+            if np.any(prices <= 0) or not np.all(np.isfinite(prices)):
+                self.logger.warning("Invalid (zero/negative/non-finite) prices in history window for volatility.")
                 return 0.0
                 
+            # Optimized log returns calculation using vectorized operations
             log_returns = np.diff(np.log(prices))
             if log_returns.size == 0:
                  self.logger.debug("Not enough price points (after diff) to calculate log returns for volatility.")
                  return 0.0
 
-            # Calculate EWMA volatility - Added 2024-12-19
+            # Optimized EWMA calculation using NumPy vectorized operations
             if not hasattr(self, '_ewma_variance'):
-                # Initialize with simple variance of first few returns
-                self._ewma_variance = np.var(log_returns[:5]) if len(log_returns) >= 5 else np.var(log_returns)
+                # Initialize with vectorized variance calculation
+                initial_returns = log_returns[:5] if log_returns.size >= 5 else log_returns
+                self._ewma_variance = np.var(initial_returns, dtype=np.float64)
             
-            # Update EWMA variance with most recent return
-            latest_return = log_returns[-1]
-            self._ewma_variance = ewma_alpha * (latest_return ** 2) + (1 - ewma_alpha) * self._ewma_variance
+            # Vectorized EWMA update for all new returns (more efficient for batch updates)
+            if log_returns.size > 1:
+                # Process multiple returns efficiently using NumPy's cumulative operations
+                squared_returns = np.square(log_returns, dtype=np.float64)
+                
+                # Vectorized EWMA calculation for all returns
+                weights = np.power(1 - ewma_alpha, np.arange(len(squared_returns) - 1, -1, -1, dtype=np.float64))
+                weighted_variance = ewma_alpha * np.dot(weights, squared_returns)
+                self._ewma_variance = weighted_variance + (1 - ewma_alpha) ** len(squared_returns) * self._ewma_variance
+            else:
+                # Single return update (fallback)
+                latest_return = log_returns[-1]
+                self._ewma_variance = ewma_alpha * (latest_return ** 2) + (1 - ewma_alpha) * self._ewma_variance
             
-            # Calculate volatility as square root of variance
-            calculated_vol_ewma = np.sqrt(self._ewma_variance)
+            # Optimized volatility calculation with NumPy sqrt
+            calculated_vol_ewma = np.sqrt(self._ewma_variance, dtype=np.float64)
             
+            # Vectorized validation check
             if not (np.isfinite(calculated_vol_ewma) and calculated_vol_ewma >= 0):
                 self.logger.warning(f"EWMA volatility calculation resulted in non-finite/negative value: {calculated_vol_ewma}")
-                # Fallback to simple standard deviation
-                calculated_vol_ewma = np.std(log_returns)
+                # Fallback to optimized standard deviation
+                calculated_vol_ewma = np.std(log_returns, dtype=np.float64)
                 if not (np.isfinite(calculated_vol_ewma) and calculated_vol_ewma >= 0):
                     return vol_floor
             
-            # Apply floor and ceiling
-            final_vol = max(vol_floor, min(calculated_vol_ewma, vol_ceiling))
-            self.logger.debug(f"Calculated EWMA volatility: {final_vol:.6f} (alpha={ewma_alpha}, variance={self._ewma_variance:.8f}, returns={log_returns.size})")
-            return final_vol
+            # Optimized floor/ceiling application using NumPy clip
+            final_vol = np.clip(calculated_vol_ewma, vol_floor, vol_ceiling)
+            
+            # Performance measurement end
+            calc_time = perf_time.perf_counter() - start_time
+            
+            # Enhanced performance logging
+            self.logger.debug(f"Optimized EWMA volatility: {final_vol:.6f} (alpha={ewma_alpha}, variance={self._ewma_variance:.8f}, returns={log_returns.size}, calc_time={calc_time*1000:.3f}ms)")
+            
+            # Performance tracking for HFT optimization
+            if not hasattr(self, '_vol_calc_times'):
+                self._vol_calc_times = deque(maxlen=100)  # Keep last 100 measurements
+            self._vol_calc_times.append(calc_time)
+            
+            # Log performance statistics periodically
+            if len(self._vol_calc_times) >= 100 and len(self._vol_calc_times) % 100 == 0:
+                avg_time = np.mean(self._vol_calc_times) * 1000  # Convert to ms
+                max_time = np.max(self._vol_calc_times) * 1000
+                min_time = np.min(self._vol_calc_times) * 1000
+                self.logger.info(f"Volatility calc performance (last 100): avg={avg_time:.3f}ms, max={max_time:.3f}ms, min={min_time:.3f}ms")
+            
+            return float(final_vol)  # Ensure Python float return type
             
         except Exception as e:
-            self.logger.error(f"Error calculating EWMA volatility: {str(e)}, Trace: {traceback.format_exc()}")
+            self.logger.error(f"Error calculating optimized EWMA volatility: {str(e)}, Trace: {traceback.format_exc()}")
             return 0.0
 
     def calculate_optimal_size(self, side: str, q: float, volatility: float) -> float:

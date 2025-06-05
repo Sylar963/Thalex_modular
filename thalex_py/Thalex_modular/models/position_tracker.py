@@ -291,9 +291,13 @@ class PositionTracker:
             self.logger.error(f"Error validating position data: {str(e)}", exc_info=True)
             return False
     
-    def update_unrealized_pnl(self, current_price: float):
+    def update_unrealized_pnl(self, current_price: float, perp_name: str = None):
         """
         Update unrealized P&L based on current market price
+        
+        Args:
+            current_price: Current market price
+            perp_name: Optional instrument name (for multi-instrument tracking)
         """
         try:
             if abs(self.current_position) < self.ZERO_THRESHOLD or self.average_entry_price is None:

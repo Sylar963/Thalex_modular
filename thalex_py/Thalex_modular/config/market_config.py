@@ -1,6 +1,7 @@
 from thalex import Network
 from typing import Dict, Any
 import warnings
+import logging
 
 # =============================================================================
 # THALEX MARKET MAKER CONFIGURATION
@@ -15,7 +16,7 @@ This file defines the configuration for the Thalex Avellaneda-Stoikov market mak
 BOT_CONFIG = {
     # Market parameters
     "market": {
-        "underlying": "BTC-06JUN25",
+        "underlying": "BTC-13JUN25",
         "network": Network.TEST,
         "label": "F",
     
@@ -43,7 +44,7 @@ BOT_CONFIG = {
             # Position and inventory management
             "inventory_weight": 0.8,       # Inventory skew factor (increased from 0.7 for better skewing)
             "inventory_cost_factor": 0.0001, # Cost of holding inventory
-            "position_fade_time": 300,     # Time to fade position (seconds)
+            "position_fade_time": 30,     # Time to fade position (seconds)
             "adverse_selection_threshold": 0.002,  # Adverse selection threshold
             "min_profit_rebalance": 0.01,  # Minimum profit to trigger rebalance
             "max_loss_threshold": 0.03,    # Maximum loss before gradual exit
@@ -51,7 +52,7 @@ BOT_CONFIG = {
             # Quote sizing and levels
             "base_size": 0.1,             # Base quote size increased from 0.01
             "size_multipliers": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],  # Size multipliers with Fibonacci-like progression
-            "max_levels": 12,              # Maximum number of quote levels (reduced from 21)
+            "max_levels": 3,              # Maximum number of quote levels (reduced from 21)
             "level_spacing": 100,          # Base spacing between levels in ticks (increased from 50 to 100)
             "vamp_spread_sensitivity": 0.5,  # Sensitivity of spread to VAMP impact
             "vamp_skew_sensitivity": 0.001,  # Sensitivity of quote skew to VAMP impact
@@ -66,22 +67,22 @@ BOT_CONFIG = {
         # Order execution parameters
         "execution": {
             "post_only": True,             # Use post-only orders
-            "min_size": 0.1,             # Minimum quote size
-            "max_size": 1.0,               # Maximum quote size
-            "size_increment": 0.1,       # Size increment
+            "min_size": 0.01,             # Minimum quote size
+            "max_size": 5.0,               # Maximum quote size
+            "size_increment": 0.2,       # Size increment
             "price_decimals": 2,           # Price decimal places
-            "size_decimals": 1,            # Size decimal places
+            "size_decimals": 2,            # Size decimal places
             "max_retries": 2,              # Maximum retry attempts
         },
         
         # Quote management
         "quote_timing": {
-            "min_interval": 1.0,           # Minimum time between quotes
-            "max_lifetime": 5,             # Maximum quote lifetime in seconds (reduced from 10 to 5)
+            "min_interval": 5.0,           # Minimum time between quotes
+            "max_lifetime": 10,             # Maximum quote lifetime in seconds (reduced from 10 to 5)
             "operation_interval": 0.2,     # Time between order operations
-            "max_pending": 5,              # Maximum concurrent operations
-            "grid_update_interval": 3.0,   # Interval for updating quote grid based on market data
-            "position_check_interval": 5.0 # Interval for position-based quote updates
+            "max_pending": 9,              # Maximum concurrent operations
+            "grid_update_interval": 5.0,   # Interval for updating quote grid based on market data
+            "position_check_interval": 2.0 # Interval for position-based quote updates
         },
         
         # Market impact and cancellation
@@ -128,7 +129,7 @@ BOT_CONFIG = {
     
     # Risk management
     "risk": {
-        "max_position": 2,           # Maximum position size
+        "max_position": 20,           # Maximum position size
         "stop_loss_pct": 0.06,         # Stop loss percentage
         "take_profit_pct": 0.0022,       # Take profit percentage (NEW - Changed to 0.22%)
         "max_drawdown": 0.10,          # Maximum drawdown
@@ -138,13 +139,34 @@ BOT_CONFIG = {
         # Additional risk parameters
         "position_rebalance_threshold": 0.8, # Position utilization for rebalance
         "market_impact_threshold": 0.0025, # Market impact threshold for rebalance
-        "rebalance_cooldown": 300,     # Rebalance cooldown period (5 min)
+        "rebalance_cooldown": 30,     # Rebalance cooldown period (5 min)
         
         # Position management
-        "max_notional": 100000,  # Maximum notional value in USD
-        "max_position_notional": 80000,  # Maximum notional position (80% of max_notional)
+        "max_notional": 100000000,  # Maximum notional value in USD
+        "max_position_notional": 80000000,  # Maximum notional position (80% of max_notional)
     },
     
+    # Portfolio-wide take profit configuration
+    "portfolio_take_profit": {
+        "enable_portfolio_tp": True,         # Master enable/disable
+        "min_profit_usd": 1.1,              # Minimum profit threshold in USD
+        "profit_after_fees": True,          # Whether threshold applies after fees
+        "check_interval_seconds": 2.0,       # How often to check portfolio P&L
+        "max_position_age_hours": 24,        # Maximum time to hold positions
+        "emergency_close_threshold": -10.0,  # Emergency close if loss exceeds this
+        "partial_profit_threshold": 0.5,     # Take partial profits at this level
+        "position_correlation_check": True,  # Monitor position correlation
+        "fee_estimation_buffer": 1.1        # Multiply estimated fees by this factor
+    },
+    
+    # Trading fees configuration
+    "trading_fees": {
+        "maker_fee_rate": 0.0002,    # 0.02% for maker orders
+        "taker_fee_rate": 0.0005,    # 0.05% for taker orders  
+        "minimum_fee_usd": 0.0001,   # Minimum fee per trade
+        "fee_estimation_buffer": 1.1 # Safety buffer for fee estimates
+    },
+
     # Hedging configuration
     "hedging": {
         "enabled": False,  # Explicitly disable hedging
@@ -310,6 +332,8 @@ TRADING_CONFIG = {
     "volume_candle": BOT_CONFIG["trading_strategy"]["volume_candle"],
     "volatility": DEFAULT_VOLATILITY_CONFIG,
     "vamp": BOT_CONFIG["trading_strategy"]["vamp"],
+    "portfolio_take_profit": BOT_CONFIG["portfolio_take_profit"],
+    "trading_fees": BOT_CONFIG["trading_fees"],
 }
 
 # RISK_LIMITS - Direct access to risk parameters
@@ -330,3 +354,23 @@ RISK_LIMITS: Dict[str, Any] = {
 }
 
 CONNECTION_CONFIG = BOT_CONFIG["connection"]
+
+
+def validate_portfolio_take_profit_config(config: Dict) -> bool:
+    """Validate portfolio take profit configuration"""
+    required_fields = ["min_profit_usd", "check_interval_seconds"]
+    
+    for field in required_fields:
+        if field not in config:
+            logging.error(f"Missing required portfolio take profit field: {field}")
+            return False
+    
+    if config["min_profit_usd"] <= 0:
+        logging.error("min_profit_usd must be positive")
+        return False
+        
+    if config["check_interval_seconds"] < 1.0:
+        logging.error("check_interval_seconds must be at least 1.0")
+        return False
+    
+    return True

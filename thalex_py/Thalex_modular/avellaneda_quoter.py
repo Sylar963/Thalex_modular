@@ -187,6 +187,7 @@ class AvellanedaQuoter:
         # Order management
         self.max_orders_per_side = 5  # Maximum orders per side
         self.max_total_orders = 16  # Maximum total orders
+        self.next_client_order_id = 1000  # Starting ID for client orders
         
         # Set default tick size
         self.tick_size = 1.0
@@ -2815,6 +2816,95 @@ class AvellanedaQuoter:
         except Exception as e:
             self.logger.error(f"Error cancelling orders: {str(e)}")
             return False
+
+    async def _close_both_positions(self, reason: str):
+        """
+        Close both perpetual and futures positions for risk management purposes.
+        
+        Args:
+            reason: The reason for closing the positions
+        """
+        self.logger.info(f"Closing both positions due to: {reason}")
+        
+        # Close perpetual position if it exists
+        if self.perp_name:
+            try:
+                current_perp_position = self.position_tracker.get_position_metrics().get("position", 0.0)
+                if abs(current_perp_position) > 0.001:  # Only if position is meaningful
+                    direction = th.Direction.SELL if current_perp_position > 0 else th.Direction.BUY
+                    amount_to_close = abs(current_perp_position)
+                    
+                    # Get a suitable exit price
+                    if self.ticker and hasattr(self.ticker, 'mark_price') and self.ticker.mark_price > 0:
+                        exit_price_base = self.ticker.mark_price
+                        # Add a buffer to ensure the order gets filled
+                        buffer_pct = 0.005  # 0.5% buffer
+                        exit_price = exit_price_base * (1 - buffer_pct) if direction == th.Direction.SELL else exit_price_base * (1 + buffer_pct)
+                        
+                        # Align to tick size
+                        if hasattr(self, 'tick_size') and self.tick_size > 0:
+                            exit_price = round(exit_price / self.tick_size) * self.tick_size
+                            
+                        self.logger.info(f"Placing market-like order to close {amount_to_close} of {self.perp_name} at price {exit_price} (Direction: {direction.value})")
+                        
+                        await self.thalex.insert(
+                            direction=direction,
+                            instrument_name=self.perp_name,
+                            amount=amount_to_close,
+                            price=exit_price,
+                            client_order_id=self.next_client_order_id,
+                            id=self.next_client_order_id,
+                            post_only=False  # Ensure it can take liquidity
+                        )
+                        self.next_client_order_id += 1
+                        self.logger.info(f"Perpetual position close order sent for {self.perp_name}")
+                    else:
+                        self.logger.error(f"Could not determine a valid exit price for {self.perp_name}. Cannot close position.")
+                else:
+                    self.logger.info(f"No meaningful perpetual position to close for {self.perp_name} (size: {current_perp_position:.6f})")
+            except Exception as e:
+                self.logger.error(f"Error closing perpetual position for {self.perp_name}: {str(e)}", exc_info=True)
+        
+        # Close futures position if it exists
+        if self.futures_instrument_name:
+            try:
+                # Use the same position tracker but the method should handle different instruments
+                current_futures_position = self.position_tracker.get_position_metrics().get("position", 0.0)
+                if abs(current_futures_position) > 0.001:  # Only if position is meaningful
+                    direction = th.Direction.SELL if current_futures_position > 0 else th.Direction.BUY
+                    amount_to_close = abs(current_futures_position)
+                    
+                    # Get a suitable exit price for futures
+                    if self.futures_ticker and hasattr(self.futures_ticker, 'mark_price') and self.futures_ticker.mark_price > 0:
+                        exit_price_base = self.futures_ticker.mark_price
+                        buffer_pct = 0.005  # 0.5% buffer
+                        exit_price = exit_price_base * (1 - buffer_pct) if direction == th.Direction.SELL else exit_price_base * (1 + buffer_pct)
+                        
+                        # Align to tick size (assuming same tick size for futures)
+                        if hasattr(self, 'tick_size') and self.tick_size > 0:
+                            exit_price = round(exit_price / self.tick_size) * self.tick_size
+                            
+                        self.logger.info(f"Placing market-like order to close {amount_to_close} of {self.futures_instrument_name} at price {exit_price} (Direction: {direction.value})")
+                        
+                        await self.thalex.insert(
+                            direction=direction,
+                            instrument_name=self.futures_instrument_name,
+                            amount=amount_to_close,
+                            price=exit_price,
+                            client_order_id=self.next_client_order_id,
+                            id=self.next_client_order_id,
+                            post_only=False  # Ensure it can take liquidity
+                        )
+                        self.next_client_order_id += 1
+                        self.logger.info(f"Futures position close order sent for {self.futures_instrument_name}")
+                    else:
+                        self.logger.error(f"Could not determine a valid exit price for {self.futures_instrument_name}. Cannot close position.")
+                else:
+                    self.logger.info(f"No meaningful futures position to close for {self.futures_instrument_name} (size: {current_futures_position:.6f})")
+            except Exception as e:
+                self.logger.error(f"Error closing futures position for {self.futures_instrument_name}: {str(e)}", exc_info=True)
+        
+        self.logger.info("Position closure orders completed")
 
 async def main():
     """Main entry point"""

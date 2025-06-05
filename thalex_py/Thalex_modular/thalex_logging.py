@@ -7,7 +7,7 @@ class LoggerFactory:
     """Factory for creating and configuring loggers"""
     
     DEFAULT_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    DEFAULT_LEVEL = logging.INFO
+    DEFAULT_LEVEL = logging.ERROR
     
     # Centralized logs configuration
     LOGS_BASE_DIR = 'logs'

@@ -126,9 +126,17 @@ class RiskManager:
             
         return current_unrealized_pnl / cost_basis
 
-    def check_stop_loss(self, current_price: float) -> bool:
+    def check_stop_loss(self, current_price: float, instrument_name: Optional[str] = None) -> bool:
         """
-        Check if stop-loss condition is met based on P&L percentage.
+        Check if stop-loss conditions are met.
+        Currently only checks P&L percentage based stop loss.
+        
+        Args:
+            current_price: Current market price
+            instrument_name: Optional instrument name for multi-instrument tracking
+            
+        Returns:
+            bool: True if stop loss is triggered, False otherwise
         """
         if self.stop_loss_pct is None:
             return False # Stop loss is not configured
@@ -140,7 +148,7 @@ class RiskManager:
             return False # No position to stop out
 
         # Update unrealized PnL in PositionTracker before checking
-        self.position_tracker.update_unrealized_pnl(current_price)
+        self.position_tracker.update_unrealized_pnl(current_price, instrument_name)
         # Fetch updated metrics
         metrics_after_upnl_update = self.position_tracker.get_position_metrics()
         unrealized_pnl_value = metrics_after_upnl_update.get("unrealized_pnl", 0.0)
@@ -167,12 +175,19 @@ class RiskManager:
             return True
         return False
 
-    def check_take_profit(self, current_price: float) -> Tuple[bool, str, float]:
+    def check_take_profit(self, current_price: float, instrument_name: Optional[str] = None) -> Tuple[bool, str, float]:
         """
         Check if take-profit conditions are met.
         Currently only checks P&L percentage based take profit.
         Time-based take-profit needs to be re-evaluated in Step 3.
-        Returns: (triggered, reason, portion_to_close) - portion_to_close is always 1.0 for now
+        
+        Args:
+            current_price: Current market price
+            instrument_name: Optional instrument name for multi-instrument tracking
+            
+        Returns: 
+            Tuple[bool, str, float]: (triggered, reason, portion_to_close) 
+            portion_to_close is always 1.0 for now
         """
         if self.take_profit_pct is None:
             return False, "", 0.0 # Take profit P&L not configured
@@ -184,7 +199,7 @@ class RiskManager:
             return False, "", 0.0 # No position
 
         # Update unrealized PnL in PositionTracker before checking
-        self.position_tracker.update_unrealized_pnl(current_price)
+        self.position_tracker.update_unrealized_pnl(current_price, instrument_name)
         # Fetch updated metrics
         metrics_after_upnl_update = self.position_tracker.get_position_metrics()
         unrealized_pnl_value = metrics_after_upnl_update.get("unrealized_pnl", 0.0)
@@ -224,10 +239,14 @@ class RiskManager:
         
         return False, "", 0.0
 
-    async def check_risk_limits(self, current_market_price: Optional[float] = None) -> bool:
+    async def check_risk_limits(self, current_market_price: Optional[float] = None, instrument_name: Optional[str] = None) -> bool:
         """
         Centralized method to check all relevant risk limits.
         Returns True if NO limits are breached, False if ANY limit is breached.
+        
+        Args:
+            current_market_price: The current market price for risk calculations
+            instrument_name: Optional instrument name for multi-instrument tracking
         """
         if current_market_price is None:
             self.logger.warning("Risk check: current_market_price is None. Cannot perform all checks.")
@@ -256,7 +275,7 @@ class RiskManager:
 
         if abs(current_pos_size) > ZERO_THRESHOLD: # Only if there's an open position
             # 2. Check Stop Loss
-            if self.check_stop_loss(current_market_price):
+            if self.check_stop_loss(current_market_price, instrument_name):
                 # The reason is logged within check_stop_loss.
                 # The callback here indicates a general risk breach due to stop-loss.
                 if self.callbacks.get("risk_limit"):

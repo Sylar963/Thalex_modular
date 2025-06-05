@@ -15,454 +15,414 @@ The tasks are organized by component and complexity level, allowing for incremen
 
 ## Task Categories
 
-### 🔧 **Configuration Tasks** (Low Risk)
-### 📊 **Data Structure Tasks** (Medium Risk)
-### 🧮 **Mathematical Model Tasks** (Medium-High Risk)
-### 🔄 **Integration Tasks** (High Risk)
-### 🚀 **Performance Tasks** (High Risk)
+### 💰 **Take Profit Enhancement Tasks** (High Risk)
 
 ---
 
-## PHASE 1: CONFIGURATION & SETUP TASKS
+## PHASE 7: TAKE PROFIT ENHANCEMENT TASKS 💰
 
-### Task S1: Fix Security Issue - Remove Keys Import from data_models.py
-**File**: `thalex_py/Thalex_modular/models/data_models.py`
-**Lines**: 18, 943
-**Objective**: Remove insecure keys import and use environment variables
-**Risk Level**: 🔒 **SECURITY CRITICAL**
+### Task TP1: Create Portfolio-Wide Position Tracker
+**File**: `thalex_py/Thalex_modular/models/position_tracker.py` (extend existing file)
+**Objective**: Add comprehensive multi-instrument position tracking to existing file
+**Risk Level**: 💰 High
 
 **Instructions**:
-1. **Remove the keys import** (line 18):
+1. **Extend existing file** `position_tracker.py` - DO NOT create new file
+2. **Add PortfolioTracker class** at the end of the existing file, after the current `PositionTracker` class
+3. **Implement PortfolioTracker class** that leverages existing `PositionTracker` instances:
    ```python
-   # REMOVE this line completely:
-   from .keys import *  # Import from the local keys.py file
+   class PortfolioTracker:
+       def __init__(self):
+           self.logger = LoggerFactory.configure_component_logger(
+               "portfolio_tracker", log_file="portfolio_tracker.log", high_frequency=False
+           )
+           self.instrument_trackers: Dict[str, PositionTracker] = {}  # instrument -> PositionTracker
+           self.mark_prices: Dict[str, float] = {}  # instrument -> current_mark_price
+           self.trading_fees: Dict[str, float] = {}  # instrument -> accumulated_fees
+           self.portfolio_lock = threading.Lock()
    ```
+4. **Add methods for portfolio management**:
+   - `register_instrument(instrument)`: Create PositionTracker for new instrument
+   - `update_position(instrument, size, price, fee)`: Update position and track fees using existing PositionTracker
+   - `update_mark_price(instrument, price)`: Update current market price for P&L calculation
+   - `get_total_pnl()`: Sum of all unrealized + realized P&L across all instruments
+   - `get_net_pnl_after_fees()`: Total P&L minus all trading fees
+5. **Add fee calculation support**:
+   - Track maker/taker fees per trade per instrument
+   - Calculate estimated closing fees across portfolio
+   - Support different fee tiers per instrument
+6. **Thread safety**: Use locks for concurrent access and leverage existing PositionTracker locks
 
-2. **Add os import** (add after line 4):
+**Validation**:
+- PortfolioTracker class initializes without errors
+- Integrates seamlessly with existing PositionTracker functionality
+- Multi-instrument position updates work correctly
+- Portfolio-wide P&L calculations are accurate
+- Fee tracking functions properly across all instruments
+- Thread-safe operations across multiple instruments
+
+---
+
+### Task TP2: Integrate Portfolio Tracker with PerpQuoter
+**File**: `thalex_py/Thalex_modular/models/data_models.py`
+**Lines**: 450-500 (PerpQuoter __init__ method)
+**Objective**: Add portfolio tracking to existing quoter
+**Risk Level**: 💰 High
+
+**Instructions**:
+1. **Import portfolio tracker** at top of file:
    ```python
-   import os
+   from .portfolio_tracker import PortfolioTracker
    ```
-
-3. **Update the login call** (line 943):
+2. **Add to PerpQuoter.__init__**:
    ```python
-   # CHANGE from:
-   await self.thalex.login(key_ids[NETWORK], private_keys[NETWORK], id=CALL_ID_LOGIN)
+   # Portfolio-wide tracking for multi-instrument take profit
+   self.portfolio_tracker = PortfolioTracker()
+   self.portfolio_tracker.register_instrument(self.perp_name)
+   ```
+3. **Update position tracking methods**:
+   - Modify `portfolio_callback()` to update portfolio tracker
+   - Update `update_realized_pnl()` to sync with portfolio tracker
+   - Ensure all position changes are reflected in portfolio tracker
+4. **Add portfolio P&L access methods**:
+   ```python
+   def get_portfolio_total_pnl(self) -> float:
+       return self.portfolio_tracker.get_total_pnl()
    
-   # TO:
-   await self.thalex.login(os.getenv('THALEX_KEY_ID'), os.getenv('THALEX_PRIVATE_KEY'), id=CALL_ID_LOGIN)
+   def get_portfolio_net_pnl(self) -> float:
+       return self.portfolio_tracker.get_net_pnl_after_fees()
    ```
 
-4. **Verify no other references** to `key_ids` or `private_keys` exist in the file
-
 **Validation**:
-- File imports successfully without keys.py dependency
-- Login functionality works with environment variables
-- No hardcoded credentials remain in the codebase
-- Matches security approach used in avellaneda_quoter.py
-- Environment variables `THALEX_KEY_ID` and `THALEX_PRIVATE_KEY` are properly set
-
-**Security Benefits**:
-- Eliminates potential credential exposure
-- Follows 12-factor app security principles
-- Consistent with existing refactored code
-- Easier credential management across environments
+- Portfolio tracker integrates without breaking existing functionality
+- Position updates sync correctly
+- P&L calculations remain accurate
+- No performance degradation
 
 ---
 
-### Task C1: Update Market Configuration Parameters
-**File**: `thalex_py/Thalex_modular/config/market_config.py`
-**Lines**: 1-100
-**Objective**: Modify specific trading parameters in BOT_CONFIG
-**Risk Level**: 🔧 Low
+### Task TP3: Add Fee-Aware P&L Calculation
+**File**: `thalex_py/Thalex_modular/models/portfolio_tracker.py`
+**Lines**: 50-100 (fee calculation methods)
+**Objective**: Implement comprehensive fee tracking and P&L calculation
+**Risk Level**: 💰 Medium-High
 
 **Instructions**:
-1. Locate the `BOT_CONFIG` dictionary
-2. Update only the specified parameter(s) provided by user
-3. Ensure all numeric values maintain proper types (int/float)
-4. Validate that nested dictionary structure remains intact
-5. Add comment with timestamp of change
+1. **Add fee configuration constants**:
+   ```python
+   THALEX_FEES = {
+       "maker_fee": 0.0002,  # 0.02%
+       "taker_fee": 0.0005,  # 0.05%
+       "minimum_fee": 0.0001  # Minimum fee per trade
+   }
+   ```
+2. **Implement fee calculation methods**:
+   ```python
+   def calculate_trade_fee(self, notional_value: float, is_maker: bool = True) -> float:
+       """Calculate trading fee for a given trade"""
+       fee_rate = THALEX_FEES["maker_fee"] if is_maker else THALEX_FEES["taker_fee"]
+       calculated_fee = notional_value * fee_rate
+       return max(calculated_fee, THALEX_FEES["minimum_fee"])
+   
+   def estimate_closing_fees(self) -> float:
+       """Estimate fees required to close all open positions"""
+       total_estimated_fees = 0.0
+       for instrument, position_size in self.positions.items():
+           if position_size != 0 and instrument in self.mark_prices:
+               notional = abs(position_size * self.mark_prices[instrument])
+               total_estimated_fees += self.calculate_trade_fee(notional, is_maker=True)
+       return total_estimated_fees
+   ```
+3. **Update P&L calculation to be fee-aware**:
+   ```python
+   def get_net_profit_after_all_fees(self) -> float:
+       """Get total profit minus all fees (paid + estimated closing fees)"""
+       gross_pnl = self.get_total_pnl()
+       paid_fees = sum(self.trading_fees.values())
+       estimated_closing_fees = self.estimate_closing_fees()
+       return gross_pnl - paid_fees - estimated_closing_fees
+   ```
 
 **Validation**:
-- Configuration loads without syntax errors
-- All existing tests pass
-- No breaking changes to dependent components
+- Fee calculations are accurate
+- P&L calculations include all fee components
+- Closing fee estimates are reasonable
+- No negative P&L from fee calculation errors
 
 ---
 
-### Task C2: Add New Risk Parameter
-**File**: `thalex_py/Thalex_modular/config/market_config.py`
-**Lines**: 120-180 (risk section)
-**Objective**: Add a single new risk management parameter
-**Risk Level**: 🔧 Low
-
-**Instructions**:
-1. Locate the `"risk"` section in BOT_CONFIG
-2. Add the new parameter with appropriate default value
-3. Include inline comment explaining the parameter's purpose
-4. Ensure parameter follows existing naming conventions
-5. Update any related validation logic if needed
-
-**Validation**:
-- New parameter is accessible via BOT_CONFIG["risk"]["new_param"]
-- No impact on existing risk calculations
-- Configuration validation passes
-
----
-
-### Task C3: Modify Avellaneda Model Parameters
-**File**: `thalex_py/Thalex_modular/config/market_config.py`
-**Lines**: 25-65 (avellaneda section)
-**Objective**: Update specific A-S model parameters
-**Risk Level**: 🔧 Low
-
-**Instructions**:
-1. Locate `"trading_strategy"` → `"avellaneda"` section
-2. Modify only the specified parameter (gamma, kappa, etc.)
-3. Ensure value is within reasonable mathematical bounds
-4. Update related comments if parameter meaning changes
-5. Maintain backward compatibility with existing code
-
-**Validation**:
-- AvellanedaMarketMaker initializes without errors
-- Mathematical calculations remain stable
-- Quote generation continues to function
-
----
-
-## PHASE 2: DATA STRUCTURE TASKS
-
-### Task D1: Add New Field to Order Class
+### Task TP4: Implement Global Take Profit Logic
 **File**: `thalex_py/Thalex_modular/models/data_models.py`
-**Lines**: 140-180 (Order class)
-**Objective**: Add a single new field to the Order dataclass
-**Risk Level**: 📊 Medium
+**Lines**: 2650-2750 (new method after manage_new_take_profit)
+**Objective**: Add portfolio-wide take profit with $1.1 minimum threshold
+**Risk Level**: 💰 High
 
 **Instructions**:
-1. Locate the `@dataclass class Order:` definition
-2. Add new field with appropriate type annotation
-3. Update `__post_init__` method if field needs initialization
-4. Modify `to_dict()` method to include new field
-5. Update `from_dict()` classmethod to handle new field
-6. Add the field to any relevant validation methods
+1. **Add new method after existing take profit logic**:
+   ```python
+   async def manage_portfolio_take_profit(self):
+       """Portfolio-wide take profit logic - monitors all positions globally"""
+       current_time = time.time()
+       
+       # Throttle to once per 2 seconds for portfolio checks
+       if not hasattr(self, '_last_portfolio_tp_check'):
+           self._last_portfolio_tp_check = 0
+       
+       if current_time - self._last_portfolio_tp_check < 2.0:
+           return
+       
+       self._last_portfolio_tp_check = current_time
+       
+       try:
+           # Get portfolio-wide P&L after all fees
+           net_profit = self.portfolio_tracker.get_net_profit_after_all_fees()
+           
+           # Take profit threshold - configurable with default $1.1
+           tp_threshold = TRADING_CONFIG.get("portfolio_take_profit", {}).get("min_profit_usd", 1.1)
+           
+           if net_profit >= tp_threshold:
+               self.logger.info(f"Portfolio take profit triggered: Net profit ${net_profit:.2f} >= ${tp_threshold:.2f}")
+               
+               # Close all positions across the portfolio
+               await self.close_all_portfolio_positions()
+               
+               # Reset position entry times
+               self.position_entry_time = None
+               
+               # Log the profitable close
+               self.logger.info(f"Portfolio positions closed with profit: ${net_profit:.2f}")
+               
+       except Exception as e:
+           self.logger.error(f"Error in portfolio take profit: {str(e)}")
+   ```
+
+2. **Add configuration section to market_config.py**:
+   ```python
+   "portfolio_take_profit": {
+       "min_profit_usd": 1.1,          # Minimum profit in USD to trigger take profit
+       "enable_portfolio_tp": True,     # Enable/disable portfolio take profit
+       "max_position_age_hours": 24,    # Maximum time to hold positions
+       "profit_check_interval": 2.0    # How often to check profit in seconds
+   }
+   ```
 
 **Validation**:
-- Order objects can be created with new field
-- Serialization/deserialization works correctly
-- Existing order processing continues unchanged
+- Take profit triggers at correct profit threshold
+- All positions close when triggered
+- Configuration parameters work correctly
+- No false positives or missed opportunities
 
 ---
 
-### Task D2: Extend Ticker Data Structure
+### Task TP5: Add Coordinated Position Closure
 **File**: `thalex_py/Thalex_modular/models/data_models.py`
-**Lines**: 200-240 (Ticker class)
-**Objective**: Add new market data field to Ticker class
-**Risk Level**: 📊 Medium
+**Lines**: 2750-2850 (new method after portfolio take profit)
+**Objective**: Implement coordinated closure of all portfolio positions
+**Risk Level**: 💰 High
 
 **Instructions**:
-1. Locate the `class Ticker:` definition
-2. Add new field in `__init__` method with proper type conversion
-3. Include field in `to_dict()` method
-4. Update `from_dict()` classmethod
-5. Add validation for the new field value
-6. Ensure backward compatibility with existing ticker data
+1. **Add coordinated closure method**:
+   ```python
+   async def close_all_portfolio_positions(self):
+       """Close all positions across the entire portfolio in coordinated manner"""
+       try:
+           positions_to_close = []
+           
+           # Collect all non-zero positions
+           for instrument, position_size in self.portfolio_tracker.positions.items():
+               if abs(position_size) > 0.001:  # Minimum position threshold
+                   positions_to_close.append({
+                       'instrument': instrument,
+                       'position_size': position_size,
+                       'direction': th.Direction.SELL if position_size > 0 else th.Direction.BUY
+                   })
+           
+           if not positions_to_close:
+               self.logger.info("No positions to close in portfolio")
+               return
+           
+           self.logger.info(f"Closing {len(positions_to_close)} positions in portfolio")
+           
+           # Close positions concurrently
+           closure_tasks = []
+           for position_info in positions_to_close:
+               if position_info['instrument'] == self.perp_name:
+                   # Use existing method for current instrument
+                   task = asyncio.create_task(self.close_all_positions_market())
+               else:
+                   # For other instruments, create market close order
+                   task = asyncio.create_task(
+                       self.close_position_for_instrument(position_info)
+                   )
+               closure_tasks.append(task)
+           
+           # Wait for all positions to close (with timeout)
+           await asyncio.wait_for(
+               asyncio.gather(*closure_tasks, return_exceptions=True), 
+               timeout=30.0
+           )
+           
+           self.logger.info("Portfolio closure completed")
+           
+       except asyncio.TimeoutError:
+           self.logger.error("Portfolio closure timed out after 30 seconds")
+       except Exception as e:
+           self.logger.error(f"Error closing portfolio positions: {str(e)}")
+   ```
+
+2. **Add helper method for other instruments**:
+   ```python
+   async def close_position_for_instrument(self, position_info: Dict):
+       """Close position for a specific instrument"""
+       try:
+           instrument = position_info['instrument']
+           position_size = position_info['position_size']
+           direction = position_info['direction']
+           
+           # Get current market price for the instrument
+           mark_price = self.portfolio_tracker.mark_prices.get(instrument)
+           if not mark_price:
+               self.logger.error(f"No mark price available for {instrument}")
+               return
+           
+           # Calculate aggressive exit price (0.5% buffer)
+           price_buffer = 0.005
+           if direction == th.Direction.SELL:
+               exit_price = mark_price * (1 - price_buffer)
+           else:
+               exit_price = mark_price * (1 + price_buffer)
+           
+           # Submit market-like order
+           await self.thalex.insert(
+               direction=direction,
+               instrument_name=instrument,
+               amount=abs(position_size),
+               price=exit_price,
+               client_order_id=self.client_order_id,
+               id=self.client_order_id,
+               collar="clamp"
+           )
+           
+           self.client_order_id += 1
+           self.logger.info(f"Submitted close order for {instrument}: {abs(position_size)} @ {exit_price}")
+           
+       except Exception as e:
+           self.logger.error(f"Error closing position for {position_info['instrument']}: {str(e)}")
+   ```
 
 **Validation**:
-- Ticker objects handle new field gracefully
-- Market data processing continues without errors
-- New field is properly validated and stored
+- All positions close in coordinated manner
+- No partial closes or hanging positions
+- Proper error handling and timeout management
+- Logging provides clear closure status
 
 ---
 
-### Task D3: Add New Quote Validation Method
+### Task TP6: Integrate Portfolio Take Profit with Quote Task
 **File**: `thalex_py/Thalex_modular/models/data_models.py`
-**Lines**: 250-290 (Quote class)
-**Objective**: Add a single validation method to Quote class
-**Risk Level**: 📊 Medium
+**Lines**: 1200-1250 (quote_task method)
+**Objective**: Add portfolio take profit monitoring to main quote loop
+**Risk Level**: 💰 Medium
 
 **Instructions**:
-1. Locate the `@dataclass class Quote:` definition
-2. Add new validation method with clear name (e.g., `validate_price_range`)
-3. Implement single validation check with boolean return
-4. Add appropriate error logging for validation failures
-5. Include docstring explaining validation purpose
-6. Ensure method is self-contained and doesn't modify state
+1. **Locate the quote_task method**
+2. **Add portfolio take profit check** in the main loop:
+   ```python
+   # Existing quote logic
+   quotes = await self.make_quotes()
+   await self.adjust_quotes(quotes)
+   
+   # Add portfolio take profit monitoring
+   if TRADING_CONFIG.get("portfolio_take_profit", {}).get("enable_portfolio_tp", True):
+       asyncio.create_task(self.manage_portfolio_take_profit())
+   
+   # Memory management - periodic cleanup every 100 quote cycles
+   if hasattr(self, '_quote_cycle_count'):
+       self._quote_cycle_count += 1
+   else:
+       self._quote_cycle_count = 1
+   ```
+
+3. **Add portfolio update triggers**:
+   - Update portfolio tracker in `ticker_callback()`
+   - Update portfolio tracker in `portfolio_callback()`
+   - Ensure position changes sync to portfolio tracker
+
+4. **Add portfolio logging**:
+   ```python
+   # Log portfolio status every 50 cycles
+   if self._quote_cycle_count % 50 == 0:
+       net_pnl = self.portfolio_tracker.get_net_profit_after_all_fees()
+       self.logger.info(f"Portfolio Net P&L: ${net_pnl:.2f}")
+   ```
 
 **Validation**:
-- New validation method works correctly
-- Quote processing performance is not impacted
-- Method integrates well with existing validation flow
-
----
-
-## PHASE 3: MATHEMATICAL MODEL TASKS
-
-### Task M1: Update Volatility Calculation Method
-**File**: `thalex_py/Thalex_modular/models/data_models.py`
-**Lines**: 1650-1720 (calculate_volatility method)
-**Objective**: Modify volatility calculation algorithm
-**Risk Level**: 🧮 Medium-High
-
-**Instructions**:
-1. Locate the `calculate_volatility()` method in PerpQuoter class
-2. Modify only the mathematical calculation part
-3. Preserve input validation and error handling
-4. Maintain the same return type and range
-5. Add logging for debugging new calculation
-6. Keep fallback mechanisms intact
-
-**Validation**:
-- Volatility values remain within reasonable bounds (0.0001 to 1.0)
-- Quote generation continues to work
-- No division by zero or mathematical errors
-- Performance impact is minimal
-
----
-
-### Task M2: Enhance Spread Calculation Logic
-**File**: `thalex_py/Thalex_modular/models/data_models.py`
-**Lines**: 1100-1200 (calculate_dynamic_spread method)
-**Objective**: Improve spread calculation with new factor
-**Risk Level**: 🧮 Medium-High
-
-**Instructions**:
-1. Locate `calculate_dynamic_spread()` method
-2. Add single new factor to spread calculation
-3. Ensure new factor is properly bounded and validated
-4. Maintain existing min/max spread constraints
-5. Preserve tick size alignment
-6. Add debug logging for new factor
-
-**Validation**:
-- Spreads remain within configured min/max bounds
-- Tick alignment is preserved
-- Quote prices are still valid
-- No negative or zero spreads generated
-
----
-
-### Task M3: Modify Position Size Calculation
-**File**: `thalex_py/Thalex_modular/models/data_models.py`
-**Lines**: 800-900 (calculate_quote_size method)
-**Objective**: Update quote size calculation algorithm
-**Risk Level**: 🧮 Medium-High
-
-**Instructions**:
-1. Locate `calculate_quote_size()` method
-2. Modify size calculation logic for single parameter
-3. Preserve inventory management constraints
-4. Maintain notional limit checks
-5. Keep size alignment to 0.001 precision
-6. Ensure minimum size requirements are met
-
-**Validation**:
-- Quote sizes remain within position limits
-- Notional value constraints are respected
-- Size precision is maintained at 0.001
-- No zero or negative sizes generated
-
----
-
-## PHASE 4: RISK MANAGEMENT TASKS
-
-### Task R1: Add New Risk Limit Check
-**File**: `thalex_py/Thalex_modular/models/data_models.py`
-**Lines**: 450-500 (check_risk_limits method)
-**Objective**: Add single new risk validation
-**Risk Level**: 🔄 High
-
-**Instructions**:
-1. Locate `check_risk_limits()` method
-2. Add one new risk check with clear condition
-3. Include appropriate warning/error logging
-4. Call existing `handle_risk_breach()` if limit exceeded
-5. Ensure check doesn't interfere with existing validations
-6. Add configuration parameter for new limit
-
-**Validation**:
-- New risk check triggers appropriately
-- Existing risk management continues to work
-- Risk breach handling is properly invoked
-- No false positives or missed violations
-
----
-
-### Task R2: Enhance Position Monitoring
-**File**: `thalex_py/Thalex_modular/models/data_models.py`
-**Lines**: 1000-1100 (manage_position method)
-**Objective**: Add new position monitoring feature
-**Risk Level**: 🔄 High
-
-**Instructions**:
-1. Locate `manage_position()` method
-2. Add single new monitoring check
-3. Integrate with existing position management flow
-4. Preserve current timing and frequency controls
-5. Add appropriate logging for new monitoring
-6. Ensure no performance degradation
-
-**Validation**:
-- New monitoring works without affecting existing logic
-- Position management timing is preserved
+- Portfolio monitoring runs without affecting quote performance
+- P&L calculations update in real-time
+- Take profit triggers work in main trading loop
 - No excessive logging or performance impact
-- Monitoring provides useful information
 
 ---
 
-### Task R3: Update Risk Breach Handling
-**File**: `thalex_py/Thalex_modular/models/data_models.py`
-**Lines**: 550-650 (handle_risk_breach method)
-**Objective**: Modify risk breach response
-**Risk Level**: 🔄 High
+### Task TP7: Add Configuration for Portfolio Take Profit
+**File**: `thalex_py/Thalex_modular/config/market_config.py`
+**Lines**: 200-250 (add new config section)
+**Objective**: Add comprehensive configuration for portfolio take profit features
+**Risk Level**: 💰 Low
 
 **Instructions**:
-1. Locate `handle_risk_breach()` method
-2. Modify single aspect of breach handling
-3. Preserve order placement and cancellation logic
-4. Maintain position reduction calculations
-5. Keep error handling and recovery mechanisms
-6. Add logging for new breach handling behavior
+1. **Add new configuration section** to TRADING_CONFIG:
+   ```python
+   "portfolio_take_profit": {
+       "enable_portfolio_tp": True,         # Master enable/disable
+       "min_profit_usd": 1.1,              # Minimum profit threshold in USD
+       "profit_after_fees": True,          # Whether threshold applies after fees
+       "check_interval_seconds": 2.0,       # How often to check portfolio P&L
+       "max_position_age_hours": 24,        # Maximum time to hold positions
+       "emergency_close_threshold": -10.0,  # Emergency close if loss exceeds this
+       "partial_profit_threshold": 0.5,     # Take partial profits at this level
+       "position_correlation_check": True,  # Monitor position correlation
+       "fee_estimation_buffer": 1.1        # Multiply estimated fees by this factor
+   }
+   ```
+
+2. **Add fee configuration**:
+   ```python
+   "trading_fees": {
+       "maker_fee_rate": 0.0002,    # 0.02% for maker orders
+       "taker_fee_rate": 0.0005,    # 0.05% for taker orders  
+       "minimum_fee_usd": 0.0001,   # Minimum fee per trade
+       "fee_estimation_buffer": 1.1 # Safety buffer for fee estimates
+   }
+   ```
+
+3. **Add validation function**:
+   ```python
+   def validate_portfolio_take_profit_config(config: Dict) -> bool:
+       """Validate portfolio take profit configuration"""
+       required_fields = ["min_profit_usd", "check_interval_seconds"]
+       
+       for field in required_fields:
+           if field not in config:
+               logging.error(f"Missing required portfolio take profit field: {field}")
+               return False
+       
+       if config["min_profit_usd"] <= 0:
+           logging.error("min_profit_usd must be positive")
+           return False
+           
+       if config["check_interval_seconds"] < 1.0:
+           logging.error("check_interval_seconds must be at least 1.0")
+           return False
+       
+       return True
+   ```
 
 **Validation**:
-- Risk breaches are handled appropriately
-- Position reduction works correctly
-- No orders are left in invalid states
-- Recovery mechanisms function properly
-
----
-
-## PHASE 5: ORDER MANAGEMENT TASKS
-
-### Task O1: Enhance Order Validation
-**File**: `thalex_py/Thalex_modular/models/data_models.py`
-**Lines**: 2100-2200 (validate_order_params method)
-**Objective**: Add new order validation check
-**Risk Level**: 🔄 High
-
-**Instructions**:
-1. Locate `validate_order_params()` method
-2. Add single new validation check
-3. Preserve existing price and size validations
-4. Maintain tick alignment and precision
-5. Return appropriate error values for invalid orders
-6. Add logging for validation failures
-
-**Validation**:
-- New validation catches intended issues
-- Valid orders continue to pass validation
-- Price and size alignment is preserved
-- No valid orders are incorrectly rejected
-
----
-
-### Task O2: Improve Order Cleanup Logic
-**File**: `thalex_py/Thalex_modular/models/data_models.py`
-**Lines**: 1400-1500 (cleanup_stale_orders method)
-**Objective**: Enhance stale order detection
-**Risk Level**: 🔄 High
-
-**Instructions**:
-1. Locate `cleanup_stale_orders()` method
-2. Modify single aspect of stale order detection
-3. Preserve existing timestamp and lifetime checks
-4. Maintain order cancellation logic
-5. Keep async lock handling intact
-6. Add improved logging for cleanup actions
-
-**Validation**:
-- Stale orders are properly identified and cancelled
-- Active orders are not incorrectly cancelled
-- Lock handling remains thread-safe
-- Cleanup performance is acceptable
-
----
-
-### Task O3: Update Quote Placement Logic
-**File**: `thalex_py/Thalex_modular/models/data_models.py`
-**Lines**: 2000-2100 (place_new_quote method)
-**Objective**: Modify quote placement behavior
-**Risk Level**: 🔄 High
-
-**Instructions**:
-1. Locate `place_new_quote()` method
-2. Modify single aspect of quote placement
-3. Preserve order tracking and semaphore handling
-4. Maintain collar validation and price checks
-5. Keep error handling and cleanup logic
-6. Ensure proper order ID management
-
-**Validation**:
-- Quotes are placed correctly with new logic
-- Order tracking remains accurate
-- Semaphore handling prevents race conditions
-- Error recovery works properly
-
----
-
-## PHASE 6: PERFORMANCE OPTIMIZATION TASKS
-
-### Task P1: Optimize Price History Management
-**File**: `thalex_py/Thalex_modular/models/data_models.py`
-**Lines**: 300-350 (price_history usage)
-**Objective**: Improve price history data structure
-**Risk Level**: 🚀 High
-
-**Instructions**:
-1. Locate price_history deque usage
-2. Replace with more efficient data structure for single use case
-3. Preserve existing capacity and access patterns
-4. Maintain thread safety if required
-5. Keep same interface for existing code
-6. Add performance measurement logging
-
-**Validation**:
-- Price history operations are faster
-- Memory usage is optimized
-- Existing functionality is preserved
-- No data corruption or loss occurs
-
----
-
-### Task P2: Enhance Mathematical Calculations
-**File**: `thalex_py/Thalex_modular/models/data_models.py`
-**Lines**: 1500-1600 (mathematical methods)
-**Objective**: Optimize single mathematical calculation
-**Risk Level**: 🚀 High
-
-**Instructions**:
-1. Locate specific mathematical method (e.g., calculate_zscore)
-2. Optimize calculation using NumPy operations
-3. Preserve numerical accuracy and stability
-4. Maintain input validation and error handling
-5. Keep same return types and ranges
-6. Add performance benchmarking
-
-**Validation**:
-- Calculations are significantly faster
-- Numerical results remain accurate
-- No mathematical errors or instabilities
-- Memory usage is optimized
-
----
-
-### Task P3: Improve Memory Management
-**File**: `thalex_py/Thalex_modular/models/data_models.py`
-**Lines**: 200-300 (object creation)
-**Objective**: Optimize object allocation for single class
-**Risk Level**: 🚀 High
-
-**Instructions**:
-1. Locate frequent object creation (e.g., Order, Quote)
-2. Implement object pooling for single class
-3. Preserve object lifecycle and cleanup
-4. Maintain thread safety for shared pools
-5. Keep same interface for object creation
-6. Add memory usage monitoring
-
-**Validation**:
-- Memory allocation is reduced
-- Object creation/destruction is faster
-- No memory leaks or corruption
-- Thread safety is maintained
+- Configuration loads without errors
+- All parameters have sensible defaults
+- Validation function catches configuration errors
+- Configuration is accessible from trading components
 
 ---
 
@@ -505,18 +465,36 @@ The tasks are organized by component and complexity level, allowing for incremen
 ## TASK DEPENDENCIES
 
 ### Sequential Dependencies:
-- **SECURITY TASK S1 MUST BE COMPLETED FIRST** - Critical security fix
-- Configuration tasks (C1-C3) should be completed before mathematical tasks
-- Data structure tasks (D1-D3) should precede integration tasks
-- Risk management tasks (R1-R3) require configuration updates
-- Performance tasks (P1-P3) should be done after functionality is stable
+- **TP1 must be completed before TP2-TP7** - Portfolio tracker is foundation
+- **TP2 must be completed before TP4-TP6** - Integration required for portfolio logic
+- **TP3 should be completed before TP4** - Fee calculation needed for take profit
+- **TP7 should be completed early** - Configuration needed for other tasks
 
 ### Parallel Execution:
-- Tasks within the same phase can often be done in parallel
-- Configuration tasks are generally independent
-- Mathematical model tasks can be done separately
-- Performance tasks should be isolated from each other
+- **TP4, TP5, TP6 can be done in parallel after TP1-TP3 are complete**
+
+### Take Profit Task Flow:
+```
+TP7 (Config) → TP1 (Portfolio Tracker) → TP2 (Integration) → TP3 (Fees)
+                                                              ↓
+                                          TP4 (Logic) ← TP5 (Closure) ← TP6 (Integration)
+```
 
 ---
 
-This task breakdown provides a structured approach to modifying the Thalex SimpleQuoter codebase while minimizing risk and maintaining system stability. Each task is designed to be completed by an LLM with clear instructions and validation criteria. 
+## PORTFOLIO TAKE PROFIT OVERVIEW
+
+The new take profit system provides:
+
+**🎯 Portfolio-Wide Awareness**: Tracks P&L across all futures and perpetual instruments
+**💰 Fee-Aware Calculations**: Ensures profit threshold is after all trading costs  
+**🔄 Coordinated Closure**: Closes all positions simultaneously when profit target is met
+**⚙️ Configurable Thresholds**: Adjustable profit targets and monitoring intervals
+**🛡️ Risk Management**: Emergency stops and maximum position age limits
+**📊 Real-Time Monitoring**: Continuous P&L tracking in main trading loop
+
+**Expected Behavior**: System monitors total portfolio P&L continuously. When net profit (after fees) reaches $1.1 or configured threshold, all positions across instruments close simultaneously to lock in profits.
+
+---
+
+This task breakdown provides a structured approach to implementing comprehensive portfolio-wide take profit functionality while maintaining system stability and following HFT best practices. 
