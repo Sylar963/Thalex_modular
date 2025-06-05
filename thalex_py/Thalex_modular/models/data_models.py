@@ -38,6 +38,7 @@ from ..components.event_bus import (
     publish_var_alert, 
     publish_pnl_update
 )
+from .position_tracker import PortfolioTracker
 
 # Basic configuration - use values from MARKET_CONFIG
 UNDERLYING = MARKET_CONFIG["underlying"]
@@ -526,6 +527,10 @@ class PerpQuoter:
         self._memory_monitor_interval = 50  # Log stats every 50 quote operations
         self._quote_operations_count = 0
         self._last_memory_log = time.time()
+        
+        # Portfolio-wide tracking for multi-instrument take profit
+        self.portfolio_tracker = PortfolioTracker()
+        # Note: perp_name will be set in await_instruments(), so we'll register it later
 
     def round_to_tick(self, value):
         return self.tick * round(value / self.tick)
@@ -1266,6 +1271,10 @@ class PerpQuoter:
                 self.tick = i["tick_size"]
                 self.perp_name = instrument_name_from_api 
                 self.logger.info(f"Selected instrument: {self.perp_name} with tick size: {self.tick} based on Underlying: {target_underlying} and Label: {target_label}")
+                
+                # Register instrument with portfolio tracker
+                self.portfolio_tracker.register_instrument(self.perp_name)
+                
                 instrument_found = True
                 return
 
@@ -1335,6 +1344,10 @@ class PerpQuoter:
                 bid=self.ticker.best_bid_price,
                 ask=self.ticker.best_ask_price
             )
+            
+            # Update portfolio tracker with mark price
+            if self.perp_name and self.ticker.mark_price > 0:
+                self.portfolio_tracker.update_mark_price(self.perp_name, self.ticker.mark_price)
             
             async with self.quote_cv:
                 self.quote_cv.notify()
@@ -1474,6 +1487,14 @@ class PerpQuoter:
                     ))
                     
                     self.position_size = new_position
+                    
+                    # Update portfolio tracker with new position
+                    if self.ticker and self.ticker.mark_price > 0:
+                        self.portfolio_tracker.update_position(
+                            self.perp_name, 
+                            new_position, 
+                            self.ticker.mark_price
+                        )
                 else: 
                     self.logger.info(f"Position size for {self.perp_name} consistent. Internal: {self.position_size:.4f}, Portfolio_msg: {new_position:.4f}.")
 
@@ -2810,6 +2831,14 @@ class PerpQuoter:
 
         # Placeholder for closing the other leg of the strategy
         self.logger.info("If this is part of a paired strategy, logic to close the other leg would be triggered from here or by the strategy orchestrator.")
+    
+    def get_portfolio_total_pnl(self) -> float:
+        """Get portfolio-wide total P&L across all instruments"""
+        return self.portfolio_tracker.get_total_pnl()
+    
+    def get_portfolio_net_pnl(self) -> float:
+        """Get portfolio-wide net P&L after trading fees"""
+        return self.portfolio_tracker.get_net_pnl_after_fees()
 
 class ConfigValidator:
     @staticmethod
