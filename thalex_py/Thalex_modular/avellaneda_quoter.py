@@ -133,6 +133,19 @@ class AvellanedaQuoter:
         self.risk_manager.register_callback("risk_limit", self._handle_risk_breach)
         self.active_trading = True # Flag to control trading activity based on risk
         
+        # Risk recovery state
+        self.risk_recovery_mode = False
+        self.risk_breach_time = None
+        self.recovery_cooldown_until = 0
+        self.recovery_step = 0  # 0=full halt, 1-3=gradual recovery, 3=full active
+        self.last_recovery_check = 0
+        
+        # Take profit state management (NEW)
+        self.take_profit_active = False
+        self.last_take_profit_check = 0
+        self.take_profit_cooldown_until = 0
+        self.last_upnl_value = 0.0
+        
         # Risk monitoring task interval
         self.risk_monitoring_interval = TRADING_CONFIG.get("risk_monitoring_interval_seconds", 2.0) # Default to 2s
         
@@ -295,33 +308,99 @@ class AvellanedaQuoter:
         """Handles actions to take when a risk limit is breached."""
         price_display = f"{price_at_breach:.2f}" if price_at_breach is not None else "N/A"
         self.logger.critical(f"RISK LIMIT BREACHED: {reason}. Price at check: {price_display}")
-        # Ensure this is also logged if it's for a specific instrument or both
-        # For now, reason should ideally include which leg caused it if it's specific.
 
         if not self.active_trading:
             self.logger.info("Trading already halted, risk breach handling skipped further action to prevent re-entry.")
             return
 
-        self.active_trading = False # Stop further trading/quoting activity
-        self.logger.critical("Trading has been HALTED due to risk limit breach.")
+        # NEW: Set recovery state
+        self.active_trading = False
+        self.risk_recovery_mode = True
+        self.risk_breach_time = time.time()
+        self.recovery_cooldown_until = time.time() + RISK_LIMITS.get("recovery_cooldown_seconds", 300)
+        self.recovery_step = 0
         
-        # Cancel all open orders
+        self.logger.critical("Trading has been HALTED due to risk limit breach. Recovery mode activated.")
+        
+        # Cancel all open orders (EXISTING LOGIC PRESERVED)
         self.logger.info("Attempting to cancel all open orders due to risk breach...")
         try:
-            # Ensure cancel_quotes can be called even if some parts of order_manager might be affected
             if hasattr(self, 'order_manager') and self.order_manager is not None:
                  await self.cancel_quotes(f"Risk limit breach: {reason}")
                  self.logger.info("Successfully requested cancellation of all orders via cancel_quotes.")
-            elif hasattr(self, 'thalex') and self.thalex is not None: # Fallback
+            elif hasattr(self, 'thalex') and self.thalex is not None:
                  await self.thalex.cancel_all_orders(id=CALL_IDS.get("cancel_all", random.randint(10000, 20000)))
                  self.logger.info("Successfully requested cancellation of all orders via direct thalex client call.")
             else:
                 self.logger.warning("No valid order_manager or thalex client to cancel orders during risk breach.")
-
         except Exception as e:
             self.logger.error(f"Error attempting to cancel all orders after risk breach: {str(e)}", exc_info=True)
+
+    async def _check_risk_recovery(self) -> bool:
+        """Check if risk conditions have improved enough to start recovery"""
+        if not self.risk_recovery_mode:
+            return False
+            
+        current_time = time.time()
         
-        # Further actions could be added here, e.g., sending notifications, trying to manually hedge, etc.
+        # Step 1: Check cooldown period
+        if current_time < self.recovery_cooldown_until:
+            return False
+            
+        # Step 2: Check if we have valid price data
+        if not self.ticker or self.ticker.mark_price <= 0:
+            return False
+            
+        # Step 3: Check current risk levels
+        try:
+            current_price = self.ticker.mark_price
+            
+            # Check if risk limits are now within recovery threshold
+            recovery_threshold = RISK_LIMITS.get("risk_recovery_threshold", 0.8)
+            
+            # Check position limits
+            metrics = self.position_tracker.get_position_metrics()
+            current_pos_size = abs(metrics.get("position", 0.0))
+            max_position = RISK_LIMITS.get("max_position", float('inf'))
+            
+            if current_pos_size > (max_position * recovery_threshold):
+                self.logger.info(f"Position {current_pos_size:.4f} still above recovery threshold {max_position * recovery_threshold:.4f}")
+                return False
+                
+            # Check notional limits
+            notional = current_pos_size * current_price
+            max_notional = RISK_LIMITS.get("max_notional", float('inf'))
+            
+            if notional > (max_notional * recovery_threshold):
+                self.logger.info(f"Notional {notional:.2f} still above recovery threshold {max_notional * recovery_threshold:.2f}")
+                return False
+                
+            # If we get here, conditions are good for recovery
+            self.logger.info("Risk conditions improved - initiating gradual recovery")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error checking recovery conditions: {str(e)}")
+            return False
+
+    async def _initiate_gradual_recovery(self):
+        """Start gradual recovery process"""
+        recovery_steps = RISK_LIMITS.get("gradual_recovery_steps", 3)
+        
+        if self.recovery_step < recovery_steps:
+            self.recovery_step += 1
+            self.logger.info(f"Recovery step {self.recovery_step}/{recovery_steps} - Partial trading resumed")
+            
+            if self.recovery_step >= recovery_steps:
+                # Full recovery
+                self.active_trading = True
+                self.risk_recovery_mode = False
+                self.risk_breach_time = None
+                self.recovery_step = 0
+                self.logger.info("FULL RECOVERY: Trading fully resumed")
+            else:
+                # Partial recovery - still in recovery mode but allow some trading
+                self.logger.info(f"PARTIAL RECOVERY: Limited trading resumed (step {self.recovery_step})")
 
     async def _risk_monitoring_task(self):
         """Periodically checks risk limits, stop-loss, and take-profit conditions."""
@@ -446,6 +525,13 @@ class AvellanedaQuoter:
                     await self._close_both_positions(tp_overall_reason)
                     await self._handle_risk_breach(tp_overall_reason, current_price if take_profit_perp_triggered else current_price_futures)
                     continue # Take-profit hit, _handle_risk_breach will stop trading
+                
+                # Check for recovery if in recovery mode
+                if self.risk_recovery_mode and not self.active_trading:
+                    if time.time() - self.last_recovery_check > RISK_LIMITS.get("recovery_check_interval", 30):
+                        self.last_recovery_check = time.time()
+                        if await self._check_risk_recovery():
+                            await self._initiate_gradual_recovery()
                 
             except asyncio.CancelledError:
                 self.logger.info("Risk monitoring task was cancelled.")
@@ -1500,9 +1586,17 @@ class AvellanedaQuoter:
 
     async def update_quotes(self, price_data: Dict, market_conditions: Dict):
         """Update quotes based on market conditions and strategy logic"""
-        if not self.active_trading:
-            self.logger.warning("Trading is halted due to a prior risk limit breach. Skipping quote update.")
+        if not self.active_trading and not self.risk_recovery_mode:
+            self.logger.warning("Trading is halted and not in recovery mode. Skipping quote update.")
             return
+        
+        # Gradual recovery: limit quote levels during recovery
+        if self.risk_recovery_mode and self.recovery_step > 0:
+            # Reduce quote levels during recovery
+            original_levels = TRADING_CONFIG["quoting"]["levels"]
+            recovery_levels = max(1, original_levels // (4 - self.recovery_step))
+            self.logger.info(f"Recovery mode: Using {recovery_levels} levels instead of {original_levels}")
+            # You can implement level reduction logic here if needed
 
         if not self.quoting_enabled or self.cooldown_active:
             self.logger.debug("Quoting disabled or cooldown active, skipping update_quotes.")
@@ -1910,8 +2004,23 @@ class AvellanedaQuoter:
                 if not position:
                     continue
                     
-                # Ensure position is a dictionary before using .get()
-                if not isinstance(position, dict):
+                # Handle different position formats
+                if isinstance(position, dict):
+                    # Standard dictionary format
+                    instrument = position.get("instrument_name", "")
+                elif isinstance(position, (int, float)):
+                    # Direct position size format - check if we have instrument name elsewhere
+                    instrument = item.get("instrument_name", "")
+                    if not instrument:
+                        self.logger.debug(f"Received position size {position} without instrument name, skipping")
+                        continue
+                    # Convert to dict format for consistent processing
+                    position = {
+                        "instrument_name": instrument,
+                        "size": position,
+                        "average_price": item.get("average_price", 0.0)
+                    }
+                else:
                     self.logger.warning(f"Received position in unexpected format: {type(position)}, value: {position}")
                     continue
                     
@@ -1930,21 +2039,44 @@ class AvellanedaQuoter:
                     # Update position tracking
                     position_size = size
                     
+                    # Update position tracker if available
+                    if hasattr(self, 'position_tracker') and self.position_tracker:
+                        # Update position tracker with new position information
+                        try:
+                            # Clear and update position
+                            current_metrics = self.position_tracker.get_position_metrics()
+                            old_position = current_metrics.get("position", 0.0)
+                            
+                            # If position changed, log the update
+                            if abs(old_position - size) > 1e-8:  # Small epsilon for float comparison
+                                self.logger.info(f"Position changed from {old_position:.8f} to {size:.8f}")
+                                
+                                # Update position tracker with portfolio data
+                                if avg_price > 0:
+                                    # Use the update_position method which handles price and size
+                                    self.position_tracker.update_position(size, avg_price)
+                                else:
+                                    # If no average price, just update the position size
+                                    self.position_tracker.update_position_size(size)
+                                    
+                        except Exception as e:
+                            self.logger.error(f"Error updating position tracker: {str(e)}")
+                    
                     # Ensure instrument is set in market maker before updating position
                     if not hasattr(self.market_maker, 'instrument') or self.market_maker.instrument is None or self.market_maker.instrument != self.perp_name:
-                        self.logger.warning(f"Instrument not set in market maker during portfolio update, setting to {self.perp_name}")
+                        self.logger.debug(f"Instrument not set in market maker during portfolio update, setting to {self.perp_name}")
                         if hasattr(self.market_maker, 'set_instrument'):
                             self.market_maker.set_instrument(self.perp_name)
+                    
+                    # Update market maker with position size if available
+                    if hasattr(self.market_maker, 'update_position_size'):
+                        self.market_maker.update_position_size(position_size)
                     
                     # Log position with average price information if available
                     if avg_price > 0:
                         self.logger.info(f"Updated position for {instrument}: Size={size:.8f}, Avg Price={avg_price:.2f}")
                     else:
                         self.logger.info(f"Updated position size for {instrument}: Size={size:.8f}")
-                    
-            # Update market maker with position size only
-            if hasattr(self.market_maker, 'update_position_size'):
-                self.market_maker.update_position_size(position_size)
                 
         except Exception as e:
             self.logger.error(f"Error handling portfolio update: {str(e)}", exc_info=True)
@@ -2162,10 +2294,18 @@ class AvellanedaQuoter:
             
             # --- BEGIN INVENTORY CHECK FOR ONE-SIDED QUOTING ---
             current_inventory = 0.0
-            if hasattr(self.market_maker, 'position_size'):
+            
+            # Try to get position from multiple sources
+            if hasattr(self, 'position_tracker') and self.position_tracker:
+                # Primary source: position tracker
+                metrics = self.position_tracker.get_position_metrics()
+                current_inventory = metrics.get("position", 0.0)
+            elif hasattr(self.market_maker, 'position_size'):
+                # Secondary source: market maker
                 current_inventory = self.market_maker.position_size
             else:
-                self.logger.warning("Market maker object or 'position_size' attribute not found. Inventory check will use 0 inventory.")
+                # Fallback: use 0 inventory
+                self.logger.debug("No position tracking available. Inventory check will use 0 inventory.")
 
             max_inventory_deviation = RISK_LIMITS.get("max_position", float('inf')) # Changed from TRADING_PARAMS
             if not isinstance(max_inventory_deviation, (int, float)) or max_inventory_deviation < 0:
@@ -2510,8 +2650,21 @@ class AvellanedaQuoter:
                 if heartbeat_counter % 60 == 0:
                     self.logger.info(f"Quote task heartbeat #{heartbeat_counter} - task is alive. Active trading: {self.active_trading}")
                     if not self.active_trading:
-                        self.logger.critical("Trading HALTED. Quote task will cease further operations.")
-                        break # Exit the loop if trading has been halted
+                        if self.risk_recovery_mode:
+                            # In recovery mode - check for recovery instead of exiting
+                            if time.time() - self.last_recovery_check > RISK_LIMITS.get("recovery_check_interval", 30):
+                                self.last_recovery_check = time.time()
+                                if await self._check_risk_recovery():
+                                    await self._initiate_gradual_recovery()
+                                else:
+                                    self.logger.info("Still in recovery mode - waiting for risk conditions to improve")
+                            
+                            # Sleep and continue loop instead of breaking
+                            await asyncio.sleep(5.0)
+                            continue
+                        else:
+                            self.logger.critical("Trading HALTED. Quote task will cease further operations.")
+                            break
                     if not self.ticker:
                         self.logger.warning("No ticker data received yet")
                     else:

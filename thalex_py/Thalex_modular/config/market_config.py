@@ -16,7 +16,9 @@ This file defines the configuration for the Thalex Avellaneda-Stoikov market mak
 BOT_CONFIG = {
     # Market parameters
     "market": {
-        "underlying": "BTC-13JUN25",
+        # Maintain backward compatibility
+        "underlying": "BTC",
+        #"underlying2": "BTC-20JUN25",
         "network": Network.TEST,
         "label": "F",
     
@@ -114,8 +116,8 @@ BOT_CONFIG = {
     # Orderbook specific parameters
     "orderbook": {
         "min_spread": 3,                # Minimum spread in ticks
-        "base_order_size": 0.1,        # Base order size for quoting
-        "min_order_size": 0.1,        # Absolute minimum order size
+        "base_order_size": 0.05,        # Base order size for quoting
+        "min_order_size": 0.02,        # Absolute minimum order size
         "levels": 6,                    # Number of order book levels for quoting logic
         "bid_step": 10,                 # Default step for placing bid orders (in ticks)
         "ask_step": 10,                 # Default step for placing ask orders (in ticks)
@@ -144,6 +146,20 @@ BOT_CONFIG = {
         # Position management
         "max_notional": 100000000,  # Maximum notional value in USD
         "max_position_notional": 80000000,  # Maximum notional position (80% of max_notional)
+        
+        # Risk recovery system
+        "recovery_enabled": True,              # Enable recovery mechanism
+        "recovery_cooldown_seconds": 300,      # 5 minutes cooldown after breach
+        "recovery_check_interval": 30,         # Check recovery conditions every 30s
+        "risk_recovery_threshold": 0.8,        # Resume at 80% of risk limits
+        "gradual_recovery_steps": 3,           # Number of steps to full recovery
+        
+        # UPNL Take Profit Configuration
+        "take_profit_enabled": True,           # Enable UPNL-based take profit
+        "take_profit_threshold": 100.0,        # Take profit at $100 UPNL
+        "take_profit_check_interval": 5,       # Check every 5 seconds
+        "flatten_position_enabled": True,       # Allow position flattening
+        "take_profit_cooldown": 30,            # 30 second cooldown after take profit
     },
     
     # Portfolio-wide take profit configuration
@@ -350,6 +366,18 @@ RISK_LIMITS: Dict[str, Any] = {
     "position_rebalance_threshold": BOT_CONFIG["risk"]["position_rebalance_threshold"],
     "market_impact_threshold": BOT_CONFIG["risk"]["market_impact_threshold"],
     "rebalance_cooldown": BOT_CONFIG["risk"]["rebalance_cooldown"],
+    # Risk recovery parameters
+    "recovery_enabled": BOT_CONFIG["risk"]["recovery_enabled"],
+    "recovery_cooldown_seconds": BOT_CONFIG["risk"]["recovery_cooldown_seconds"],
+    "recovery_check_interval": BOT_CONFIG["risk"]["recovery_check_interval"],
+    "risk_recovery_threshold": BOT_CONFIG["risk"]["risk_recovery_threshold"],
+    "gradual_recovery_steps": BOT_CONFIG["risk"]["gradual_recovery_steps"],
+    # UPNL Take Profit parameters
+    "take_profit_enabled": BOT_CONFIG["risk"]["take_profit_enabled"],
+    "take_profit_threshold": BOT_CONFIG["risk"]["take_profit_threshold"],
+    "take_profit_check_interval": BOT_CONFIG["risk"]["take_profit_check_interval"],
+    "flatten_position_enabled": BOT_CONFIG["risk"]["flatten_position_enabled"],
+    "take_profit_cooldown": BOT_CONFIG["risk"]["take_profit_cooldown"],
     # Ensure all keys from BOT_CONFIG["risk"] are present if needed by RiskManager
 }
 
