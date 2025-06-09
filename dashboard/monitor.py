@@ -138,69 +138,109 @@ class TradingViewChart:
     
     @staticmethod
     def create_pnl_chart(df: pd.DataFrame) -> go.Figure:
-        """Create PnL chart with position overlay"""
+        """Create ROI chart with time on Y-axis and ROI% on X-axis"""
+        # Calculate cumulative PnL and ROI
+        df_copy = df.copy()
+        df_copy['cumulative_pnl'] = df_copy['pnl'].cumsum()
+        
+        # Estimate initial capital from position size and price
+        # Assume initial capital is at least 10x the largest position value
+        if not df_copy.empty and 'position' in df_copy.columns and 'mid_price' in df_copy.columns:
+            max_position_value = abs(df_copy['position'] * df_copy['mid_price']).max()
+            initial_capital = max(10000, max_position_value * 10)  # Minimum $10k or 10x max position
+        else:
+            initial_capital = 10000  # Default $10k
+        
+        # Calculate ROI percentage
+        df_copy['roi_percent'] = (df_copy['cumulative_pnl'] / initial_capital) * 100
+        
+        # Create figure with subplots
         fig = make_subplots(
-            rows=2, cols=1,
-            shared_xaxes=True,
-            vertical_spacing=0.05,
-            row_heights=[0.7, 0.3],
-            subplot_titles=('PnL & Position', 'Drawdown')
+            rows=1, cols=2,
+            shared_yaxes=True,
+            horizontal_spacing=0.08,
+            column_widths=[0.7, 0.3],
+            subplot_titles=('ROI% over Time', 'Current Position')
         )
         
-        # PnL line
+        # Main ROI chart - Time on Y-axis, ROI% on X-axis
+        colors = ['#00E676' if roi >= 0 else '#ef5350' for roi in df_copy['roi_percent']]
+        
         fig.add_trace(
             go.Scatter(
-                x=df['datetime'],
-                y=df['pnl'],
-                mode='lines',
-                name='PnL',
+                x=df_copy['roi_percent'],
+                y=df_copy['datetime'],
+                mode='lines+markers',
+                name='ROI %',
                 line=dict(color='#00E676', width=3),
-                fill='tonexty' if df['pnl'].iloc[0] >= 0 else 'tozeroy',
-                fillcolor='rgba(0, 230, 118, 0.2)'
+                marker=dict(color=colors, size=4),
+                hovertemplate='<b>Time</b>: %{y}<br>' +
+                              '<b>ROI</b>: %{x:.2f}%<br>' +
+                              '<b>PnL</b>: $%{customdata:.2f}<extra></extra>',
+                customdata=df_copy['cumulative_pnl']
             ), row=1, col=1
         )
         
-        # Position bars
-        colors = ['#26a69a' if pos >= 0 else '#ef5350' for pos in df['position']]
+        # Add zero line
+        fig.add_vline(x=0, line=dict(color='#666666', width=1, dash='dash'), row=1, col=1)
+        
+        # Position visualization on the right
+        latest_position = df_copy['position'].iloc[-1] if 'position' in df_copy.columns else 0
+        latest_price = df_copy['mid_price'].iloc[-1] if 'mid_price' in df_copy.columns else 0
+        position_value = abs(latest_position * latest_price)
+        
+        # Position indicator
         fig.add_trace(
             go.Bar(
-                x=df['datetime'],
-                y=df['position'],
-                name='Position',
-                marker_color=colors,
-                opacity=0.6,
-                yaxis='y2'
-            ), row=1, col=1
+                x=[position_value],
+                y=[df_copy['datetime'].iloc[-1]],
+                orientation='h',
+                name='Position Value',
+                marker=dict(color='#26a69a' if latest_position >= 0 else '#ef5350'),
+                hovertemplate='<b>Position</b>: %{customdata:.4f} BTC<br>' +
+                              '<b>Value</b>: $%{x:.2f}<extra></extra>',
+                customdata=[latest_position],
+                width=timedelta(hours=1).total_seconds() * 1000  # Bar width
+            ), row=1, col=2
         )
         
-        # Calculate drawdown
-        cumulative = df['pnl'].cumsum()
-        running_max = cumulative.expanding().max()
-        drawdown = cumulative - running_max
+        # Calculate key metrics for display
+        total_roi = df_copy['roi_percent'].iloc[-1] if not df_copy.empty else 0
+        max_roi = df_copy['roi_percent'].max() if not df_copy.empty else 0
+        min_roi = df_copy['roi_percent'].min() if not df_copy.empty else 0
         
-        fig.add_trace(
-            go.Scatter(
-                x=df['datetime'],
-                y=drawdown,
-                mode='lines',
-                name='Drawdown',
-                line=dict(color='#f44336', width=2),
-                fill='tonexty',
-                fillcolor='rgba(244, 67, 54, 0.3)'
-            ), row=2, col=1
-        )
-        
+        # Update layout
         fig.update_layout(
-            title=dict(text="PnL Analysis", font=dict(size=20, color='white')),
+            title=dict(
+                text=f"ROI Tracking - Current: {total_roi:.2f}% | Max: {max_roi:.2f}% | Min: {min_roi:.2f}%",
+                font=dict(size=20, color='white')
+            ),
             paper_bgcolor='#1e1e1e',
             plot_bgcolor='#1e1e1e',
             font=dict(color='white'),
             height=600,
-            yaxis2=dict(overlaying='y', side='right', title='Position')
+            showlegend=True,
+            legend=dict(x=0.02, y=0.98)
         )
         
-        fig.update_xaxes(gridcolor='#333333', linecolor='#666666')
-        fig.update_yaxes(gridcolor='#333333', linecolor='#666666')
+        # Update axes
+        fig.update_xaxes(
+            title="ROI %",
+            gridcolor='#333333',
+            linecolor='#666666',
+            row=1, col=1
+        )
+        fig.update_xaxes(
+            title="Position Value $",
+            gridcolor='#333333',
+            linecolor='#666666',
+            row=1, col=2
+        )
+        fig.update_yaxes(
+            title="Time",
+            gridcolor='#333333',
+            linecolor='#666666'
+        )
         
         return fig
 
@@ -318,8 +358,13 @@ def create_sidebar():
     </div>
     """, unsafe_allow_html=True)
     
-    # Controls
+    # Controls with auto-refresh
     if st.sidebar.button("🔄 Refresh Data", type="primary"):
+        st.rerun()
+    
+    # Auto-refresh every 2 seconds for real-time monitoring
+    if st.sidebar.checkbox("Auto-refresh (2s)", value=True):
+        time.sleep(2)
         st.rerun()
     
     # Time range
@@ -382,26 +427,44 @@ def create_overview_tab(df: pd.DataFrame):
     if df.empty:
         return
     
+    # Calculate ROI for overview
+    df_copy = df.copy()
+    df_copy['cumulative_pnl'] = df_copy['pnl'].cumsum()
+    
+    if not df_copy.empty and 'position' in df_copy.columns and 'mid_price' in df_copy.columns:
+        max_position_value = abs(df_copy['position'] * df_copy['mid_price']).max()
+        initial_capital = max(10000, max_position_value * 10)
+    else:
+        initial_capital = 10000
+    
+    df_copy['roi_percent'] = (df_copy['cumulative_pnl'] / initial_capital) * 100
+    
     # Metrics
-    latest = df.iloc[-1]
-    col1, col2, col3, col4 = st.columns(4)
+    latest = df_copy.iloc[-1]
+    col1, col2, col3, col4, col5 = st.columns(5)
     
     with col1:
-        pnl_change = latest['pnl'] - df.iloc[-2]['pnl'] if len(df) > 1 else 0
-        st.metric("Current PnL", f"${latest['pnl']:.2f}", f"${pnl_change:.2f}")
+        pnl_change = latest['pnl'] - df_copy.iloc[-2]['pnl'] if len(df_copy) > 1 else 0
+        st.metric("Period PnL", f"${latest['pnl']:.2f}", f"${pnl_change:.2f}")
     
     with col2:
-        st.metric("Position", f"{latest['position']:.4f} BTC")
+        total_pnl = latest['cumulative_pnl']
+        st.metric("Total PnL", f"${total_pnl:.2f}")
     
     with col3:
-        st.metric("Mid Price", f"${latest['mid_price']:.2f}")
+        current_roi = latest['roi_percent']
+        roi_change = current_roi - df_copy.iloc[-2]['roi_percent'] if len(df_copy) > 1 else 0
+        st.metric("ROI", f"{current_roi:.2f}%", f"{roi_change:.2f}%")
     
     with col4:
-        st.metric("Spread", f"${latest['spread']:.2f}")
+        st.metric("Position", f"{latest['position']:.4f} BTC")
+    
+    with col5:
+        st.metric("Mid Price", f"${latest['mid_price']:.2f}")
     
     # Main chart
     chart = TradingViewChart()
-    fig = chart.create_price_chart(df, "BTC-PERPETUAL Price Action")
+    fig = chart.create_price_chart(df_copy, "BTC-PERPETUAL Price Action")
     st.plotly_chart(fig, use_container_width=True)
 
 def create_pnl_tab(df: pd.DataFrame):
@@ -409,23 +472,84 @@ def create_pnl_tab(df: pd.DataFrame):
     if df.empty:
         return
     
-    # PnL metrics
-    total_pnl = df['pnl'].iloc[-1]
-    max_pnl = df['pnl'].max()
-    min_pnl = df['pnl'].min()
+    # Calculate enhanced metrics
+    df_copy = df.copy()
+    df_copy['cumulative_pnl'] = df_copy['pnl'].cumsum()
     
-    col1, col2, col3 = st.columns(3)
+    # Estimate initial capital
+    if not df_copy.empty and 'position' in df_copy.columns and 'mid_price' in df_copy.columns:
+        max_position_value = abs(df_copy['position'] * df_copy['mid_price']).max()
+        initial_capital = max(10000, max_position_value * 10)
+    else:
+        initial_capital = 10000
+    
+    # Calculate ROI
+    df_copy['roi_percent'] = (df_copy['cumulative_pnl'] / initial_capital) * 100
+    
+    # Current metrics
+    total_pnl = df_copy['cumulative_pnl'].iloc[-1]
+    current_roi = df_copy['roi_percent'].iloc[-1]
+    max_pnl = df_copy['cumulative_pnl'].max()
+    min_pnl = df_copy['cumulative_pnl'].min()
+    max_roi = df_copy['roi_percent'].max()
+    min_roi = df_copy['roi_percent'].min()
+    
+    # Display key metrics
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("Total PnL", f"${total_pnl:.2f}")
     with col2:
-        st.metric("Max PnL", f"${max_pnl:.2f}")
+        roi_color = "normal" if current_roi >= 0 else "inverse"
+        st.metric("Current ROI", f"{current_roi:.2f}%")
     with col3:
-        st.metric("Min PnL", f"${min_pnl:.2f}")
+        st.metric("Max ROI", f"{max_roi:.2f}%")
+    with col4:
+        st.metric("Min ROI", f"{min_roi:.2f}%")
     
-    # PnL chart
+    # Capital info
+    st.info(f"📊 **Estimated Initial Capital**: ${initial_capital:,.2f} (Based on max position size)")
+    
+    # ROI chart
     chart = TradingViewChart()
-    fig = chart.create_pnl_chart(df)
+    fig = chart.create_pnl_chart(df_copy)
     st.plotly_chart(fig, use_container_width=True)
+    
+    # Performance summary table
+    st.subheader("📈 Performance Summary")
+    
+    # Calculate additional metrics
+    trades_count = len(df_copy)
+    avg_pnl_per_trade = total_pnl / trades_count if trades_count > 0 else 0
+    
+    # Calculate win rate (positive PnL periods)
+    positive_periods = len(df_copy[df_copy['pnl'] > 0])
+    win_rate = (positive_periods / trades_count * 100) if trades_count > 0 else 0
+    
+    summary_data = {
+        "Metric": [
+            "Total Trades/Records",
+            "Average PnL per Record", 
+            "Win Rate",
+            "Best Single Period PnL",
+            "Worst Single Period PnL",
+            "Total Return",
+            "Max Drawdown ROI"
+        ],
+        "Value": [
+            f"{trades_count:,}",
+            f"${avg_pnl_per_trade:.2f}",
+            f"{win_rate:.1f}%",
+            f"${df_copy['pnl'].max():.2f}",
+            f"${df_copy['pnl'].min():.2f}",
+            f"{current_roi:.2f}%",
+            f"{min_roi:.2f}%"
+        ]
+    }
+    
+    summary_df = pd.DataFrame(summary_data)
+    # Ensure all values are strings to avoid Arrow serialization issues
+    summary_df['Value'] = summary_df['Value'].astype(str)
+    st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
 def create_market_tab(df: pd.DataFrame):
     """Market analysis tab"""
@@ -489,6 +613,8 @@ def create_system_tab(df: pd.DataFrame):
     }
     
     diag_df = pd.DataFrame(diag_data)
+    # Convert all values to strings to avoid Arrow serialization issues  
+    diag_df['Value'] = diag_df['Value'].astype(str)
     st.dataframe(diag_df, use_container_width=True, hide_index=True)
     
     # Recent data

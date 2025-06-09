@@ -1,280 +1,347 @@
-
-
 # Implementation Tasks: Trading System Enhancements
 
-## ✅ COMPLETED: Risk Recovery System Implementation
+## ✅ COMPLETED: Simple UPNL Take Profit Implementation
 
 ### Summary of Completed Work
-**Status**: All phases completed successfully ✅
+**Status**: Phases 1-4 completed successfully ✅
 
-The Risk Recovery System has been fully implemented with the following enhancements:
+A basic UPNL-based take profit system has been implemented with the following components:
 
-- **Recovery Configuration**: Added 5 new parameters to `market_config.py` for recovery behavior control
-- **State Management**: Added recovery state variables to track halt/recovery status  
-- **Enhanced Risk Breach Handler**: Modified to activate recovery mode instead of permanent halt
-- **Recovery Logic**: Implemented gradual 3-step recovery process with cooldown periods
-- **Quote Task Integration**: Updated to check for recovery conditions instead of exiting on halt
-- **Risk Monitor Enhancement**: Added periodic recovery condition checking
+#### **Phase 1: Configuration ✅**
+- Added 5 take profit parameters to `market_config.py` risk section
+- Added 4 state variables to `avellaneda_quoter.py`
 
-**Key Features Delivered**:
-- 5-minute cooldown after risk breach before recovery attempts
-- 80% threshold for position/notional limits before recovery initiation
-- 3-step gradual recovery to prevent immediate re-breach
-- 30-second interval recovery condition checks
-- Comprehensive logging for all recovery events
-- Full backward compatibility with existing functionality
+#### **Phase 2: UPNL Monitoring ✅** 
+- `_get_current_upnl()` method extracts UPNL from position tracker
+- `_check_take_profit_conditions()` method checks thresholds with cooldowns
+
+#### **Phase 3: Position Flattening ✅**
+- `_execute_take_profit_flatten()` method places market orders to close positions
+- Integrated with order manager for reduce-only market orders
+
+#### **Phase 4: Integration ✅**
+- Replaced legacy take profit variables with simplified system
+- Integrated UPNL checks into main quote task loop
+
+### ⚠️ **LIMITATION IDENTIFIED**
+**The current implementation is NOT suitable for futures spread trading** because:
+- It only monitors total position UPNL, not spread-specific PnL
+- It doesn't understand futures-perpetual hedging relationships
+- It can't calculate spread convergence profits correctly
 
 ---
 
-## 🎯 NEW TASK: Take Profit Logic Simplification
+## 🎯 NEW TASK: Spread-Aware Take Profit for Futures Trading
 
 ### Overview
-Replace current take profit logic with simplified UPNL-based monetary thresholds. The new logic should monitor Unrealized PnL from position data and flatten positions when reaching specific dollar amounts.
+The bot trades futures spreads where taking a position in futures automatically hedges with opposite position in perpetuals:
+- **Long BTC-25JUL25** → **Short BTC-PERPETUAL** (same size)  
+- **Short BTC-25JUL25** → **Long BTC-PERPETUAL** (same size)
+
+**Profit comes from spread convergence, not absolute position PnL.**
 
 ### Current Challenge
-The existing take profit mechanism needs to be replaced with a simpler approach that:
-- Monitors UPNL (Unrealized PnL) from position data
-- Triggers position flattening at specific monetary values
-- Removes complex conditional logic in favor of direct dollar-based thresholds
+Replace the simple UPNL-based take profit with spread-aware logic that:
+- Tracks both futures and perpetual positions separately
+- Calculates spread PnL correctly
+- Takes profit when the spread is profitable (not individual legs)
+- Maintains hedged position integrity
 
-## Phase 1: Add Take Profit Configuration
+## Phase 1: Spread Position Tracking
 
-### Step 1.1: Add UPNL Take Profit Configuration
+### Step 1.1: Add Dual Take Profit Configuration
 **File**: `thalex_py/Thalex_modular/config/market_config.py`
-**Location**: Add to existing `"risk"` section
+**Location**: Add to existing `"risk"` section (keep existing simple UPNL config)
 
 ```python
-# Add these to existing BOT_CONFIG["risk"]
-"take_profit_enabled": True,           # Enable UPNL-based take profit
-"take_profit_threshold": 100.0,        # Take profit at $100 UPNL
-"take_profit_check_interval": 5,       # Check every 5 seconds
-"flatten_position_enabled": True,       # Allow position flattening
-"take_profit_cooldown": 30,            # 30 second cooldown after take profit
+# Keep existing simple UPNL take profit:
+"take_profit_enabled": True,              # Enable simple UPNL-based take profit
+"take_profit_threshold": 100.0,           # Take profit at $100 total UPNL
+"take_profit_check_interval": 5,          # Check every 5 seconds
+"flatten_position_enabled": True,         # Allow position flattening
+"take_profit_cooldown": 30,               # 30 second cooldown after take profit
+
+# ADD new spread-aware take profit:
+"spread_take_profit_enabled": True,       # Enable spread-based take profit
+"spread_profit_threshold_usd": 50.0,      # Take profit at $50 spread profit  
+"spread_check_interval": 3,               # Check every 3 seconds
+"spread_flatten_both_legs": True,         # Close both futures and perpetual
+"spread_profit_cooldown": 60,             # 60 second cooldown after take profit
+"min_spread_position_size": 0.01,         # Minimum position size to monitor
+"spread_priority_over_simple": True,      # If both trigger, spread takes priority
 ```
 
-### Step 1.2: Add Take Profit State Variables
+### Step 1.2: Add Spread State Variables  
 **File**: `thalex_py/Thalex_modular/avellaneda_quoter.py`
-**Location**: In `__init__` method after existing risk recovery variables
+**Location**: Add after existing take profit state variables (keep existing ones)
 
 ```python
-# Take profit state management (ADD AFTER risk recovery variables)
-self.take_profit_active = False
-self.last_take_profit_check = 0
-self.take_profit_cooldown_until = 0
-self.last_upnl_value = 0.0
+# Keep existing simple take profit state:
+# self.take_profit_active = False
+# self.last_take_profit_check = 0  
+# self.take_profit_cooldown_until = 0
+# self.last_upnl_value = 0.0
+
+# ADD new spread take profit state management:
+self.spread_take_profit_active = False
+self.last_spread_check = 0
+self.spread_cooldown_until = 0
+self.last_spread_pnl = 0.0
+self.futures_position_size = 0.0
+self.perpetual_position_size = 0.0
+self.current_spread_value = 0.0
 ```
 
-## Phase 2: Implement UPNL Monitoring
+## Phase 2: Spread PnL Calculation
 
-### Step 2.1: Add UPNL Extraction Method
-**File**: `thalex_py/Thalex_modular/avellaneda_quoter.py`
-**Location**: Add new method after recovery methods
+### Step 2.1: Add Spread PnL Extraction Method
+**File**: `thalex_py/Thalex_modular/avellaneda_quoter.py`  
+**Location**: Add after existing `_get_current_upnl` method (keep existing one)
 
 ```python
-def _get_current_upnl(self) -> float:
-    """Extract UPNL from position data"""
+def _get_spread_pnl(self) -> float:
+    """Calculate spread PnL from both legs of the trade"""
     try:
-        # Get position metrics from position tracker
-        metrics = self.position_tracker.get_position_metrics()
-        upnl = metrics.get("unrealized_pnl", 0.0)
+        # Get position metrics for both instruments
+        futures_metrics = self.position_tracker.get_position_metrics(self.futures_instrument_name) 
+        perpetual_metrics = self.position_tracker.get_position_metrics(self.perp_name)
         
-        # Alternative: Get from position data if available
-        if hasattr(self, 'position') and self.position:
-            upnl = getattr(self.position, 'unrealized_pnl', upnl)
+        # Extract individual leg PnLs
+        futures_pnl = futures_metrics.get("unrealized_pnl", 0.0)
+        perpetual_pnl = perpetual_metrics.get("unrealized_pnl", 0.0)
             
-        # Alternative: Calculate from mark price if needed
-        if upnl == 0.0 and hasattr(self, 'ticker') and self.ticker:
-            position_size = metrics.get("position", 0.0)
-            entry_price = metrics.get("average_entry_price", 0.0)
-            mark_price = self.ticker.mark_price
-            
-            if position_size != 0 and entry_price > 0 and mark_price > 0:
-                upnl = position_size * (mark_price - entry_price)
+        # Calculate spread PnL (sum of both legs)
+        spread_pnl = futures_pnl + perpetual_pnl
         
-        return float(upnl)
+        # Update tracking variables
+        self.futures_position_size = futures_metrics.get("position", 0.0)
+        self.perpetual_position_size = perpetual_metrics.get("position", 0.0)
+        
+        # Calculate current spread value
+        if self.futures_ticker and self.ticker:
+            self.current_spread_value = self.futures_ticker.mark_price - self.ticker.mark_price
+            
+        return float(spread_pnl)
         
     except Exception as e:
-        self.logger.error(f"Error extracting UPNL: {str(e)}")
+        self.logger.error(f"Error calculating spread PnL: {str(e)}")
         return 0.0
 
-async def _check_take_profit_conditions(self) -> bool:
-    """Check if take profit conditions are met"""
-    if not RISK_LIMITS.get("take_profit_enabled", True):
+def _is_valid_spread_position(self) -> bool:
+    """Check if we have a valid spread position to monitor"""
+    min_size = RISK_LIMITS.get("min_spread_position_size", 0.01)
+    
+    # Check if both legs exist and are roughly opposite
+    if (abs(self.futures_position_size) < min_size or 
+        abs(self.perpetual_position_size) < min_size):
+        return False
+        
+    # Check if positions are roughly opposite (spread trade)
+    position_ratio = abs(self.futures_position_size / self.perpetual_position_size)
+    if not (0.8 <= position_ratio <= 1.2):  # Allow 20% tolerance
+        self.logger.warning(f"Position sizes not balanced: futures={self.futures_position_size:.4f}, perp={self.perpetual_position_size:.4f}")
+        
+    return True
+
+async def _check_spread_take_profit_conditions(self) -> bool:
+    """Check if spread take profit conditions are met"""
+    if not RISK_LIMITS.get("spread_take_profit_enabled", True):
         return False
         
     current_time = time.time()
     
     # Check cooldown
-    if current_time < self.take_profit_cooldown_until:
+    if current_time < self.spread_cooldown_until:
         return False
         
     # Check interval
-    if current_time - self.last_take_profit_check < RISK_LIMITS.get("take_profit_check_interval", 5):
+    if current_time - self.last_spread_check < RISK_LIMITS.get("spread_check_interval", 3):
         return False
         
-    self.last_take_profit_check = current_time
+    self.last_spread_check = current_time
     
-    # Get current UPNL
-    current_upnl = self._get_current_upnl()
-    self.last_upnl_value = current_upnl
+    # Check if we have valid spread positions
+    if not self._is_valid_spread_position():
+        return False
+    
+    # Get current spread PnL
+    current_spread_pnl = self._get_spread_pnl()
+    self.last_spread_pnl = current_spread_pnl
     
     # Check threshold
-    take_profit_threshold = RISK_LIMITS.get("take_profit_threshold", 100.0)
+    profit_threshold = RISK_LIMITS.get("spread_profit_threshold_usd", 50.0)
     
-    if current_upnl >= take_profit_threshold:
-        self.logger.info(f"Take profit triggered: UPNL {current_upnl:.2f} >= threshold {take_profit_threshold:.2f}")
+    if current_spread_pnl >= profit_threshold:
+        self.logger.info(f"Spread take profit triggered: PnL ${current_spread_pnl:.2f} >= ${profit_threshold:.2f} (Spread: {self.current_spread_value:.2f})")
         return True
         
     return False
 ```
 
-## Phase 3: Implement Position Flattening
+## Phase 3: Spread Position Flattening
 
-### Step 3.1: Add Position Flattening Method
+### Step 3.1: Add Spread Flattening Method
 **File**: `thalex_py/Thalex_modular/avellaneda_quoter.py`
-**Location**: Add new method after UPNL monitoring methods
+**Location**: Add after existing `_execute_take_profit_flatten` method (keep existing one)
 
 ```python
-async def _execute_take_profit_flatten(self):
-    """Execute take profit by flattening position"""
+async def _execute_spread_take_profit_flatten(self):
+    """Execute spread take profit by flattening both legs"""
     try:
-        # Get current position
-        metrics = self.position_tracker.get_position_metrics()
-        position_size = metrics.get("position", 0.0)
-        
-        if abs(position_size) < 0.0001:  # Already flat
-            self.logger.info("Position already flat, take profit action not needed")
+        if not self._is_valid_spread_position():
+            self.logger.info("No valid spread position to flatten")
             return True
             
-        self.logger.critical(f"EXECUTING TAKE PROFIT: Flattening position {position_size:.4f} at UPNL ${self.last_upnl_value:.2f}")
+        self.logger.critical(f"EXECUTING SPREAD TAKE PROFIT: Spread PnL ${self.last_spread_pnl:.2f}, Futures: {self.futures_position_size:.4f}, Perp: {self.perpetual_position_size:.4f}")
         
         # Cancel all existing quotes first
-        await self.cancel_quotes("Take profit execution")
-        await asyncio.sleep(1)  # Brief pause
+        await self.cancel_quotes("Spread take profit execution")
+        await asyncio.sleep(1)
         
-        # Determine market order side and size
-        if position_size > 0:
-            # Long position - sell to flatten
-            order_side = "sell"
-            order_size = abs(position_size)
-        else:
-            # Short position - buy to flatten
-            order_side = "buy"
-            order_size = abs(position_size)
+        # Close futures position
+        if abs(self.futures_position_size) >= RISK_LIMITS.get("min_spread_position_size", 0.01):
+            futures_side = "sell" if self.futures_position_size > 0 else "buy"
             
-        # Place market order to flatten
-        if hasattr(self, 'order_manager') and self.order_manager:
-            market_order = {
-                "instrument": self.instrument,
-                "side": order_side,
-                "size": order_size,
-                "type": "market",
-                "reduce_only": True  # Ensure we only reduce position
-            }
+            if hasattr(self, 'order_manager') and self.order_manager:
+                futures_result = await self.order_manager.place_order(
+                    instrument=self.futures_instrument_name,
+                    direction=futures_side,
+                    price=None,  # Market order
+                    amount=abs(self.futures_position_size),
+                    label="SpreadTakeProfit",
+                    post_only=False  # Market orders can't be post-only
+                )
+                self.logger.info(f"Spread TP: Futures close order placed: {futures_result}")
+        
+        # Close perpetual position  
+        if abs(self.perpetual_position_size) >= RISK_LIMITS.get("min_spread_position_size", 0.01):
+            perp_side = "sell" if self.perpetual_position_size > 0 else "buy"
             
-            order_result = await self.order_manager.place_order(market_order)
-            self.logger.info(f"Take profit market order placed: {order_result}")
+            if hasattr(self, 'order_manager') and self.order_manager:
+                perp_result = await self.order_manager.place_order(
+                    instrument=self.perp_name,
+                    direction=perp_side,
+                    price=None,  # Market order
+                    amount=abs(self.perpetual_position_size),
+                    label="SpreadTakeProfit",
+                    post_only=False  # Market orders can't be post-only
+                )
+                self.logger.info(f"Spread TP: Perpetual close order placed: {perp_result}")
             
         # Set cooldown
-        self.take_profit_cooldown_until = time.time() + RISK_LIMITS.get("take_profit_cooldown", 30)
-        self.take_profit_active = True
+        self.spread_cooldown_until = time.time() + RISK_LIMITS.get("spread_profit_cooldown", 60)
+        self.spread_take_profit_active = True
         
         return True
         
     except Exception as e:
-        self.logger.error(f"Error executing take profit flatten: {str(e)}")
+        self.logger.error(f"Error executing spread take profit: {str(e)}")
         return False
 ```
 
-## Phase 4: Remove/Replace Existing Take Profit Logic
+## Phase 4: Integration and Monitoring
 
-### Step 4.1: Identify and Replace Current Take Profit Logic
+### Step 4.1: Update Quote Task Integration
 **File**: `thalex_py/Thalex_modular/avellaneda_quoter.py`
-**Location**: Find and replace existing take profit implementation
+**Location**: Update existing take profit check in quote_task to support both systems
 
 ```python
-# REPLACE existing take profit logic with simple call:
-# (Search for current take profit methods and replace with)
-
-async def _legacy_take_profit_check(self):
-    """Replaced with simplified UPNL-based logic"""
-    # This method is deprecated - see _check_take_profit_conditions()
-    pass
-```
-
-### Step 4.2: Integration in Main Trading Loop
-**File**: `thalex_py/Thalex_modular/avellaneda_quoter.py`
-**Location**: Add to main quote task loop or risk monitoring task
-
-```python
-# ADD this check in quote_task main loop (after existing risk checks):
+# Update existing take profit check to support BOTH systems:
 if self.active_trading and not self.risk_recovery_mode:
-    # Check take profit conditions
-    if await self._check_take_profit_conditions():
+    # Check spread take profit first (if enabled and has priority)
+    if (RISK_LIMITS.get("spread_take_profit_enabled", False) and 
+        await self._check_spread_take_profit_conditions()):
+        await self._execute_spread_take_profit_flatten()
+        # Brief pause after spread take profit
+        await asyncio.sleep(3.0)
+        continue
+    
+    # Check simple UPNL take profit (if enabled and spread didn't trigger)
+    elif (RISK_LIMITS.get("take_profit_enabled", False) and 
+          await self._check_take_profit_conditions()):
         await self._execute_take_profit_flatten()
-        # Brief pause after take profit
+        # Brief pause after simple take profit
         await asyncio.sleep(2.0)
         continue
 ```
 
-## Phase 5: Integration and Testing
-
-### Step 5.1: Add Take Profit to Risk Monitoring
+### Step 4.2: Add Dual Take Profit Monitoring to Risk Task
 **File**: `thalex_py/Thalex_modular/avellaneda_quoter.py`
-**Location**: In `_risk_monitoring_task` main loop
+**Location**: Add to `_risk_monitoring_task` main loop
 
 ```python
-# ADD to risk monitoring loop:
-# Check take profit conditions (separate from other risk checks)
+# Add dual take profit monitoring (separate from individual risk checks):
 if self.active_trading and not self.risk_recovery_mode:
-    if await self._check_take_profit_conditions():
+    # Check spread take profit first (if enabled and has priority)
+    if (RISK_LIMITS.get("spread_take_profit_enabled", False) and 
+        await self._check_spread_take_profit_conditions()):
+        await self._execute_spread_take_profit_flatten()
+    
+    # Check simple UPNL take profit (if enabled and spread didn't trigger)
+    elif (RISK_LIMITS.get("take_profit_enabled", False) and 
+          await self._check_take_profit_conditions()):
         await self._execute_take_profit_flatten()
 ```
 
-### Step 5.2: Add Logging and Monitoring
+### Step 4.3: Add Dual Take Profit Status Logging
 **File**: `thalex_py/Thalex_modular/avellaneda_quoter.py`
-**Location**: Add logging in status methods
+**Location**: Add to status logging methods
 
 ```python
-# ADD to status logging methods:
 def _log_take_profit_status(self):
-    """Log current take profit status"""
-    current_upnl = self._get_current_upnl()
-    threshold = RISK_LIMITS.get("take_profit_threshold", 100.0)
+    """Log current take profit status for both systems"""
+    # Log simple UPNL take profit status
+    if RISK_LIMITS.get("take_profit_enabled", False):
+        current_upnl = self._get_current_upnl()
+        threshold = RISK_LIMITS.get("take_profit_threshold", 100.0)
+        self.logger.info(f"Simple TP: UPNL ${current_upnl:.2f} / ${threshold:.2f}")
+        
+        if self.take_profit_active:
+            cooldown_remaining = max(0, self.take_profit_cooldown_until - time.time())
+            self.logger.info(f"Simple TP: Cooldown active for {cooldown_remaining:.1f}s")
     
-    if current_upnl > 0:
-        self.logger.info(f"Take Profit Monitor: UPNL ${current_upnl:.2f} / ${threshold:.2f} threshold")
-    
-    if self.take_profit_active:
-        cooldown_remaining = max(0, self.take_profit_cooldown_until - time.time())
-        self.logger.info(f"Take Profit: Cooldown active for {cooldown_remaining:.1f}s")
+    # Log spread take profit status  
+    if RISK_LIMITS.get("spread_take_profit_enabled", False):
+        if self._is_valid_spread_position():
+            spread_pnl = self._get_spread_pnl()
+            threshold = RISK_LIMITS.get("spread_profit_threshold_usd", 50.0)
+            
+            self.logger.info(f"Spread TP: PnL ${spread_pnl:.2f} / ${threshold:.2f} | "
+                            f"Futures: {self.futures_position_size:.4f} | "
+                            f"Perp: {self.perpetual_position_size:.4f} | "
+                            f"Spread: {self.current_spread_value:.2f}")
+        
+        if self.spread_take_profit_active:
+            cooldown_remaining = max(0, self.spread_cooldown_until - time.time())
+            self.logger.info(f"Spread TP: Cooldown active for {cooldown_remaining:.1f}s")
 ```
 
 ## Implementation Summary
 
 ### Files to Modify:
-1. **`market_config.py`** - Add 5 new take profit parameters
-2. **`avellaneda_quoter.py`** - Add 4 new methods, modify 2 existing methods, add 4 state variables
+1. **`market_config.py`** - Add 7 new spread parameters (keep existing 5 simple TP parameters)
+2. **`avellaneda_quoter.py`** - Add 4 new methods, modify 2 existing methods, add 7 spread state variables
 
 ### Key Benefits:
-- **Simplified Logic**: Direct UPNL-based thresholds replace complex conditions
-- **Real-time Monitoring**: Continuous UPNL tracking with configurable intervals  
-- **Immediate Action**: Market orders for instant position flattening
-- **Configurable Thresholds**: Easy adjustment of profit targets
-- **Integration Friendly**: Works with existing risk management
+- **Dual Take Profit Systems**: Both simple UPNL and spread-aware logic available
+- **Independent Toggle Control**: Enable/disable each system separately via config
+- **Priority System**: Spread take profit can take priority over simple TP when both triggered
+- **Spread-Aware Logic**: Calculates PnL from both legs of futures trades
+- **Position Validation**: Ensures balanced spread positions before monitoring
+- **Dual-Leg Closure**: Closes both futures and perpetual positions simultaneously
+- **Unified Integration**: Both systems work seamlessly in existing risk framework
 
 ### Testing Strategy:
-1. Verify UPNL extraction from position data
-2. Test threshold detection accuracy
-3. Confirm position flattening execution
-4. Validate cooldown periods
-5. Check integration with existing risk systems
+1. Verify spread PnL calculation accuracy with both legs
+2. Test position balance validation for spread trades  
+3. Confirm dual-leg flattening executes correctly
+4. Validate cooldown periods work properly
+5. Check integration with existing futures trading logic
 
 ## Execution Status:
-- [ ] Phase 1: Add Take Profit Configuration
-- [ ] Phase 2: Implement UPNL Monitoring  
-- [ ] Phase 3: Implement Position Flattening
-- [ ] Phase 4: Remove/Replace Existing Take Profit Logic
-- [ ] Phase 5: Integration and Testing
+- [ ] Phase 1: Spread Configuration  
+- [ ] Phase 2: Spread PnL Calculation
+- [ ] Phase 3: Spread Position Flattening
+- [ ] Phase 4: Integration and Monitoring
 
-**Next Steps**: Begin Phase 1 implementation with configuration updates. 
+**Next Steps**: Begin Phase 1 implementation with spread-aware configuration. 

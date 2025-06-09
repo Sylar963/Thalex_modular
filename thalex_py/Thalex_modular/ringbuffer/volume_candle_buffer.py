@@ -69,16 +69,16 @@ class VolumeBasedCandleBuffer:
     """Buffer for volume-based candles with predictive indicators"""
     
     # --- Signal Calculation Constants ---
-    MIN_CANDLES_FOR_SIGNALS = 5
-    MOMENTUM_PRICE_FACTOR = 20.0
-    MOMENTUM_DELTA_SENSITIVITY_FACTOR = 2.0
-    REVERSAL_PRICE_CHANGE_FACTOR = 10.0
-    REVERSAL_DELTA_CHANGE_FACTOR = 5.0
-    VOLATILITY_PRICE_RANGE_FACTOR = 10.0
-    EXHAUSTION_DELTA_TREND_THRESHOLD = 0.2
-    EXHAUSTION_STRENGTH_FACTOR = 2.0
-    SIGNIFICANT_SIGNAL_CHANGE_THRESHOLD = 0.2
-    SIGNAL_LOGGING_FREQUENCY = 5 # For predictions_made % N
+    MIN_CANDLES_FOR_SIGNALS = 3  # Reduced for faster signal generation
+    MOMENTUM_PRICE_FACTOR = 100.0  # Increased sensitivity for small price moves
+    MOMENTUM_DELTA_SENSITIVITY_FACTOR = 5.0  # Increased delta sensitivity  
+    REVERSAL_PRICE_CHANGE_FACTOR = 50.0  # Increased reversal sensitivity
+    REVERSAL_DELTA_CHANGE_FACTOR = 10.0  # Increased delta change sensitivity
+    VOLATILITY_PRICE_RANGE_FACTOR = 50.0  # Increased volatility sensitivity
+    EXHAUSTION_DELTA_TREND_THRESHOLD = 0.1  # Lowered threshold for exhaustion
+    EXHAUSTION_STRENGTH_FACTOR = 5.0  # Increased exhaustion strength
+    SIGNIFICANT_SIGNAL_CHANGE_THRESHOLD = 0.05  # Lowered for more logging
+    SIGNAL_LOGGING_FREQUENCY = 3  # More frequent logging
 
     # --- Parameter Prediction Constants ---
     GAMMA_ADJ_VOLATILITY_FACTOR = 0.4

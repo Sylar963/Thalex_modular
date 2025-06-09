@@ -678,12 +678,23 @@ class AvellanedaMarketMaker:
             # Update market mid price
             self.last_mid_price = mid_price
             
-            # Extract volatility
+            # Extract volatility and volume candle signals
             try:
                 volatility = market_conditions.get("volatility", self.volatility)
                 self.logger.debug(f"Extracted volatility: {volatility}")
                 market_impact = market_conditions.get("market_impact", 0.0)
                 self.logger.debug(f"Extracted market_impact: {market_impact}")
+                
+                # NEW: Extract volume candle signals for enhanced quote generation (FIXED)
+                volume_momentum = market_conditions.get("volume_momentum", 0.0)
+                volume_reversal = market_conditions.get("volume_reversal", 0.0)
+                volume_volatility = market_conditions.get("volume_volatility", 0.0)
+                volume_exhaustion = market_conditions.get("volume_exhaustion", 0.0)
+                
+                if any(abs(sig) > 0.1 for sig in [volume_momentum, volume_reversal, volume_volatility, volume_exhaustion]):
+                    self.logger.info(f"Volume signals detected: momentum={volume_momentum:.3f}, reversal={volume_reversal:.3f}, "
+                                   f"volatility={volume_volatility:.3f}, exhaustion={volume_exhaustion:.3f}")
+                    
             except Exception as e:
                 self.logger.error(f"Error extracting market conditions: {str(e)}")
                 return [], []
@@ -696,10 +707,28 @@ class AvellanedaMarketMaker:
                 self.logger.error(f"Error updating market conditions: {str(e)}")
                 return [], []
             
-            # Calculate optimal spread using Avellaneda-Stoikov model
+            # Calculate optimal spread using Avellaneda-Stoikov model with volume enhancement
             try:
-                spread = self.calculate_optimal_spread(market_impact)
-                self.logger.debug(f"Calculated spread: {spread}")
+                base_spread = self.calculate_optimal_spread(market_impact)
+                self.logger.debug(f"Calculated base spread: {base_spread}")
+                
+                # NEW: Enhance spread based on volume candle signals (FIXED)
+                spread_adjustment = 1.0
+                
+                # Increase spread on high volatility signals
+                if volume_volatility > 0.3:
+                    spread_adjustment *= (1.0 + volume_volatility * 0.3)  # Up to 30% increase
+                    self.logger.debug(f"Increased spread by {volume_volatility * 30:.1f}% due to volume volatility")
+                
+                # Increase spread on reversal signals to protect against trend changes
+                if volume_reversal > 0.4:
+                    spread_adjustment *= (1.0 + volume_reversal * 0.2)  # Up to 20% increase
+                    self.logger.debug(f"Increased spread by {volume_reversal * 20:.1f}% due to reversal signal")
+                
+                # Apply adjustment
+                spread = base_spread * spread_adjustment
+                self.logger.debug(f"Final spread after volume adjustments: {spread} (adjustment: {spread_adjustment:.3f})")
+                
             except Exception as e:
                 self.logger.error(f"Error calculating optimal spread: {str(e)}")
                 return [], []
@@ -716,18 +745,77 @@ class AvellanedaMarketMaker:
                 self.logger.error(f"Error applying reservation price offset: {str(e)}")
                 # Continue as this is not critical
             
-            # Calculate base bid and ask prices with inventory skew
+            # Calculate base bid and ask prices with inventory skew and volume signals
             try:
                 base_bid_price, base_ask_price = self.calculate_skewed_prices(mid_price, spread)
-                self.logger.debug(f"Calculated base prices: bid={base_bid_price}, ask={base_ask_price}")
+                self.logger.debug(f"Calculated inventory-skewed prices: bid={base_bid_price}, ask={base_ask_price}")
+                
+                # NEW: Apply volume candle momentum and exhaustion signals to price skewing (FIXED)
+                volume_skew_adjustment = 0.0
+                
+                # Strong momentum signals shift quotes in direction of momentum
+                if abs(volume_momentum) > 0.05:  # Lowered threshold from 0.2 to 0.05
+                    momentum_skew = volume_momentum * spread * 0.3  # Up to 30% of spread
+                    volume_skew_adjustment += momentum_skew
+                    self.logger.debug(f"Applied momentum skew: {momentum_skew:.4f} (momentum: {volume_momentum:.3f})")
+                
+                # Exhaustion signals shift quotes away from exhausted direction
+                if abs(volume_exhaustion) > 0.1:  # Lowered threshold from 0.3 to 0.1
+                    # If buying exhaustion (positive), shift quotes lower to encourage sells
+                    # If selling exhaustion (negative), shift quotes higher to encourage buys
+                    exhaustion_skew = -volume_exhaustion * spread * 0.2  # Up to 20% of spread, inverted
+                    volume_skew_adjustment += exhaustion_skew
+                    self.logger.debug(f"Applied exhaustion skew: {exhaustion_skew:.4f} (exhaustion: {volume_exhaustion:.3f})")
+                
+                # Apply volume-based skew adjustments
+                if abs(volume_skew_adjustment) > 0.0001:
+                    base_bid_price += volume_skew_adjustment
+                    base_ask_price += volume_skew_adjustment
+                    self.logger.info(f"Applied total volume skew: {volume_skew_adjustment:.4f} to both sides")
+                
+                self.logger.debug(f"Final volume-enhanced prices: bid={base_bid_price}, ask={base_ask_price}")
+                
             except Exception as e:
                 self.logger.error(f"Error calculating skewed prices: {str(e)}")
                 return [], []
             
-            # Calculate optimal sizes for base bid and ask
+            # Calculate optimal sizes for base bid and ask with volume enhancements
             try:
                 base_bid_size, base_ask_size = self.calculate_quote_sizes(mid_price)
                 self.logger.debug(f"Calculated base sizes: bid={base_bid_size}, ask={base_ask_size}")
+                
+                # NEW: Adjust quote sizes based on volume candle signals (FIXED)
+                size_adjustment_factor = 1.0
+                
+                # Reduce sizes on high volatility or reversal signals to limit exposure
+                if volume_volatility > 0.4 or volume_reversal > 0.5:
+                    risk_reduction = max(volume_volatility, volume_reversal) * 0.3  # Up to 30% reduction
+                    size_adjustment_factor *= (1.0 - risk_reduction)
+                    self.logger.debug(f"Reduced quote sizes by {risk_reduction * 100:.1f}% due to volume risk signals")
+                
+                # Adjust individual sides based on momentum and exhaustion
+                bid_size_factor = size_adjustment_factor
+                ask_size_factor = size_adjustment_factor
+                
+                # Strong buy momentum: increase ask sizes (more willing to sell), reduce bid sizes
+                if volume_momentum > 0.1:  # Lowered threshold from 0.3 to 0.1
+                    ask_size_factor *= (1.0 + volume_momentum * 0.2)  # Up to 20% increase
+                    bid_size_factor *= (1.0 - volume_momentum * 0.1)  # Up to 10% decrease
+                    self.logger.debug(f"Buy momentum detected: increased ask sizes, reduced bid sizes")
+                    
+                # Strong sell momentum: increase bid sizes (more willing to buy), reduce ask sizes  
+                elif volume_momentum < -0.1:  # Lowered threshold from -0.3 to -0.1
+                    bid_size_factor *= (1.0 + abs(volume_momentum) * 0.2)  # Up to 20% increase
+                    ask_size_factor *= (1.0 - abs(volume_momentum) * 0.1)  # Up to 10% decrease
+                    self.logger.debug(f"Sell momentum detected: increased bid sizes, reduced ask sizes")
+                
+                # Apply size adjustments
+                base_bid_size *= bid_size_factor
+                base_ask_size *= ask_size_factor
+                
+                self.logger.debug(f"Volume-enhanced sizes: bid={base_bid_size:.4f} (factor: {bid_size_factor:.3f}), "
+                                f"ask={base_ask_size:.4f} (factor: {ask_size_factor:.3f})")
+                
             except Exception as e:
                 self.logger.error(f"Error calculating quote sizes: {str(e)}")
                 return [], []

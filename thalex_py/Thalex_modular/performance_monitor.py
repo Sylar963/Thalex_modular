@@ -83,7 +83,7 @@ class PerformanceMonitor:
                     writer = csv.writer(f)
                     writer.writerow([
                         "timestamp", "datetime", "pnl", "position", "mid_price", 
-                        "spread", "quote_count", "active_quotes"
+                        "volatility", "spread", "quote_count", "active_quotes", "fills", "response_time"
                     ])
                     
             # Initialize trades file
@@ -160,9 +160,12 @@ class PerformanceMonitor:
                         metric["pnl"],
                         metric["position"],
                         metric["mid_price"],
+                        metric["volatility"],
                         metric["spread"],
                         metric["quote_count"],
-                        metric["active_quotes"]
+                        metric["active_quotes"],
+                        metric["fills"],
+                        metric["response_time"]
                     ])
             # Clear buffer after writing
             self.metrics_buffer = []
@@ -250,33 +253,92 @@ class PerformanceMonitor:
     def _collect_metrics(self, quoter) -> Dict:
         """Collect essential metrics from quoter object"""
         try:
+            current_time = time.time()
+            
+            # Initialize metrics with default values
             metrics = {
-                "timestamp": time.time(),
+                "timestamp": current_time,
                 "pnl": 0.0,
                 "position": 0.0,
                 "mid_price": 0.0,
+                "volatility": 0.001,  # Add volatility field
                 "spread": 0.0,
-                "quote_count": len(quoter.current_quotes[0]) + len(quoter.current_quotes[1]),
-                "active_quotes": len(quoter.order_manager.active_bids) + len(quoter.order_manager.active_asks),
+                "quote_count": 0,
+                "active_quotes": 0,
+                "fills": 0,
+                "response_time": 0.0
             }
             
-            # Get position and PnL if available
-            if hasattr(quoter, 'market_maker') and quoter.market_maker:
-                position_metrics = quoter.market_maker.get_position_metrics()
-                metrics["position"] = position_metrics.get("position", 0.0)
-                metrics["pnl"] = position_metrics.get("total_pnl", 0.0)
+            # Get quote count safely
+            try:
+                if hasattr(quoter, 'current_quotes') and quoter.current_quotes:
+                    metrics["quote_count"] = len(quoter.current_quotes[0]) + len(quoter.current_quotes[1])
+            except:
+                pass
+                
+            # Get active orders count safely  
+            try:
+                if hasattr(quoter, 'order_manager') and quoter.order_manager:
+                    active_bids = getattr(quoter.order_manager, 'active_bids', [])
+                    active_asks = getattr(quoter.order_manager, 'active_asks', [])
+                    metrics["active_quotes"] = len(active_bids) + len(active_asks)
+            except:
+                pass
+            
+            # Get position and PnL from position tracker (more reliable)
+            try:
+                if hasattr(quoter, 'position_tracker') and quoter.position_tracker:
+                    pt_metrics = quoter.position_tracker.get_metrics()
+                    metrics["position"] = pt_metrics.get("position_size", 0.0)
+                    metrics["pnl"] = pt_metrics.get("realized_pnl", 0.0) + pt_metrics.get("unrealized_pnl", 0.0)
+                    metrics["fills"] = pt_metrics.get("fill_count", 0)
+                elif hasattr(quoter, 'market_maker') and quoter.market_maker:
+                    # Fallback to market maker
+                    position_metrics = quoter.market_maker.get_position_metrics()
+                    metrics["position"] = position_metrics.get("position", 0.0)
+                    metrics["pnl"] = position_metrics.get("total_pnl", 0.0)
+            except Exception as e:
+                self.logger.debug(f"Could not get position metrics: {str(e)}")
                 
             # Get market data if available
-            if hasattr(quoter, 'ticker') and quoter.ticker:
-                metrics["mid_price"] = quoter.ticker.mark_price
-                if quoter.ticker.best_bid_price and quoter.ticker.best_ask_price:
-                    metrics["spread"] = quoter.ticker.best_ask_price - quoter.ticker.best_bid_price
+            try:
+                if hasattr(quoter, 'ticker') and quoter.ticker:
+                    metrics["mid_price"] = getattr(quoter.ticker, 'mark_price', 0.0)
                     
+                    # Calculate spread
+                    best_bid = getattr(quoter.ticker, 'best_bid_price', None)
+                    best_ask = getattr(quoter.ticker, 'best_ask_price', None)
+                    if best_bid and best_ask and best_bid > 0 and best_ask > 0:
+                        metrics["spread"] = best_ask - best_bid
+            except Exception as e:
+                self.logger.debug(f"Could not get market data: {str(e)}")
+                
+            # Get volatility if available
+            try:
+                if hasattr(quoter, 'market_maker') and quoter.market_maker:
+                    metrics["volatility"] = getattr(quoter.market_maker, 'volatility', 0.001)
+                elif hasattr(quoter, 'market_data') and quoter.market_data:
+                    metrics["volatility"] = getattr(quoter.market_data, 'volatility', 0.001)
+            except:
+                pass
+                
             return metrics
             
         except Exception as e:
             self.logger.error(f"Error collecting metrics: {str(e)}")
-            return self.current_metrics
+            # Return a valid metrics structure with current timestamp
+            return {
+                "timestamp": time.time(),
+                "pnl": 0.0,
+                "position": 0.0,
+                "mid_price": 0.0,
+                "volatility": 0.001,
+                "spread": 0.0,
+                "quote_count": 0,
+                "active_quotes": 0,
+                "fills": 0,
+                "response_time": 0.0
+            }
     
     def record_trade(self, trade_data: Dict):
         """Record trade information to buffer"""

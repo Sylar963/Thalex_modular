@@ -52,9 +52,9 @@ BOT_CONFIG = {
             "max_loss_threshold": 0.03,    # Maximum loss before gradual exit
             
             # Quote sizing and levels
-            "base_size": 0.1,             # Base quote size increased from 0.01
+            "base_size": 0.05,             # Base quote size increased from 0.01
             "size_multipliers": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],  # Size multipliers with Fibonacci-like progression
-            "max_levels": 3,              # Maximum number of quote levels (reduced from 21)
+            "max_levels": 6,              # Maximum number of quote levels (reduced from 21)
             "level_spacing": 100,          # Base spacing between levels in ticks (increased from 50 to 100)
             "vamp_spread_sensitivity": 0.5,  # Sensitivity of spread to VAMP impact
             "vamp_skew_sensitivity": 0.001,  # Sensitivity of quote skew to VAMP impact
@@ -69,7 +69,7 @@ BOT_CONFIG = {
         # Order execution parameters
         "execution": {
             "post_only": True,             # Use post-only orders
-            "min_size": 0.01,             # Minimum quote size
+            "min_size": 0.05,             # Minimum quote size
             "max_size": 5.0,               # Maximum quote size
             "size_increment": 0.2,       # Size increment
             "price_decimals": 2,           # Price decimal places
@@ -89,9 +89,9 @@ BOT_CONFIG = {
         
         # Market impact and cancellation
         "market_impact": {
-            "threshold": 0.01,             # Market impact threshold
+            "threshold": 0.1,             # Market impact threshold
             "fast_cancel_threshold": 0.005, # Price movement for fast cancellation
-            "aggressive_cancel": False,     # Whether to cancel aggressively
+            "aggressive_cancel": True,     # Whether to cancel aggressively
         },
         
         # VAMP (Volume Adjusted Market Pressure)
@@ -101,11 +101,13 @@ BOT_CONFIG = {
             "impact_window": 30            # Number of market impact samples
         },
 
-        # Volume Candle configuration for predictive analysis
+        # Volume Candle configuration for predictive analysis (FULLY IMPLEMENTED)
+        # This system now properly integrates volume-based candle formation with quote generation
+        # Volume signals (momentum, reversal, volatility, exhaustion) enhance spread and size calculations
         "volume_candle": {
             "threshold": 1.0,               # Volume threshold for candle formation (e.g., in BTC)
             "max_candles": 100,             # Max number of candles to store
-            "max_time_seconds": 300,        # Max time for a candle toi form if volume threshold not met
+            "max_time_seconds": 300,        # Max time for a candle to form if volume threshold not met
             "use_exchange_data": False,     # Whether to use exchange's kline data as a source
             "fetch_interval_seconds": 60,   # Interval to fetch exchange data if use_exchange_data is True
             "lookback_hours": 1,            # Lookback hours for initial data fetch
@@ -115,7 +117,7 @@ BOT_CONFIG = {
     
     # Orderbook specific parameters
     "orderbook": {
-        "min_spread": 3,                # Minimum spread in ticks
+        "min_spread": 15,                # Minimum spread in ticks
         "base_order_size": 0.05,        # Base order size for quoting
         "min_order_size": 0.02,        # Absolute minimum order size
         "levels": 6,                    # Number of order book levels for quoting logic
@@ -156,10 +158,10 @@ BOT_CONFIG = {
         
         # UPNL Take Profit Configuration
         "take_profit_enabled": True,           # Enable UPNL-based take profit
-        "take_profit_threshold": 100.0,        # Take profit at $100 UPNL
-        "take_profit_check_interval": 5,       # Check every 5 seconds
+        "take_profit_threshold": 2.0,        # Take profit at $100 UPNL
+        "take_profit_check_interval": 1,       # Check every 5 seconds
         "flatten_position_enabled": True,       # Allow position flattening
-        "take_profit_cooldown": 30,            # 30 second cooldown after take profit
+        "take_profit_cooldown": 1,            # 30 second cooldown after take profit
     },
     
     # Portfolio-wide take profit configuration

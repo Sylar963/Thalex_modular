@@ -127,7 +127,7 @@ class AvellanedaQuoter:
         self.market_maker = AvellanedaMarketMaker(exchange_client=self.thalex, position_tracker=self.position_tracker) # MODIFIED: Pass position_tracker
         self.order_manager = OrderManager(self.thalex)
         self.risk_manager = RiskManager(self.position_tracker) # Then pass it to RiskManager
-        self.performance_monitor = PerformanceMonitor()
+        self.performance_monitor = PerformanceMonitor(record_interval=1, buffer_size=1)  # Record every 1 second, immediate write
         
         # Register risk breach handler
         self.risk_manager.register_callback("risk_limit", self._handle_risk_breach)
@@ -164,13 +164,8 @@ class AvellanedaQuoter:
         # Portfolio data
         self.portfolio = {}
         
-        # Take profit tracking - advanced implementation
-        self.take_profit_levels_executed = set()
-        self.highest_profit_levels = {}
-        self.last_take_profit_check = 0
-        self.take_profit_cooldown = 60  # 60 seconds between take profit checks
-        self.take_profit_orders = {}  # Track take profit orders
-        self.take_profit_order_id = None  # Track take profit order ID
+        # Take profit tracking - DEPRECATED (replaced with UPNL-based logic)
+        # Legacy variables kept for compatibility - use new UPNL system instead
         
         # Rate limiting parameters - now managed by circuit breaker in Thalex client
         self.max_requests_per_minute = BOT_CONFIG["connection"]["rate_limit"]
@@ -401,6 +396,117 @@ class AvellanedaQuoter:
             else:
                 # Partial recovery - still in recovery mode but allow some trading
                 self.logger.info(f"PARTIAL RECOVERY: Limited trading resumed (step {self.recovery_step})")
+
+    def _get_current_upnl(self) -> float:
+        """Extract UPNL from position data"""
+        try:
+            # Get position metrics from position tracker
+            metrics = self.position_tracker.get_position_metrics()
+            upnl = metrics.get("unrealized_pnl", 0.0)
+            
+            # Alternative: Get from position data if available
+            if hasattr(self, 'position') and self.position:
+                upnl = getattr(self.position, 'unrealized_pnl', upnl)
+                
+            # Alternative: Calculate from mark price if needed
+            if upnl == 0.0 and hasattr(self, 'ticker') and self.ticker:
+                position_size = metrics.get("position", 0.0)
+                entry_price = metrics.get("average_entry_price", 0.0)
+                mark_price = self.ticker.mark_price
+                
+                if position_size != 0 and entry_price > 0 and mark_price > 0:
+                    upnl = position_size * (mark_price - entry_price)
+            
+            return float(upnl)
+            
+        except Exception as e:
+            self.logger.error(f"Error extracting UPNL: {str(e)}")
+            return 0.0
+
+    async def _check_take_profit_conditions(self) -> bool:
+        """Check if take profit conditions are met"""
+        if not RISK_LIMITS.get("take_profit_enabled", True):
+            return False
+            
+        current_time = time.time()
+        
+        # Check cooldown
+        if current_time < self.take_profit_cooldown_until:
+            return False
+            
+        # Check interval
+        if current_time - self.last_take_profit_check < RISK_LIMITS.get("take_profit_check_interval", 5):
+            return False
+            
+        self.last_take_profit_check = current_time
+        
+        # Get current UPNL
+        current_upnl = self._get_current_upnl()
+        self.last_upnl_value = current_upnl
+        
+        # Check threshold
+        take_profit_threshold = RISK_LIMITS.get("take_profit_threshold", 100.0)
+        
+        if current_upnl >= take_profit_threshold:
+            self.logger.info(f"Take profit triggered: UPNL {current_upnl:.2f} >= threshold {take_profit_threshold:.2f}")
+            return True
+            
+        return False
+
+    async def _execute_take_profit_flatten(self):
+        """Execute take profit by flattening position"""
+        try:
+            # Get current position
+            metrics = self.position_tracker.get_position_metrics()
+            position_size = metrics.get("position", 0.0)
+            
+            if abs(position_size) < 0.0001:  # Already flat
+                self.logger.info("Position already flat, take profit action not needed")
+                return True
+                
+            self.logger.critical(f"EXECUTING TAKE PROFIT: Flattening position {position_size:.4f} at UPNL ${self.last_upnl_value:.2f}")
+            
+            # Cancel all existing quotes first
+            await self.cancel_quotes("Take profit execution")
+            await asyncio.sleep(1)  # Brief pause
+            
+            # Determine market order side and size
+            if position_size > 0:
+                # Long position - sell to flatten
+                order_side = "sell"
+                order_size = abs(position_size)
+            else:
+                # Short position - buy to flatten
+                order_side = "buy"
+                order_size = abs(position_size)
+                
+            # Place market order to flatten
+            if hasattr(self, 'order_manager') and self.order_manager:
+                # Use None for price to indicate market order
+                order_result = await self.order_manager.place_order(
+                    instrument=self.perp_name,
+                    direction=order_side,
+                    price=None,  # Market order
+                    amount=order_size,
+                    label="TakeProfit",
+                    post_only=False  # Market orders can't be post-only
+                )
+                self.logger.info(f"Take profit market order placed: {order_result}")
+                
+            # Set cooldown
+            self.take_profit_cooldown_until = time.time() + RISK_LIMITS.get("take_profit_cooldown", 30)
+            self.take_profit_active = True
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error executing take profit flatten: {str(e)}")
+            return False
+
+    async def _legacy_take_profit_check(self):
+        """Replaced with simplified UPNL-based logic"""
+        # This method is deprecated - see _check_take_profit_conditions()
+        pass
 
     async def _risk_monitoring_task(self):
         """Periodically checks risk limits, stop-loss, and take-profit conditions."""
@@ -731,6 +837,25 @@ class AvellanedaQuoter:
             else:
                 self.logger.info(f"Futures instrument for P&L monitoring: {self.futures_instrument_name}")
             
+            # NEW: Initialize volume candle buffer for predictive analysis (FIXED)
+            self.logger.info("Initializing volume candle buffer for predictive analysis...")
+            try:
+                self.volume_buffer = VolumeBasedCandleBuffer(
+                    volume_threshold=TRADING_CONFIG["volume_candle"].get("threshold", 1.0),
+                    max_candles=TRADING_CONFIG["volume_candle"].get("max_candles", 100),
+                    max_time_seconds=TRADING_CONFIG["volume_candle"].get("max_time_seconds", 300),
+                    exchange_client=self.thalex,
+                    instrument=self.perp_name,
+                    use_exchange_data=TRADING_CONFIG["volume_candle"].get("use_exchange_data", False),
+                    fetch_interval_seconds=TRADING_CONFIG["volume_candle"].get("fetch_interval_seconds", 60),
+                    lookback_hours=TRADING_CONFIG["volume_candle"].get("lookback_hours", 1)
+                )
+                self.logger.info(f"Volume candle buffer initialized: threshold={self.volume_buffer.volume_threshold}, "
+                               f"max_candles={self.volume_buffer.max_candles}, instrument={self.perp_name}")
+            except Exception as e:
+                self.logger.error(f"Failed to initialize volume candle buffer: {str(e)}")
+                self.volume_buffer = None  # Fallback to None if initialization fails
+            
             # Subscribe to WebSocket topics with retry logic
             self.logger.info("Setting up WebSocket subscriptions...")
             max_sub_attempts = 3
@@ -771,7 +896,8 @@ class AvellanedaQuoter:
                 'status': asyncio.create_task(self.log_status_task()),
                 'profile': asyncio.create_task(self.profile_optimization_task()),
                 'quote': asyncio.create_task(self.quote_task()),
-                'risk_monitor': asyncio.create_task(self._risk_monitoring_task()) # Add new task
+                'risk_monitor': asyncio.create_task(self._risk_monitoring_task()), # Add new task
+                'performance_monitor': asyncio.create_task(self.performance_monitor.start_recording(self)) # Start performance monitoring
             })
             
             # Extra debug logging to track initialization
@@ -835,6 +961,18 @@ class AvellanedaQuoter:
             except Exception as e:
                 self.logger.error(f"Error disconnecting from Thalex: {str(e)}")
             
+            # Close volume candle buffer
+            try:
+                if hasattr(self, 'volume_buffer') and self.volume_buffer:
+                    self.logger.info("Stopping volume candle buffer...")
+                    if hasattr(self.volume_buffer, 'stop'):
+                        self.volume_buffer.stop()
+                    self.logger.info("Volume candle buffer stopped")
+                else:
+                    self.logger.info("No volume buffer to clean up")
+            except Exception as e:
+                self.logger.error(f"Error stopping volume candle buffer: {str(e)}")
+
             # Close shared memory resources
             try:
                 self.logger.info("Cleaning up shared memory resources...")
@@ -2094,6 +2232,7 @@ class AvellanedaQuoter:
             amount = float(trade_data.get('amount', 0))
             direction = trade_data.get('direction', '')
             instrument = trade_data.get('instrument', '')
+            trade_timestamp = int(trade_data.get('timestamp', time.time() * 1000))
             
             # Check validity
             if price <= 0 or amount <= 0 or not direction or not instrument:
@@ -2107,28 +2246,61 @@ class AvellanedaQuoter:
             # Convert direction to is_buy flag
             is_buy = direction.lower() == 'buy'
             
+            # NEW: Update quoter-level volume candle buffer (FIXED)
+            volume_candle_completed = None
+            if self.volume_buffer:
+                try:
+                    # Update volume buffer and check if a candle was completed
+                    volume_candle_completed = self.volume_buffer.update(
+                        price=price, 
+                        volume=amount, 
+                        is_buy=is_buy, 
+                        timestamp=trade_timestamp
+                    )
+                    
+                    if volume_candle_completed:
+                        self.logger.info(f"Volume candle completed: {volume_candle_completed}")
+                        # Get predictive parameters from completed candle
+                        predictions = self.volume_buffer.get_predicted_parameters()
+                        if predictions:
+                            self.logger.info(f"Volume candle predictions: {predictions}")
+                except Exception as e:
+                    self.logger.error(f"Error updating volume candle buffer: {str(e)}")
+            
             # Update market maker's market data
             should_update_grid = self.market_maker.update_market_data(price, amount, is_buy, is_trade=True)
             
             # Update market data buffer with trade
             self.market_data.add_trade(price, amount, is_buy)
             
-            # If the volume candle buffer indicates we should update quotes, do so
-            if should_update_grid:
-                # Get current market conditions
+            # Enhanced quote update logic based on volume candle signals
+            should_update_quotes = should_update_grid or volume_candle_completed is not None
+            
+            if should_update_quotes:
+                # Get current market conditions including volume candle predictions
                 market_conditions = self.get_market_conditions()
                 
-                # Get current ticker data
-                ticker = self.get_current_ticker()
+                # Enhance market conditions with volume candle signals if available
+                if self.volume_buffer and hasattr(self.volume_buffer, 'signals'):
+                    volume_signals = self.volume_buffer.signals
+                    market_conditions.update({
+                        'volume_momentum': volume_signals.get('momentum', 0.0),
+                        'volume_reversal': volume_signals.get('reversal', 0.0),
+                        'volume_volatility': volume_signals.get('volatility', 0.0),
+                        'volume_exhaustion': volume_signals.get('exhaustion', 0.0)
+                    })
+                    self.logger.info(f"Enhanced market conditions with volume signals: momentum={volume_signals.get('momentum', 0.0):.3f}")
                 
-                if ticker:
+                # Get current ticker data
+                if self.ticker:
                     # Generate new quotes based on updated parameters
-                    bid_quotes, ask_quotes = self.market_maker.generate_quotes(ticker, market_conditions)
+                    bid_quotes, ask_quotes = self.market_maker.generate_quotes(self.ticker, market_conditions)
                     
                     # Place the quotes
                     if bid_quotes or ask_quotes:
                         await self.place_quotes(bid_quotes, ask_quotes)
-                        self.logger.info("Updated quotes based on trade-triggered volume candle prediction")
+                        reason = "trade-triggered volume candle prediction" if volume_candle_completed else "market maker trade signal"
+                        self.logger.info(f"Updated quotes based on {reason}")
             
         except Exception as e:
             self.logger.error(f"Error processing trade update: {str(e)}")
@@ -2419,7 +2591,7 @@ class AvellanedaQuoter:
             self.current_quotes = ([], [])
 
     def get_market_conditions(self) -> Dict:
-        """Get the current market conditions from market data buffer"""
+        """Get the current market conditions from market data buffer and volume candle signals"""
         # Check if cached conditions exist and are recent (within last 500ms)
         current_time = time.time()
         if hasattr(self, '_cached_market_conditions') and current_time - getattr(self, '_cached_market_time', 0) < 0.5:
@@ -2438,6 +2610,20 @@ class AvellanedaQuoter:
             "market_impact": market_state.get("market_impact", 0.0)
         }
         
+        # NEW: Integrate volume candle signals into market conditions (FIXED)
+        if self.volume_buffer and hasattr(self.volume_buffer, 'signals'):
+            volume_signals = self.volume_buffer.signals
+            conditions.update({
+                'volume_momentum': volume_signals.get('momentum', 0.0),
+                'volume_reversal': volume_signals.get('reversal', 0.0),
+                'volume_volatility': volume_signals.get('volatility', 0.0),
+                'volume_exhaustion': volume_signals.get('exhaustion', 0.0)
+            })
+            
+            # Enhance traditional volatility with volume signals
+            if volume_signals.get('volatility', 0.0) > 0.5:
+                conditions["volatility"] *= (1.0 + volume_signals['volatility'] * 0.2)  # Up to 20% increase
+                
         # Cache result
         self._cached_market_conditions = conditions
         self._cached_market_time = current_time
@@ -2702,6 +2888,15 @@ class AvellanedaQuoter:
                     self.logger.info(f"In cooldown period - {(self.cooldown_until - current_time):.1f}s remaining")
                     await asyncio.sleep(0.5)
                     continue
+                
+                # Check take profit conditions (NEW UPNL-based logic)
+                if self.active_trading and not self.risk_recovery_mode:
+                    # Check take profit conditions
+                    if await self._check_take_profit_conditions():
+                        await self._execute_take_profit_flatten()
+                        # Brief pause after take profit
+                        await asyncio.sleep(2.0)
+                        continue
                 
                 # Skip if no ticker data
                 if not self.ticker:
