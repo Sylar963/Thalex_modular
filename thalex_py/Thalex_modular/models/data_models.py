@@ -2211,8 +2211,8 @@ class PerpQuoter:
                 amount=amount,
                 price=price,
                 client_order_id=self.client_order_id,
-                id=self.client_order_id,
-                collar="clamp"  # Add collar parameter to handle price limits
+                id=self.client_order_id
+                # No collar parameter needed for non-MM trading
             )
             self.client_order_id += 1
             return True
@@ -2258,7 +2258,7 @@ class PerpQuoter:
                 side_idx = 0 if side == th.Direction.BUY else 1
                 self.orders[side_idx].append(new_order)
                 
-                # Place order with collar parameter
+                # Place order
                 await self.thalex.insert(
                     direction=side,
                     instrument_name=self.perp_name,
@@ -2267,8 +2267,8 @@ class PerpQuoter:
                     post_only=True,
                     label=LABEL,
                     client_order_id=order_id,
-                    id=order_id,
-                    collar="clamp"  # Use clamp mode to handle price limits
+                    id=order_id
+                    # No collar parameter needed for non-MM trading
                 )
                 self.client_order_id += 1
                 
@@ -2870,8 +2870,8 @@ class PerpQuoter:
                 amount=abs(position_size),
                 price=exit_price,
                 client_order_id=self.client_order_id,
-                id=self.client_order_id,
-                collar="clamp"
+                id=self.client_order_id
+                # No collar parameter needed for non-MM trading
             )
             
             self.client_order_id += 1

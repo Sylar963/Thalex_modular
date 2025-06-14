@@ -17,7 +17,7 @@ BOT_CONFIG = {
     # Market parameters
     "market": {
         # Maintain backward compatibility
-        "underlying": "BTC",
+        "underlying": "BTC-25JUL25",
         #"underlying2": "BTC-20JUN25",
         "network": Network.TEST,
         "label": "F",
@@ -29,33 +29,33 @@ BOT_CONFIG = {
         # Avellaneda-Stoikov model parameters
         "avellaneda": {
             # Core model parameters
-            "gamma": 0.2,                  # Risk aversion (reduced from 0.3 for more frequent executions)
+            "gamma": 0.4,                  # Risk aversion (reduced from 0.3 for more frequent executions)
             "kappa": 0.5,                  # Inventory risk factor
             "time_horizon": 3600,          # Time horizon in seconds (1 hour)
             "order_flow_intensity": 2.0,   # Order flow intensity parameter
             
             # Spread management
-            "base_spread": 5.0,            # Base spread in ticks
-            "max_spread": 25.0,            # Maximum spread in ticks
-            "spread_multiplier": 1.0,      # Dynamic spread adjustment factor
-            "base_spread_factor": 1.0,     # Multiplier for the base_spread in optimal spread calculation
-            "market_impact_factor": 0.5,   # Factor for market impact component in spread calculation
-            "inventory_factor": 0.5,       # Factor for inventory component in spread calculation
-            "volatility_multiplier": 0.2,  # Multiplier for volatility component in spread calculation
+            "base_spread": 14.0,            # INCREASED: Base spread in ticks - must cover fees
+            "max_spread": 75.0,            # INCREASED: Maximum spread in ticks
+            "spread_multiplier": 1.2,      # INCREASED: Dynamic spread adjustment factor
+            "base_spread_factor": 1.5,     # INCREASED: Multiplier for the base_spread in optimal spread calculation
+            "market_impact_factor": 0.7,   # INCREASED: Factor for market impact component in spread calculation
+            "inventory_factor": 0.7,       # INCREASED: Factor for inventory component in spread calculation
+            "volatility_multiplier": 0.4,  # INCREASED: Multiplier for volatility component in spread calculation
             
             # Position and inventory management
             "inventory_weight": 0.8,       # Inventory skew factor (increased from 0.7 for better skewing)
             "inventory_cost_factor": 0.0001, # Cost of holding inventory
-            "position_fade_time": 30,     # Time to fade position (seconds)
+            "position_fade_time": 300,     # INCREASED: Time to fade position (seconds) - was 30
             "adverse_selection_threshold": 0.002,  # Adverse selection threshold
             "min_profit_rebalance": 0.01,  # Minimum profit to trigger rebalance
             "max_loss_threshold": 0.03,    # Maximum loss before gradual exit
             
-            # Quote sizing and levels
-            "base_size": 0.05,             # Base quote size increased from 0.01
-            "size_multipliers": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],  # Size multipliers with Fibonacci-like progression
-            "max_levels": 6,              # Maximum number of quote levels (reduced from 21)
-            "level_spacing": 100,          # Base spacing between levels in ticks (increased from 50 to 100)
+            # Quote sizing and levels - REDUCED for profitability
+            "base_size": 0.1,            
+            "size_multipliers": [1.0, 1.5, 2.0, 2.5, 3.0],  # REDUCED: Less aggressive size progression
+            "max_levels": 3,               # REDUCED: Maximum number of quote levels - was 6
+            "level_spacing": 150,          # INCREASED: Base spacing between levels in ticks - was 100
             "vamp_spread_sensitivity": 0.5,  # Sensitivity of spread to VAMP impact
             "vamp_skew_sensitivity": 0.001,  # Sensitivity of quote skew to VAMP impact
             # Predictive adjustment thresholds
@@ -69,22 +69,22 @@ BOT_CONFIG = {
         # Order execution parameters
         "execution": {
             "post_only": True,             # Use post-only orders
-            "min_size": 0.05,             # Minimum quote size
-            "max_size": 5.0,               # Maximum quote size
-            "size_increment": 0.2,       # Size increment
-            "price_decimals": 2,           # Price decimal places
-            "size_decimals": 2,            # Size decimal places
-            "max_retries": 2,              # Maximum retry attempts
+            "min_size": 0.1,              # CORRECTED: Minimum order size for BTC futures (0.1 BTC)
+            "max_size": 5.0,              # Maximum quote size
+            "size_increment": 0.001,      # CORRECTED: Volume tick size for BTC futures (0.001 BTC)
+            "price_decimals": 0,          # CORRECTED: Price in whole USD (no decimals)
+            "size_decimals": 3,           # CORRECTED: Size decimals for 0.001 BTC increments
+            "max_retries": 2,             # Maximum retry attempts
         },
         
         # Quote management
         "quote_timing": {
-            "min_interval": 5.0,           # Minimum time between quotes
-            "max_lifetime": 10,             # Maximum quote lifetime in seconds (reduced from 10 to 5)
-            "operation_interval": 0.2,     # Time between order operations
-            "max_pending": 9,              # Maximum concurrent operations
-            "grid_update_interval": 5.0,   # Interval for updating quote grid based on market data
-            "position_check_interval": 2.0 # Interval for position-based quote updates
+            "min_interval": 8.0,           # INCREASED: Minimum time between quotes - was 5.0
+            "max_lifetime": 60,             # INCREASED: Maximum quote lifetime in seconds - was 10
+            "operation_interval": 0.5,     # INCREASED: Time between order operations - was 0.2
+            "max_pending": 6,              # REDUCED: Maximum concurrent operations - was 9
+            "grid_update_interval": 10.0,   # INCREASED: Interval for updating quote grid - was 5.0
+            "position_check_interval": 5.0 # INCREASED: Interval for position-based quote updates - was 2.0
         },
         
         # Market impact and cancellation
@@ -117,18 +117,18 @@ BOT_CONFIG = {
     
     # Orderbook specific parameters
     "orderbook": {
-        "min_spread": 15,                # Minimum spread in ticks
-        "base_order_size": 0.05,        # Base order size for quoting
-        "min_order_size": 0.02,        # Absolute minimum order size
-        "levels": 6,                    # Number of order book levels for quoting logic
-        "bid_step": 10,                 # Default step for placing bid orders (in ticks)
-        "ask_step": 10,                 # Default step for placing ask orders (in ticks)
-        "min_size": 0.1,              # Minimum size for individual orders (used by AMM)
-        "quote_lifetime": 30,           # Max lifetime for quotes in seconds
-        "amend_threshold": 25,          # Price movement (in ticks) to trigger quote amendment
-        "min_quote_interval": 2.0,      # Minimum interval between quote updates in seconds
-        "bid_sizes": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], # Size multipliers for bid side levels
-        "ask_sizes": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]  # Size multipliers for ask side levels (mirrors bid_sizes)
+        "min_spread": 14,                # INCREASED: Minimum spread in ticks - CRITICAL for profitability
+        "base_order_size": 0.02,        # REDUCED: Base order size for quoting - was 0.05
+        "min_order_size": 0.01,        # REDUCED: Absolute minimum order size - was 0.02
+        "levels": 3,                    # REDUCED: Number of order book levels for quoting logic - was 6
+        "bid_step": 15,                 # INCREASED: Default step for placing bid orders (in ticks) - was 10
+        "ask_step": 15,                 # INCREASED: Default step for placing ask orders (in ticks) - was 10
+        "min_size": 0.05,              # REDUCED: Minimum size for individual orders (used by AMM) - was 0.1
+        "quote_lifetime": 45,           # INCREASED: Max lifetime for quotes in seconds - was 30
+        "amend_threshold": 35,          # INCREASED: Price movement (in ticks) to trigger quote amendment - was 25
+        "min_quote_interval": 3.0,      # INCREASED: Minimum interval between quote updates in seconds - was 2.0
+        "bid_sizes": [1.0, 1.5, 2.0], # REDUCED: Size multipliers for bid side levels
+        "ask_sizes": [1.0, 1.5, 2.0]  # REDUCED: Size multipliers for ask side levels
     },
     
     # Risk management
@@ -151,30 +151,30 @@ BOT_CONFIG = {
         
         # Risk recovery system
         "recovery_enabled": True,              # Enable recovery mechanism
-        "recovery_cooldown_seconds": 300,      # 5 minutes cooldown after breach
+        "recovery_cooldown_seconds": 9,      # 5 minutes cooldown after breach
         "recovery_check_interval": 30,         # Check recovery conditions every 30s
         "risk_recovery_threshold": 0.8,        # Resume at 80% of risk limits
         "gradual_recovery_steps": 3,           # Number of steps to full recovery
         
         # UPNL Take Profit Configuration
         "take_profit_enabled": True,           # Enable UPNL-based take profit
-        "take_profit_threshold": 2.0,        # Take profit at $100 UPNL
-        "take_profit_check_interval": 1,       # Check every 5 seconds
+        "take_profit_threshold": 5.0,        # INCREASED: Take profit at $5 UPNL - was 2.0
+        "take_profit_check_interval": 2,       # INCREASED: Check every 2 seconds - was 1
         "flatten_position_enabled": True,       # Allow position flattening
-        "take_profit_cooldown": 1,            # 30 second cooldown after take profit
+        "take_profit_cooldown": 3,            # INCREASED: 3 second cooldown after take profit - was 1
     },
     
     # Portfolio-wide take profit configuration
     "portfolio_take_profit": {
         "enable_portfolio_tp": True,         # Master enable/disable
-        "min_profit_usd": 1.1,              # Minimum profit threshold in USD
+        "min_profit_usd": 3.0,              # INCREASED: Minimum profit threshold in USD - was 1.1
         "profit_after_fees": True,          # Whether threshold applies after fees
-        "check_interval_seconds": 2.0,       # How often to check portfolio P&L
+        "check_interval_seconds": 3.0,       # INCREASED: How often to check portfolio P&L - was 2.0
         "max_position_age_hours": 24,        # Maximum time to hold positions
-        "emergency_close_threshold": -10.0,  # Emergency close if loss exceeds this
-        "partial_profit_threshold": 0.5,     # Take partial profits at this level
+        "emergency_close_threshold": -15.0,  # INCREASED: Emergency close if loss exceeds this - was -10.0
+        "partial_profit_threshold": 1.0,     # INCREASED: Take partial profits at this level - was 0.5
         "position_correlation_check": True,  # Monitor position correlation
-        "fee_estimation_buffer": 1.1        # Multiply estimated fees by this factor
+        "fee_estimation_buffer": 1.2        # INCREASED: Multiply estimated fees by this factor - was 1.1
     },
     
     # Trading fees configuration
@@ -182,7 +182,10 @@ BOT_CONFIG = {
         "maker_fee_rate": 0.0002,    # 0.02% for maker orders
         "taker_fee_rate": 0.0005,    # 0.05% for taker orders  
         "minimum_fee_usd": 0.0001,   # Minimum fee per trade
-        "fee_estimation_buffer": 1.1 # Safety buffer for fee estimates
+        "fee_estimation_buffer": 1.1, # Safety buffer for fee estimates
+        "profit_margin_rate": 0.0005, # ADDED: Minimum profit margin above fees (0.05%)
+        "fee_coverage_multiplier": 1.2, # ADDED: Multiplier for fee coverage (20% safety margin)
+        "min_profit_per_trade_pct": 0.001, # ADDED: Minimum profit per trade (0.1%)
     },
 
     # Hedging configuration

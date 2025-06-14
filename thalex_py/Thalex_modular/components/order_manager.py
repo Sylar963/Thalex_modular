@@ -123,10 +123,10 @@ class OrderManager:
             # Get next order ID
             order_id = await self.get_next_order_id()
             
-            # Validate amount is not too small
-            if amount < 0.001:
-                self.logger.warning(f"Order amount {amount} is below minimum. Rounding to 0.001")
-                amount = 0.001
+            # Validate amount is not too small for futures
+            if amount < 0.1:
+                self.logger.warning(f"Order amount {amount} is below BTC futures minimum (0.1 BTC). Rounding to 0.1")
+                amount = 0.1
             
             # Check for market order (price is None)
             is_market_order = price is None
@@ -147,7 +147,7 @@ class OrderManager:
             
             # Align price and amount to tick size
             aligned_price = self.round_to_tick(price) if not is_market_order else price
-            aligned_amount = round(amount / 0.001) * 0.001  # Align to 0.001 tick size
+            aligned_amount = round(amount / 0.001) * 0.001  # Align to 0.001 BTC volume tick size for futures
             
             # Create order object
             order = Order(
@@ -184,8 +184,8 @@ class OrderManager:
                         client_order_id=order_id,
                         id=order_id,
                         label=label,
-                        post_only=False,  # Can't be post-only
-                        collar="none"     # No price protection for market orders
+                        post_only=False  # Can't be post-only
+                        # No collar parameter needed for non-MM trading
                     )
                 else:
                     self.logger.info(
@@ -201,8 +201,8 @@ class OrderManager:
                         client_order_id=order_id,
                         id=order_id,
                         label=label,
-                        post_only=post_only,
-                        collar="clamp"
+                        post_only=post_only
+                        # No collar parameter needed for non-MM trading
                     )
                 
                 return order_id

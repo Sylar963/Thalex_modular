@@ -1,0 +1,287 @@
+import numpy as np
+from typing import Dict, List, Optional, Tuple, NamedTuple
+import time
+from collections import deque
+import math
+
+from ..config.market_config import TRADING_CONFIG, RISK_LIMITS, ORDERBOOK_CONFIG
+from ..models.data_models import Ticker, Quote
+from ..models.position_tracker import PositionTracker, Fill
+from ..thalex_logging import LoggerFactory
+
+# Pre-computed constants for performance
+SQRT_2PI = math.sqrt(2 * math.pi)
+LOG_FREQ = 0.01  # Log only 1% of operations
+
+class OptimizedAvellanedaMarketMaker:
+    """
+    High-frequency optimized Avellaneda-Stoikov market maker
+    Focused on minimal latency and computational overhead
+    """
+    
+    __slots__ = [
+        'logger', 'exchange_client', 'position_tracker', 'instrument',
+        'gamma', 'kappa', 'volatility', 'tick_size', 'time_horizon',
+        'last_mid_price', 'last_quote_time', 'quote_count',
+        'position_limit', 'inventory_weight', 'base_spread_factor',
+        'min_spread', 'quote_levels', 'current_quotes',
+        # Pre-allocated arrays for performance
+        '_bid_prices', '_ask_prices', '_bid_sizes', '_ask_sizes',
+        # Cached calculations
+        '_cached_spread', '_cached_mid', '_cache_time',
+        # Simple VAMP tracking
+        '_vwap_sum', '_volume_sum', '_last_vamp_update'
+    ]
+    
+    def __init__(self, exchange_client=None, position_tracker: PositionTracker = None):
+        # Core components only
+        self.logger = LoggerFactory.configure_component_logger(
+            "optimized_mm", log_file="mm_opt.log", high_frequency=True
+        )
+        
+        self.exchange_client = exchange_client
+        self.position_tracker = position_tracker
+        self.instrument = None
+        
+        # Core Avellaneda parameters
+        config = TRADING_CONFIG["avellaneda"]
+        self.gamma = config["gamma"]
+        self.kappa = config["kappa"] 
+        self.volatility = TRADING_CONFIG["volatility"]["default"]
+        self.tick_size = 1.0
+        self.time_horizon = config["time_horizon"]
+        self.position_limit = config["position_limit"]
+        self.inventory_weight = config["inventory_weight"]
+        self.base_spread_factor = config.get("base_spread_factor", 1.0)
+        
+        # Quote parameters
+        self.quote_levels = TRADING_CONFIG["quoting"]["levels"]
+        self.min_spread = ORDERBOOK_CONFIG["min_spread"]
+        
+        # State tracking
+        self.last_mid_price = 0.0
+        self.last_quote_time = 0.0
+        self.quote_count = 0
+        self.current_quotes = ([], [])  # (bids, asks)
+        
+        # Pre-allocated arrays (avoid malloc in hot path)
+        max_levels = min(self.quote_levels, 10)  # Cap at 10 levels
+        self._bid_prices = np.zeros(max_levels, dtype=np.float64)
+        self._ask_prices = np.zeros(max_levels, dtype=np.float64)
+        self._bid_sizes = np.zeros(max_levels, dtype=np.float64)
+        self._ask_sizes = np.zeros(max_levels, dtype=np.float64)
+        
+        # Simple caching (avoid recalculation)
+        self._cached_spread = 0.0
+        self._cached_mid = 0.0
+        self._cache_time = 0.0
+        
+        # Simplified VAMP (no complex analysis)
+        self._vwap_sum = 0.0
+        self._volume_sum = 0.0
+        self._last_vamp_update = 0.0
+        
+        # Reduced logging
+        if np.random.random() < LOG_FREQ:
+            self.logger.info("Optimized Avellaneda MM initialized")
+
+    def set_tick_size(self, tick_size: float):
+        """Set tick size with validation"""
+        self.tick_size = max(tick_size, 0.01)  # Ensure positive
+        
+    def set_instrument(self, instrument: str):
+        """Set trading instrument"""
+        self.instrument = instrument
+
+    def update_market_data(self, price: float, volume: float = 0, is_buy: Optional[bool] = None) -> bool:
+        """
+        Optimized market data update - minimal processing
+        Returns True if quotes should be updated
+        """
+        current_time = time.time()
+        
+        # Simple price tracking
+        if price > 0:
+            self.last_mid_price = price
+            
+        # Simplified VAMP update (only when needed)
+        if volume > 0 and current_time - self._last_vamp_update > 1.0:  # Max 1Hz VAMP updates
+            self._vwap_sum += price * volume
+            self._volume_sum += volume
+            self._last_vamp_update = current_time
+            
+        # Simple quote update decision
+        return self._should_update_quotes_fast(current_time)
+    
+    def _should_update_quotes_fast(self, current_time: float) -> bool:
+        """Fast quote update decision with minimal checks"""
+        # Time-based update (primary trigger)
+        if current_time - self.last_quote_time > 2.0:  # 2 second max
+            return True
+            
+        # Price movement check (cached)
+        if abs(self.last_mid_price - self._cached_mid) / self._cached_mid > 0.001:  # 0.1%
+            return True
+            
+        return False
+
+    def generate_quotes(self, ticker: Ticker, market_conditions: Dict) -> Tuple[List[Quote], List[Quote]]:
+        """
+        Optimized quote generation with pre-allocated arrays and minimal calculations
+        """
+        current_time = time.time()
+        
+        # Fast validation
+        if not (ticker.best_bid_price and ticker.best_ask_price):
+            return [], []
+            
+        mid_price = (ticker.best_bid_price + ticker.best_ask_price) / 2
+        if mid_price <= 0:
+            return [], []
+            
+        # Update cache
+        self._cached_mid = mid_price
+        self._cache_time = current_time
+        
+        # Fast spread calculation (simplified Avellaneda)
+        spread = self._calculate_fast_spread(mid_price)
+        
+        # Fast inventory skew
+        position_ratio = self.position_tracker.current_position / self.position_limit
+        inventory_skew = position_ratio * spread * 0.1  # Simplified skew
+        
+        # Calculate base prices
+        half_spread = spread * 0.5
+        base_bid = self._round_to_tick(mid_price - half_spread - inventory_skew)
+        base_ask = self._round_to_tick(mid_price + half_spread - inventory_skew)
+        
+        # Generate levels using pre-allocated arrays
+        levels_to_create = min(self.quote_levels, len(self._bid_prices))
+        
+        bid_quotes = []
+        ask_quotes = []
+        
+        # Pre-computed level multipliers (avoid calculation in loop)
+        level_multipliers = [1.0, 1.5, 2.2, 3.4, 5.1, 7.8, 12.0, 18.5, 28.5, 44.0]
+        
+        base_size = ORDERBOOK_CONFIG.get("base_order_size", 0.01)
+        step_size = self.tick_size * 10
+        
+        # Fast quote generation loop
+        for i in range(levels_to_create):
+            if i < len(level_multipliers):
+                multiplier = level_multipliers[i]
+            else:
+                multiplier = level_multipliers[-1] * (1.6 ** (i - len(level_multipliers) + 1))
+                
+            # Calculate prices
+            bid_offset = step_size * multiplier
+            ask_offset = step_size * multiplier
+            
+            self._bid_prices[i] = self._round_to_tick(base_bid - bid_offset)
+            self._ask_prices[i] = self._round_to_tick(base_ask + ask_offset)
+            
+            # Simple size scaling
+            size_factor = max(0.3, 1.0 - (i * 0.15))  # Decreasing size with level
+            self._bid_sizes[i] = base_size * size_factor
+            self._ask_sizes[i] = base_size * size_factor
+            
+            # Create quotes (only if position allows)
+            if self._can_buy():
+                bid_quotes.append(Quote(
+                    instrument=self.instrument,
+                    side="buy", 
+                    price=self._bid_prices[i],
+                    amount=self._bid_sizes[i],
+                    timestamp=current_time
+                ))
+                
+            if self._can_sell():
+                ask_quotes.append(Quote(
+                    instrument=self.instrument,
+                    side="sell",
+                    price=self._ask_prices[i], 
+                    amount=self._ask_sizes[i],
+                    timestamp=current_time
+                ))
+        
+        self.last_quote_time = current_time
+        self.quote_count += 1
+        
+        # Minimal logging
+        if np.random.random() < LOG_FREQ:
+            self.logger.info(f"Generated {len(bid_quotes)}B/{len(ask_quotes)}A @ {mid_price:.2f}")
+            
+        return bid_quotes, ask_quotes
+
+    def _calculate_fast_spread(self, mid_price: float) -> float:
+        """Fast spread calculation with minimal Avellaneda components"""
+        # Base spread from tick size
+        min_spread = self.min_spread * self.tick_size
+        
+        # Simplified volatility component
+        vol_component = self.volatility * 0.2 * math.sqrt(self.time_horizon)
+        
+        # Simple gamma component  
+        gamma_component = self.gamma * (1.0 + abs(self.position_tracker.current_position) / self.position_limit)
+        
+        # Combined spread
+        spread = (min_spread + vol_component) * gamma_component * self.base_spread_factor
+        
+        return max(min_spread, spread)
+
+    def _can_buy(self) -> bool:
+        """Fast position check for buying"""
+        return self.position_tracker.current_position < self.position_limit * 0.95
+        
+    def _can_sell(self) -> bool:  
+        """Fast position check for selling"""
+        return self.position_tracker.current_position > -self.position_limit * 0.95
+
+    def _round_to_tick(self, price: float) -> float:
+        """Fast tick rounding"""
+        return round(price / self.tick_size) * self.tick_size
+
+    def on_order_filled(self, order_id: str, fill_price: float, fill_size: float, is_buy: bool):
+        """Optimized fill processing"""
+        try:
+            # Create fill and update position
+            fill = Fill(
+                order_id=order_id,
+                fill_price=fill_price, 
+                fill_size=fill_size,
+                fill_time=time.time(),
+                side="buy" if is_buy else "sell",
+                is_maker=True
+            )
+            
+            self.position_tracker.update_on_fill(fill)
+            
+            # Simple VAMP update
+            self._vwap_sum += fill_price * fill_size
+            self._volume_sum += fill_size
+            
+            # Minimal logging
+            if np.random.random() < LOG_FREQ * 10:  # 10x more frequent for fills
+                self.logger.info(f"Fill: {fill_size:.3f}@{fill_price:.2f} {'BUY' if is_buy else 'SELL'}")
+                
+        except Exception as e:
+            self.logger.error(f"Fill processing error: {e}")
+
+    def get_position_metrics(self) -> Dict:
+        """Fast metrics calculation"""
+        vwap = self._vwap_sum / self._volume_sum if self._volume_sum > 0 else 0
+        
+        return {
+            'position': self.position_tracker.current_position,
+            'entry_price': self.position_tracker.average_entry_price,
+            'realized_pnl': self.position_tracker.realized_pnl,
+            'unrealized_pnl': self.position_tracker.unrealized_pnl,
+            'vwap': vwap,
+            'quote_count': self.quote_count
+        }
+
+    def cleanup(self):
+        """Minimal cleanup"""
+        if np.random.random() < LOG_FREQ:
+            self.logger.info("Cleanup complete") 

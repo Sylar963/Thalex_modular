@@ -13,12 +13,34 @@ from ..models.position_tracker import PositionTracker, Fill
 from ..thalex_logging import LoggerFactory
 from ..ringbuffer.volume_candle_buffer import VolumeBasedCandleBuffer
 
-# Constants
+# Constants - Pre-computed for performance
 DEFAULT_RESERVATION_PRICE_BOUND = TRADING_CONFIG["avellaneda"].get("reservation_price_bound", 0.005)
 MIN_SPREAD_TICK_MULTIPLIER = 2  # Minimum spread as a multiple of tick size
+SQRT_2PI = math.sqrt(2 * math.pi)  # Pre-computed constant
+LOG_SAMPLING_RATE = 0.05  # Log only 5% of operations for performance
 
 class AvellanedaMarketMaker:
     """Avellaneda-Stoikov market making strategy implementation"""
+    
+    # Use __slots__ for memory efficiency while maintaining all functionality
+    __slots__ = [
+        'logger', 'exchange_client', 'position_tracker', 'gamma', 'k_default', 'kappa',
+        'volatility', 'tick_size', 'time_horizon', 'reservation_price_offset',
+        'quote_count', 'quote_levels', 'instrument', 'last_mid_price', 'last_update_time',
+        'volatility_grid', 'price_history', 'vamp_window', 'vamp_aggressive_window',
+        'vamp_buy_volume', 'vamp_sell_volume', 'vamp_value', 'vamp_impact', 'vamp_impact_window',
+        'volume_buffer', 'predictive_adjustments', 'last_prediction_time', 'prediction_interval',
+        'last_grid_update_time', 'grid_update_interval', 'force_grid_update',
+        'inventory_weight', 'position_fade_time', 'order_flow_intensity', 'position_limit',
+        'base_spread_factor', 'market_impact_factor', 'inventory_factor', 'volatility_multiplier',
+        'market_state', 'last_quote_time', 'min_tick', 'last_position_check', 'last_quote_update',
+        'vwap', 'total_volume', 'volume_price_sum', 'market_buys_volume', 'market_sells_volume',
+        'aggressive_buys_sum', 'aggressive_sells_sum', 'market_impact', 'active_quotes',
+        'current_bid_quotes', 'current_ask_quotes', 'hedge_manager', 'use_hedging',
+        # Performance optimization caches
+        '_cached_spread', '_cached_mid_price', '_cached_volatility_factor', '_cache_timestamp',
+        '_log_counter', '_last_major_log'
+    ]
     
     def __init__(self, exchange_client=None, position_tracker: PositionTracker = None):
         # Initialize logger
@@ -136,6 +158,14 @@ class AvellanedaMarketMaker:
         self.hedge_manager = None
         self.use_hedging = False  # Always disable hedging
         
+        # Performance optimization: Initialize caches
+        self._cached_spread = 0.0
+        self._cached_mid_price = 0.0
+        self._cached_volatility_factor = 1.0
+        self._cache_timestamp = 0.0
+        self._log_counter = 0
+        self._last_major_log = 0.0
+
         # Skip the hedge manager initialization to avoid the exchange_api_key error
         if False and self.use_hedging:  # Force this to never execute
             from .hedge import create_hedge_manager
@@ -155,7 +185,9 @@ class AvellanedaMarketMaker:
             self.hedge_manager.start()
             self.logger.info("Hedge manager initialized and started")
         else:
-            self.logger.info("Hedging is disabled")
+            # Only log occasionally to reduce overhead
+            if random.random() < LOG_SAMPLING_RATE:
+                self.logger.info("Hedging is disabled")
 
     def set_tick_size(self, tick_size: float):
         """Set the tick size for the instrument"""
@@ -171,10 +203,11 @@ class AvellanedaMarketMaker:
     
     def update_vamp(self, price: float, volume: float, is_buy: bool, is_aggressive: bool=False):
         """Update Volume-Adjusted Market Price calculations"""
-        # Log entry
-        side_str = "BUY" if is_buy else "SELL"
-        agg_str = "aggressive" if is_aggressive else "passive"
-        self.logger.debug(f"Updating VAMP with {side_str} {volume:.6f} @ {price:.2f} ({agg_str})")
+        # Performance: Only log occasionally to reduce overhead
+        if random.random() < LOG_SAMPLING_RATE:
+            side_str = "BUY" if is_buy else "SELL"
+            agg_str = "aggressive" if is_aggressive else "passive"
+            self.logger.debug(f"Updating VAMP with {side_str} {volume:.6f} @ {price:.2f} ({agg_str})")
         
         # Save old values for comparison
         old_vwap = getattr(self, 'vwap', 0)
@@ -185,7 +218,9 @@ class AvellanedaMarketMaker:
         self.total_volume += volume
         if self.total_volume > 0:
             self.vwap = self.volume_price_sum / self.total_volume
-            self.logger.debug(f"VWAP updated: {old_vwap:.2f} → {self.vwap:.2f} (Δ: {self.vwap - old_vwap:+.2f})")
+            # Performance: Only log VWAP updates occasionally
+            if random.random() < LOG_SAMPLING_RATE:
+                self.logger.debug(f"VWAP updated: {old_vwap:.2f} → {self.vwap:.2f} (Δ: {self.vwap - old_vwap:+.2f})")
         
         # Update aggressive volume tracking with detailed logging
         if is_aggressive:
@@ -193,12 +228,16 @@ class AvellanedaMarketMaker:
                 old_buys = self.market_buys_volume
                 self.market_buys_volume += volume
                 self.aggressive_buys_sum += price * volume
-                self.logger.debug(f"Aggressive buys: {old_buys:.6f} → {self.market_buys_volume:.6f} (Δ: +{volume:.6f})")
+                # Performance: Only log occasionally
+                if random.random() < LOG_SAMPLING_RATE:
+                    self.logger.debug(f"Aggressive buys: {old_buys:.6f} → {self.market_buys_volume:.6f} (Δ: +{volume:.6f})")
             else:
                 old_sells = self.market_sells_volume
                 self.market_sells_volume += volume
                 self.aggressive_sells_sum += price * volume
-                self.logger.debug(f"Aggressive sells: {old_sells:.6f} → {self.market_sells_volume:.6f} (Δ: +{volume:.6f})")
+                # Performance: Only log occasionally
+                if random.random() < LOG_SAMPLING_RATE:
+                    self.logger.debug(f"Aggressive sells: {old_sells:.6f} → {self.market_sells_volume:.6f} (Δ: +{volume:.6f})")
             
             # Record impact in the impact window for time-weighted impact decay
             current_time = time.time()
@@ -319,6 +358,13 @@ class AvellanedaMarketMaker:
         Returns:
             float: Optimal spread in USDC
         """
+        # Performance: Check cache first to avoid expensive recalculation
+        current_time = time.time()
+        if (current_time - self._cache_timestamp < 0.1 and  # Cache valid for 100ms
+            abs(market_impact) < 0.001 and  # Market impact hasn't changed significantly
+            self._cached_spread > 0):  # Have valid cached value
+            return self._cached_spread
+            
         try:
             # Start with a minimum spread baseline based on tick size
             min_spread_ticks = ORDERBOOK_CONFIG["min_spread"]
@@ -329,6 +375,33 @@ class AvellanedaMarketMaker:
                 self.tick_size = 1.0
                 
             min_spread = min_spread_ticks * self.tick_size
+            
+            # CRITICAL: Calculate minimum spread needed to cover fees with profit margin
+            # For roundtrip trading (buy then sell), we need to cover both legs
+            trading_fees_config = TRADING_CONFIG.get("trading_fees", {})
+            maker_fee_rate = trading_fees_config.get("maker_fee_rate", 0.0002)  # 0.02%
+            profit_margin_rate = trading_fees_config.get("profit_margin_rate", 0.0005)  # 0.05%
+            fee_coverage_multiplier = trading_fees_config.get("fee_coverage_multiplier", 1.2)  # 20% safety margin
+            
+            # Calculate minimum spread needed for profitability
+            # For $84,000 BTC: 0.02% fee = $16.8 per trade, roundtrip = $33.6
+            # Plus 0.05% profit margin = $42 per trade, total min spread = $75.6
+            if hasattr(self, 'last_mid_price') and self.last_mid_price > 0:
+                reference_price = self.last_mid_price
+            else:
+                reference_price = 84000  # Fallback estimate for BTC
+                
+            # Calculate fee-based minimum spread (roundtrip cost + profit margin + safety buffer)
+            fee_based_min_spread = reference_price * (maker_fee_rate * 2 + profit_margin_rate) * fee_coverage_multiplier
+            
+            # Ensure our minimum spread covers fees
+            fee_coverage_spread = max(min_spread, fee_based_min_spread)
+            
+            self.logger.debug(f"Fee calculations: reference_price={reference_price:.2f}, "
+                             f"fee_min_spread=${fee_based_min_spread:.2f}, "
+                             f"config_min_spread=${min_spread:.2f}, "
+                             f"final_fee_coverage=${fee_coverage_spread:.2f}, "
+                             f"coverage_multiplier={fee_coverage_multiplier:.2f}")
             
             # Get volatility with safety fallback, ensure minimum is reasonable
             volatility = max(self.volatility, 0.01)  # At least 1% volatility
@@ -436,7 +509,7 @@ class AvellanedaMarketMaker:
                 market_state_factor = 0.85
             
             # Calculate raw optimal spread
-            base_spread = self.base_spread_factor * min_spread
+            base_spread = self.base_spread_factor * fee_coverage_spread  # CHANGED: Use fee-coverage spread as base
             optimal_spread = (
                 base_spread * gamma_component +
                 volatility_component +
@@ -444,25 +517,33 @@ class AvellanedaMarketMaker:
                 inventory_component
             ) * market_state_factor
             
-            # Ensure minimum spread
-            final_spread = max(optimal_spread, min_spread)
+            # Ensure minimum spread covers fees (CRITICAL)
+            final_spread = max(optimal_spread, fee_coverage_spread)
             
-            # Log spread calculation components for debugging
-            if random.random() < 0.05:  # Log occasionally to avoid spam
+            # Performance: Cache the result and update timestamp
+            self._cached_spread = final_spread
+            self._cache_timestamp = current_time
+            
+            # Log spread calculation components for debugging - reduced frequency
+            if random.random() < LOG_SAMPLING_RATE:  # Use consistent sampling rate
                 self.logger.info(
-                    f"Spread calc: base={base_spread:.2f}, volatility={volatility_component:.2f}, "
-                    f"impact_arg={market_impact_arg:.2f}, vamp_effect={vamp_effect_on_spread:.2f}, effective_impact_comp={market_impact_component:.2f}, "
-                    f"inventory={inventory_component:.2f}, market_state_factor={market_state_factor:.2f}, final={final_spread:.2f}"
+                    f"Spread calc: fee_coverage=${fee_coverage_spread:.2f}, base={base_spread:.2f}, "
+                    f"volatility={volatility_component:.2f}, impact_comp={market_impact_component:.2f}, "
+                    f"inventory={inventory_component:.2f}, market_state_factor={market_state_factor:.2f}, "
+                    f"final=${final_spread:.2f}"
                 )
                 
             return final_spread
         except Exception as e:
             self.logger.error(f"Error calculating optimal spread: {str(e)}", exc_info=True)
-            # Return safe default spread on error
-            min_spread_ticks = ORDERBOOK_CONFIG.get("min_spread", 5)
+            # Return safe default spread on error that covers fees
+            maker_fee_rate = TRADING_CONFIG.get("trading_fees", {}).get("maker_fee_rate", 0.0002)
+            reference_price = 84000  # Safe fallback for BTC
+            fee_based_fallback = reference_price * (maker_fee_rate * 2 + 0.0005)  # Fees + margin
+            min_spread_ticks = ORDERBOOK_CONFIG.get("min_spread", 35)
             if self.tick_size <= 0:
                 self.tick_size = 1.0
-            return min_spread_ticks * self.tick_size
+            return max(min_spread_ticks * self.tick_size, fee_based_fallback)
 
     def calculate_skewed_prices(self, mid_price: float, spread: float) -> Tuple[float, float]:
         """Calculate skewed bid and ask prices based on inventory"""
@@ -647,8 +728,9 @@ class AvellanedaMarketMaker:
             # Extract ticker data
             timestamp = getattr(ticker, 'timestamp', time.time())
             
-            # Debug: Log all ticker attributes
-            self.logger.debug(f"Ticker data: {vars(ticker) if hasattr(ticker, '__dict__') else 'No ticker data'}")
+            # Performance: Only debug log occasionally to reduce overhead
+            if random.random() < LOG_SAMPLING_RATE:
+                self.logger.debug(f"Ticker data: {vars(ticker) if hasattr(ticker, '__dict__') else 'No ticker data'}")
             
             mark_price = getattr(ticker, 'mark_price', 0)
             if mark_price <= 0:
@@ -673,7 +755,12 @@ class AvellanedaMarketMaker:
                 self.logger.error(f"Calculated mid_price ({mid_price}) is invalid. Cannot generate quotes.")
                 return [], []
             
-            self.logger.debug(f"Using BBO for mid_price: bid={bid_price}, ask={ask_price}, mid={mid_price}")
+            # Performance: Cache mid price for future use
+            self._cached_mid_price = mid_price
+            
+            # Performance: Only debug log occasionally
+            if random.random() < LOG_SAMPLING_RATE:
+                self.logger.debug(f"Using BBO for mid_price: bid={bid_price}, ask={ask_price}, mid={mid_price}")
             
             # Update market mid price
             self.last_mid_price = mid_price
@@ -681,9 +768,12 @@ class AvellanedaMarketMaker:
             # Extract volatility and volume candle signals
             try:
                 volatility = market_conditions.get("volatility", self.volatility)
-                self.logger.debug(f"Extracted volatility: {volatility}")
                 market_impact = market_conditions.get("market_impact", 0.0)
-                self.logger.debug(f"Extracted market_impact: {market_impact}")
+                
+                # Performance: Only debug log occasionally
+                if random.random() < LOG_SAMPLING_RATE:
+                    self.logger.debug(f"Extracted volatility: {volatility}")
+                    self.logger.debug(f"Extracted market_impact: {market_impact}")
                 
                 # NEW: Extract volume candle signals for enhanced quote generation (FIXED)
                 volume_momentum = market_conditions.get("volume_momentum", 0.0)
@@ -691,7 +781,9 @@ class AvellanedaMarketMaker:
                 volume_volatility = market_conditions.get("volume_volatility", 0.0)
                 volume_exhaustion = market_conditions.get("volume_exhaustion", 0.0)
                 
-                if any(abs(sig) > 0.1 for sig in [volume_momentum, volume_reversal, volume_volatility, volume_exhaustion]):
+                # Performance: Only log when significant signals are detected and occasionally
+                if (any(abs(sig) > 0.1 for sig in [volume_momentum, volume_reversal, volume_volatility, volume_exhaustion]) 
+                    and random.random() < LOG_SAMPLING_RATE * 5):  # 5x more likely to log significant signals
                     self.logger.info(f"Volume signals detected: momentum={volume_momentum:.3f}, reversal={volume_reversal:.3f}, "
                                    f"volatility={volume_volatility:.3f}, exhaustion={volume_exhaustion:.3f}")
                     
@@ -702,7 +794,9 @@ class AvellanedaMarketMaker:
             # Update market conditions
             try:
                 self.update_market_conditions(volatility, market_impact)
-                self.logger.debug("Market conditions updated successfully")
+                # Performance: Only debug log occasionally
+                if random.random() < LOG_SAMPLING_RATE:
+                    self.logger.debug("Market conditions updated successfully")
             except Exception as e:
                 self.logger.error(f"Error updating market conditions: {str(e)}")
                 return [], []
@@ -710,7 +804,10 @@ class AvellanedaMarketMaker:
             # Calculate optimal spread using Avellaneda-Stoikov model with volume enhancement
             try:
                 base_spread = self.calculate_optimal_spread(market_impact)
-                self.logger.debug(f"Calculated base spread: {base_spread}")
+                
+                # Performance: Only debug log occasionally
+                if random.random() < LOG_SAMPLING_RATE:
+                    self.logger.debug(f"Calculated base spread: {base_spread}")
                 
                 # NEW: Enhance spread based on volume candle signals (FIXED)
                 spread_adjustment = 1.0
@@ -718,16 +815,23 @@ class AvellanedaMarketMaker:
                 # Increase spread on high volatility signals
                 if volume_volatility > 0.3:
                     spread_adjustment *= (1.0 + volume_volatility * 0.3)  # Up to 30% increase
-                    self.logger.debug(f"Increased spread by {volume_volatility * 30:.1f}% due to volume volatility")
+                    # Performance: Only debug log occasionally
+                    if random.random() < LOG_SAMPLING_RATE:
+                        self.logger.debug(f"Increased spread by {volume_volatility * 30:.1f}% due to volume volatility")
                 
                 # Increase spread on reversal signals to protect against trend changes
                 if volume_reversal > 0.4:
                     spread_adjustment *= (1.0 + volume_reversal * 0.2)  # Up to 20% increase
-                    self.logger.debug(f"Increased spread by {volume_reversal * 20:.1f}% due to reversal signal")
+                    # Performance: Only debug log occasionally
+                    if random.random() < LOG_SAMPLING_RATE:
+                        self.logger.debug(f"Increased spread by {volume_reversal * 20:.1f}% due to reversal signal")
                 
                 # Apply adjustment
                 spread = base_spread * spread_adjustment
-                self.logger.debug(f"Final spread after volume adjustments: {spread} (adjustment: {spread_adjustment:.3f})")
+                
+                # Performance: Only debug log occasionally
+                if random.random() < LOG_SAMPLING_RATE:
+                    self.logger.debug(f"Final spread after volume adjustments: {spread} (adjustment: {spread_adjustment:.3f})")
                 
             except Exception as e:
                 self.logger.error(f"Error calculating optimal spread: {str(e)}")
@@ -1316,9 +1420,14 @@ class AvellanedaMarketMaker:
 
     def round_to_tick(self, value: float) -> float:
         """Round price to nearest tick size"""
-        if self.tick_size <= 0:
+        # Performance optimization: Fast path for valid tick size
+        if self.tick_size > 0:
+            return round(value / self.tick_size) * self.tick_size
+        
+        # Fallback path with occasional logging
+        if random.random() < LOG_SAMPLING_RATE:
             self.logger.warning(f"Invalid tick size ({self.tick_size}) in round_to_tick. Using default of 1.0")
-            self.tick_size = 1.0
+        self.tick_size = 1.0
         return round(value / self.tick_size) * self.tick_size
 
     def on_order_filled(self, order_id: str, fill_price: float, fill_size: float, is_buy: bool) -> None:
@@ -1370,10 +1479,12 @@ class AvellanedaMarketMaker:
                 # Now process the fill for hedging
                 self._process_fill_for_hedging(order_id, fill_price, fill_size, is_buy)
             
-            self.logger.info(
-                f"Order filled: {fill_size} @ {fill_price} ({'BUY' if is_buy else 'SELL'})"
-                f" - New position: {self.position_tracker.current_position:.4f}, Avg entry: {self.position_tracker.average_entry_price:.2f}" # MODIFIED
-            )
+            # Performance: Always log fills but with reduced detail for frequent small fills  
+            if fill_size >= 0.01 or random.random() < LOG_SAMPLING_RATE * 10:  # Always log significant fills
+                self.logger.info(
+                    f"Order filled: {fill_size} @ {fill_price} ({'BUY' if is_buy else 'SELL'})"
+                    f" - New position: {self.position_tracker.current_position:.4f}, Avg entry: {self.position_tracker.average_entry_price:.2f}" # MODIFIED
+                )
             
         except Exception as e:
             self.logger.error(f"Error handling order fill: {str(e)}")
@@ -1473,38 +1584,41 @@ class AvellanedaMarketMaker:
         Returns:
             float: Price aligned to the instrument's tick size
         """
-        # Ensure price is positive
+        # Performance: Fast path for valid inputs (most common case)
+        if price > 0 and self.tick_size > 0:
+            aligned_price = self.tick_size * round(price / self.tick_size)
+            return max(aligned_price, self.tick_size)  # Ensure minimum price
+        
+        # Fallback path with occasional logging
         if price <= 0:
-            self.logger.warning(f"Invalid price {price} in align_price_to_tick. Using minimum tick size.")
-            return self.tick_size  # Return minimum valid price
+            if random.random() < LOG_SAMPLING_RATE:
+                self.logger.warning(f"Invalid price {price} in align_price_to_tick. Using minimum tick size.")
+            return self.tick_size if self.tick_size > 0 else 1.0
             
         if not self.tick_size or self.tick_size <= 0:
-            self.logger.warning("Invalid tick size, using default alignment")
-            # Store previous tick size for logging
-            old_tick_size = self.tick_size
-            # Set a valid tick size for future use
-            self.tick_size = 1.0
-            self.logger.info(f"Updated tick size from {old_tick_size} to {self.tick_size}")
+            if random.random() < LOG_SAMPLING_RATE:
+                self.logger.warning("Invalid tick size, using default alignment")
+                old_tick_size = self.tick_size
+                self.tick_size = 1.0
+                self.logger.info(f"Updated tick size from {old_tick_size} to {self.tick_size}")
+            else:
+                self.tick_size = 1.0  # Set default without logging
             return round(price, 2)  # Default to 2 decimal places
-            
-        # Round to nearest tick
-        aligned_price = self.tick_size * round(price / self.tick_size)
-        
-        # Ensure we have at least minimum price
-        min_price = self.tick_size
-        aligned_price = max(aligned_price, min_price)
-        
-        return aligned_price
 
     def set_instrument(self, instrument: str):
         """Set the instrument being traded"""
         self.instrument = instrument
-        self.logger.info(f"Setting instrument to {instrument}")
+        
+        # Performance: Only log occasionally unless instrument actually changes
+        if random.random() < LOG_SAMPLING_RATE * 10:  # More frequent for instrument changes
+            self.logger.info(f"Setting instrument to {instrument}")
         
         # Update instrument in volume candle buffer if available
         if hasattr(self, 'volume_buffer') and self.volume_buffer:
             self.volume_buffer.instrument = instrument
-            self.logger.info(f"Updated volume candle buffer instrument to {instrument}")
+            # Performance: Only log occasionally
+            if random.random() < LOG_SAMPLING_RATE * 5:
+                self.logger.info(f"Updated volume candle buffer instrument to {instrument}")
 
     def calculate_dynamic_gamma(self, volatility: float, market_impact: float) -> float:
         """
@@ -1835,6 +1949,7 @@ class AvellanedaMarketMaker:
 
     def cleanup(self):
         """Clean up resources when shutting down"""
+        # Performance: Always log cleanup start/end since it's infrequent but important
         self.logger.info("Cleaning up Avellaneda market maker resources")
         
         # Clean up hedge manager if active
