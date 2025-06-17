@@ -288,8 +288,8 @@ class PerformanceMonitor:
             # Get position and PnL from position tracker (more reliable)
             try:
                 if hasattr(quoter, 'position_tracker') and quoter.position_tracker:
-                    pt_metrics = quoter.position_tracker.get_metrics()
-                    metrics["position"] = pt_metrics.get("position_size", 0.0)
+                    pt_metrics = quoter.position_tracker.get_position_metrics()
+                    metrics["position"] = pt_metrics.get("position", 0.0)
                     metrics["pnl"] = pt_metrics.get("realized_pnl", 0.0) + pt_metrics.get("unrealized_pnl", 0.0)
                     metrics["fills"] = pt_metrics.get("fill_count", 0)
                 elif hasattr(quoter, 'market_maker') and quoter.market_maker:

@@ -95,6 +95,11 @@ class OrderManager:
     ) -> Optional[int]:
         """Place a new order with improved tracking and validation"""
         try:
+            # Check connection state first
+            if not self.thalex.connected():
+                self.logger.warning(f"Cannot place order: WebSocket not connected")
+                return None
+                
             # Check if parent quoter is in cooldown mode
             if hasattr(self.thalex, "quoter") and getattr(self.thalex, "quoter", None) is not None:
                 quoter = self.thalex.quoter
@@ -226,6 +231,11 @@ class OrderManager:
     async def cancel_order(self, order_id: int) -> bool:
         """Cancel an existing order"""
         try:
+            # Check connection state first
+            if not self.thalex.connected():
+                self.logger.warning(f"Cannot cancel order {order_id}: WebSocket not connected")
+                return False
+                
             if order_id not in self.orders:
                 self.logger.warning(f"Order {order_id} not found for cancellation")
                 return False
@@ -266,6 +276,11 @@ class OrderManager:
     async def cancel_all_orders(self) -> None:
         """Cancel all active orders"""
         try:
+            # Check connection state first
+            if not self.thalex.connected():
+                self.logger.warning("Cannot cancel orders: WebSocket not connected")
+                return
+                
             # Get all active order IDs
             active_orders = list(self.active_bids.keys()) + list(self.active_asks.keys())
             

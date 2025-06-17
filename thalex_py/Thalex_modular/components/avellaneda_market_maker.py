@@ -78,26 +78,18 @@ class AvellanedaMarketMaker:
         self.volatility_grid = []
         self.price_history = deque(maxlen=TRADING_CONFIG["volatility"]["window"])
         
-        # VAMP (Volume Adjusted Market Pressure) tracking
-        self.vamp_window = deque(maxlen=TRADING_CONFIG["vamp"]["window"])
-        self.vamp_aggressive_window = deque(maxlen=TRADING_CONFIG["vamp"]["aggressive_window"])
+        # VAMP (Volume Adjusted Market Pressure) tracking - using defaults
+        vamp_config = TRADING_CONFIG.get("vamp", {})
+        self.vamp_window = deque(maxlen=vamp_config.get("window", 50))
+        self.vamp_aggressive_window = deque(maxlen=vamp_config.get("aggressive_window", 20))
         self.vamp_buy_volume = 0.0
         self.vamp_sell_volume = 0.0
         self.vamp_value = 0.0
         self.vamp_impact = 0.0
-        self.vamp_impact_window = deque(maxlen=TRADING_CONFIG["vamp"]["impact_window"])
+        self.vamp_impact_window = deque(maxlen=vamp_config.get("impact_window", 30))
         
-        # NEW: Volume candle buffer for predictive analysis
-        self.volume_buffer = VolumeBasedCandleBuffer(
-            volume_threshold=TRADING_CONFIG["volume_candle"].get("threshold", 1.0),
-            max_candles=TRADING_CONFIG["volume_candle"].get("max_candles", 100),
-            max_time_seconds=TRADING_CONFIG["volume_candle"].get("max_time_seconds", 300),
-            exchange_client=exchange_client,
-            instrument=None,  # Will be set via set_instrument method
-            use_exchange_data=TRADING_CONFIG["volume_candle"].get("use_exchange_data", False),
-            fetch_interval_seconds=TRADING_CONFIG["volume_candle"].get("fetch_interval_seconds", 60),
-            lookback_hours=TRADING_CONFIG["volume_candle"].get("lookback_hours", 1)
-        )
+        # Volume candle buffer - will be shared from quoter to avoid duplication
+        self.volume_buffer = None  # Will be set by quoter
         
         # NEW: Predictive state tracking - initialize at the start to avoid None issues
         self.predictive_adjustments = {
@@ -283,7 +275,8 @@ class AvellanedaMarketMaker:
         weighted_impact = 0.0
         
         # Max age to consider (default 5 minutes)
-        max_age = TRADING_CONFIG["vamp"].get("max_impact_age", 300)
+        vamp_config = TRADING_CONFIG.get("vamp", {})
+        max_age = vamp_config.get("max_impact_age", 300)
         
         for timestamp, impact in self.vamp_impact_window:
             age = current_time - timestamp
@@ -758,8 +751,8 @@ class AvellanedaMarketMaker:
             # Performance: Cache mid price for future use
             self._cached_mid_price = mid_price
             
-            # Performance: Only debug log occasionally
-            if random.random() < LOG_SAMPLING_RATE:
+            # Performance: Only debug log very occasionally for HFT
+            if random.random() < LOG_SAMPLING_RATE * 0.1:  # 10x less frequent
                 self.logger.debug(f"Using BBO for mid_price: bid={bid_price}, ask={ask_price}, mid={mid_price}")
             
             # Update market mid price
@@ -1080,6 +1073,8 @@ class AvellanedaMarketMaker:
                     )
                     bid_quotes.append(bid_quote)
                     
+                    # Reduce debug logging for HFT performance
+                if random.random() < LOG_SAMPLING_RATE * 0.1:  # 10x less frequent
                     self.logger.debug(f"Created level {level} bid: {level_size:.4f} @ {level_price:.2f}")
             else:
                 self.logger.info("Skipping bid quotes: at position limit or no capacity to buy")
@@ -1135,6 +1130,8 @@ class AvellanedaMarketMaker:
                     )
                     ask_quotes.append(ask_quote)
                     
+                    # Reduce debug logging for HFT performance
+                if random.random() < LOG_SAMPLING_RATE * 0.1:  # 10x less frequent
                     self.logger.debug(f"Created level {level} ask: {level_size:.4f} @ {level_price:.2f}")
             else:
                 self.logger.info("Skipping ask quotes: no position to sell")
@@ -1420,6 +1417,10 @@ class AvellanedaMarketMaker:
 
     def round_to_tick(self, value: float) -> float:
         """Round price to nearest tick size"""
+        # HFT BUG FIX: Handle NaN values that cause "cannot convert float NaN to integer"
+        if not (value and math.isfinite(value)):
+            return 0.0  # Return safe default for NaN/inf values
+            
         # Performance optimization: Fast path for valid tick size
         if self.tick_size > 0:
             return round(value / self.tick_size) * self.tick_size
