@@ -250,6 +250,7 @@ class Quote:
     instrument: str = ""
     side: str = ""  # "buy" or "sell"
     timestamp: float = field(default_factory=time.time)
+    is_trigger_order: bool = False  # Flag to differentiate trigger orders from grid orders
     
     def to_dict(self) -> Dict:
         """Convert quote to dictionary"""
@@ -258,7 +259,8 @@ class Quote:
             "amount": self.amount,
             "instrument": self.instrument,
             "side": self.side,
-            "timestamp": self.timestamp
+            "timestamp": self.timestamp,
+            "is_trigger_order": self.is_trigger_order
         }
         
     @classmethod
@@ -269,7 +271,8 @@ class Quote:
             amount=data["amount"],
             instrument=data.get("instrument", ""),
             side=data.get("side", ""),
-            timestamp=data.get("timestamp", time.time())
+            timestamp=data.get("timestamp", time.time()),
+            is_trigger_order=data.get("is_trigger_order", False)
         )
     
     def validate_notional_value(self, max_notional: float = 1000.0) -> bool:

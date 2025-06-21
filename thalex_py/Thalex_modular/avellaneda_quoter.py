@@ -144,7 +144,7 @@ class AvellanedaQuoter:
         'recovery_cooldown_until', 'recovery_step', 'last_recovery_check',
         
         # Take profit state
-        'take_profit_active', 'last_take_profit_check', 'take_profit_cooldown_until',
+
         'last_upnl_value', 'risk_monitoring_interval',
         
         # Market data
@@ -285,9 +285,7 @@ class AvellanedaQuoter:
         self.last_recovery_check = 0
         
         # Take profit state management (NEW)
-        self.take_profit_active = False
-        self.last_take_profit_check = 0
-        self.take_profit_cooldown_until = 0
+
         self.last_upnl_value = 0.0
         
         # Risk monitoring task interval
@@ -522,10 +520,11 @@ class AvellanedaQuoter:
             # Get total portfolio P&L across all instruments
             total_portfolio_pnl = self.portfolio_tracker.get_total_pnl()
             
-            # FORCE DEBUGGING: Always log detailed breakdown to find the issue
-            portfolio_metrics = self.portfolio_tracker.get_portfolio_metrics()
-            instrument_pnls = portfolio_metrics.get("instrument_pnls", {})
-            self.logger.critical(f"UPNL DEBUG: Portfolio breakdown: {instrument_pnls}, Total: {total_portfolio_pnl:.2f}")
+            # HFT FIX: Log detailed breakdown periodically for monitoring
+            if hasattr(self, '_log_counter') and self._log_counter % 100 == 0:  # Less frequent logging
+                portfolio_metrics = self.portfolio_tracker.get_portfolio_metrics()
+                instrument_pnls = portfolio_metrics.get("instrument_pnls", {})
+                self.logger.info(f"Portfolio UPNL breakdown: {instrument_pnls}, Total: {total_portfolio_pnl:.2f}")
             
             # HFT FIX: Validate UPNL calculation
             if not isinstance(total_portfolio_pnl, (int, float)) or not np.isfinite(total_portfolio_pnl):
@@ -541,7 +540,7 @@ class AvellanedaQuoter:
                 if hasattr(self, 'position_tracker') and hasattr(self.position_tracker, 'get_position_metrics'):
                     metrics = self.position_tracker.get_position_metrics()
                     fallback_upnl = float(metrics.get("unrealized_pnl", 0.0))
-                    self.logger.critical(f"UPNL DEBUG: Using fallback UPNL: {fallback_upnl:.2f}")
+                    self.logger.info(f"Using fallback UPNL: {fallback_upnl:.2f}")
                     return fallback_upnl
             except Exception as fallback_error:
                 self.logger.error(f"Fallback UPNL calculation also failed: {str(fallback_error)}")
@@ -550,134 +549,9 @@ class AvellanedaQuoter:
             self.logger.error("CRITICAL: All UPNL calculation methods failed - take profit will not work")
             return 0.0
 
-    async def _check_take_profit_conditions(self) -> bool:
-        """Check if take profit conditions are met"""
-        if not RISK_LIMITS.get("take_profit_enabled", True):
-            return False
-            
-        current_time = time.time()
-        
-        # Check cooldown (prevents immediate retries)
-        if current_time < self.take_profit_cooldown_until:
-            return False
-            
-        # Check interval (prevents too frequent checks)
-        if current_time - self.last_take_profit_check < RISK_LIMITS.get("take_profit_check_interval", 5):
-            return False
-            
-        self.last_take_profit_check = current_time
-        
-        # Check if we have a position worth taking profit on
-        metrics = self.position_tracker.get_position_metrics()
-        position_size = metrics.get("position", 0.0)
-        
-        if abs(position_size) < 0.0001:  # No significant position
-            return False
-        
-        # Get current UPNL
-        current_upnl = self._get_current_upnl()
-        self.last_upnl_value = current_upnl
-        
-        # Check threshold
-        take_profit_threshold = RISK_LIMITS.get("take_profit_threshold", 100.0)
-        
-        # FORCE DEBUGGING: Always log take profit checks to investigate the issue
-        self.logger.critical(f"TAKE PROFIT CHECK: UPNL={current_upnl:.2f}, threshold={take_profit_threshold:.2f}, position={position_size:.4f}")
-        
-        if current_upnl >= take_profit_threshold:
-            self.logger.critical(f"TAKE PROFIT TRIGGERED: UPNL {current_upnl:.2f} >= threshold {take_profit_threshold:.2f}, Position: {position_size:.4f}")
-            return True
-            
-        return False
 
-    async def _execute_take_profit_flatten(self):
-        """Execute take profit by flattening position"""
-        try:
-            # Get current position
-            metrics = self.position_tracker.get_position_metrics()
-            position_size = metrics.get("position", 0.0)
-            
-            if abs(position_size) < 0.0001:  # Already flat
-                self.logger.info("Position already flat, take profit action not needed")
-                return True
-                
-            # Get current market prices to check profitability
-            if not self.ticker or not hasattr(self.ticker, 'best_bid_price') or not hasattr(self.ticker, 'best_ask_price'):
-                self.logger.error("Cannot execute take profit: missing ticker data")
-                return False
-                
-            # Get position entry price for profitability check
-            avg_entry_price = metrics.get("average_entry")
-            if not avg_entry_price or avg_entry_price <= 0:
-                self.logger.error("Cannot execute take profit: no valid entry price")
-                return False
-            
-            # Determine order side and check if market order would be profitable
-            if position_size > 0:
-                # Long position - sell to flatten using best bid
-                order_side = "sell"
-                order_size = abs(position_size)
-                market_price = self.ticker.best_bid_price
-                
-                if market_price <= 0:
-                    self.logger.error("Invalid best bid price for take profit sell order")
-                    return False
-                    
-                # Check if selling at best bid is profitable
-                profit_per_unit = market_price - avg_entry_price
-                total_profit = profit_per_unit * order_size
-                
-                if profit_per_unit <= 0:
-                    self.logger.warning(f"Take profit cancelled: selling at {market_price:.2f} would lose money (entry: {avg_entry_price:.2f})")
-                    return False
-                    
-            else:
-                # Short position - buy to flatten using best ask
-                order_side = "buy"
-                order_size = abs(position_size)
-                market_price = self.ticker.best_ask_price
-                
-                if market_price <= 0:
-                    self.logger.error("Invalid best ask price for take profit buy order")
-                    return False
-                    
-                # Check if buying at best ask is profitable for short position
-                profit_per_unit = avg_entry_price - market_price
-                total_profit = profit_per_unit * order_size
-                
-                if profit_per_unit <= 0:
-                    self.logger.warning(f"Take profit cancelled: buying at {market_price:.2f} would lose money (entry: {avg_entry_price:.2f})")
-                    return False
-            
-            self.logger.critical(f"EXECUTING TAKE PROFIT: Flattening {order_side} {order_size:.4f} at market price {market_price:.2f} (entry: {avg_entry_price:.2f}, profit: ${total_profit:.2f})")
-            
-            # Cancel all existing quotes first
-            await self.cancel_quotes("Take profit execution")
-            await asyncio.sleep(1)  # Brief pause
-                
-            # Place market order to flatten (no price parameter)
-            if hasattr(self, 'order_manager') and self.order_manager:
-                order_result = await self.order_manager.place_order(
-                    instrument=self.perp_name,
-                    direction=order_side,
-                    price=None,  # HFT FIX: Explicitly pass None for market order
-                    amount=order_size,
-                    label="TakeProfit",
-                    post_only=False  # Market orders can't be post-only
-                )
-                self.logger.info(f"Take profit market order placed: {order_side} {order_size:.4f} - Result: {order_result}")
-                
-            # Set cooldown to prevent immediate retries
-            self.take_profit_cooldown_until = time.time() + RISK_LIMITS.get("take_profit_cooldown", 30)
-            self.take_profit_active = True
-            
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Error executing take profit flatten: {str(e)}")
-            # Set a longer cooldown on errors to prevent spam
-            self.take_profit_cooldown_until = time.time() + 60  # 1 minute cooldown on error
-            return False
+
+
 
     async def _risk_monitoring_task(self):
         """Optimized risk monitoring with adaptive intervals"""
@@ -1993,7 +1867,34 @@ class AvellanedaQuoter:
                 is_buy_flag = order.direction.lower() == "buy"
                 significant_fill_threshold = TRADING_CONFIG["avellaneda"].get("significant_fill_threshold", 0.1)
                 
-                # Update PositionTracker
+                # Check if this is a trigger order fill
+                order_label = order_data.get("label", "")
+                client_id = order_data.get("client_id", "")
+                is_trigger_order = (order_label == "TakeProfitTrigger" or 
+                                  (client_id and client_id.startswith("trigger_")))
+                
+                if is_trigger_order:
+                    # Handle trigger order fill
+                    self.logger.info(
+                        f"TRIGGER ORDER FILLED: {order.direction.upper()} {order.amount:.4f} @ {order.price:.2f} "
+                        f"(order_id: {order.id}, client_id: {client_id})"
+                    )
+                    
+                    # Remove from active trigger orders tracking
+                    if hasattr(self, 'active_trigger_order_ids') and client_id in self.active_trigger_order_ids:
+                        self.active_trigger_order_ids.remove(client_id)
+                    
+                    # Notify market maker about trigger order fill
+                    if hasattr(self.market_maker, 'on_trigger_order_filled'):
+                        self.market_maker.on_trigger_order_filled(str(order.id), order.price, order.amount)
+                else:
+                    # Handle normal grid order fill
+                    self.logger.info(
+                        f"GRID ORDER FILLED: {order.direction.upper()} {order.amount:.4f} @ {order.price:.2f} "
+                        f"(order_id: {order.id})"
+                    )
+                
+                # Update PositionTracker (for both trigger and grid orders)
                 if self.position_tracker:
                     try:
                         fill_timestamp_raw = order_data.get("timestamp", order_data.get("create_time", time.time()))
@@ -2019,8 +1920,8 @@ class AvellanedaQuoter:
                     except Exception:
                         pass  # Silent fail for HFT performance
                 
-                # Update market maker with fill information
-                self.market_maker.on_order_filled(order.id, order.price, order.amount, is_buy_flag)
+                # Update market maker with fill information (for both trigger and grid orders)
+                self.market_maker.on_order_filled(str(order.id), order.price, order.amount, is_buy_flag)
                 
                 # Sync position data after fill to ensure consistency
                 self._sync_position_data()
@@ -2212,7 +2113,7 @@ class AvellanedaQuoter:
             # Convert direction to is_buy flag
             is_buy = direction.lower() == 'buy'
             
-            # NEW: Update quoter-level volume candle buffer (FIXED)
+            # Update quoter-level volume candle buffer
             volume_candle_completed = None
             if self.volume_buffer:
                 try:
@@ -2543,19 +2444,57 @@ class AvellanedaQuoter:
             # Record successful quote placement
             self.last_quote_time = time.time()
             
-            # Log single summary for orders placed
-            if placed_bids > 0 or placed_asks > 0:
-                self.logger.info(f"Orders placed: {placed_bids}B/{placed_asks}A")
+            # Place trigger orders from market maker
+            if hasattr(self.market_maker, 'get_active_trigger_orders'):
+                trigger_orders = self.market_maker.get_active_trigger_orders()
+                placed_triggers = 0
                 
-            # Verify order counts after placement to detect any potential tracking issues
-            await asyncio.sleep(0.5)  # Brief pause to allow orders to be processed
-            current_active_bids = len(self.order_manager.active_bids)
-            current_active_asks = len(self.order_manager.active_asks)
+                for trigger_id, trigger_quote in trigger_orders.items():
+                    try:
+                        # Check if this trigger order is already placed
+                        if trigger_id in getattr(self, 'active_trigger_order_ids', set()):
+                            continue
+                            
+                        # Validate trigger order
+                        if trigger_quote.price <= 0 or trigger_quote.amount <= 0:
+                            self.logger.warning(f"Invalid trigger order: {trigger_quote.price}@{trigger_quote.amount}")
+                            continue
+                        
+                        # Place trigger order
+                        await self.order_manager.place_order(
+                            instrument=self.perp_name,
+                            direction=trigger_quote.side,
+                            price=trigger_quote.price,
+                            amount=trigger_quote.amount,
+                            label="TakeProfitTrigger",
+                            post_only=False,  # Allow trigger orders to be taker orders
+                            client_id=trigger_id  # Use trigger_id as client_id for tracking
+                        )
+                        
+                        # Track active trigger orders
+                        if not hasattr(self, 'active_trigger_order_ids'):
+                            self.active_trigger_order_ids = set()
+                        self.active_trigger_order_ids.add(trigger_id)
+                        
+                        placed_triggers += 1
+                        self.logger.info(
+                            f"Placed trigger order: {trigger_quote.side.upper()} {trigger_quote.amount:.4f} @ {trigger_quote.price:.2f} "
+                            f"(trigger_id: {trigger_id})"
+                        )
+                        
+                    except Exception as e:
+                        self.logger.error(f"Error placing trigger order {trigger_id}: {str(e)}")
+                
+                if placed_triggers > 0:
+                    self.logger.info(f"Successfully placed {placed_triggers} trigger orders for take profit")
             
-            if current_active_bids > max_levels or current_active_asks > max_levels:
-                self.logger.error(f"Order tracking issue detected! Active orders exceed max levels: {current_active_bids} bids, {current_active_asks} asks (max: {max_levels})")
-                self.logger.info(f"Initiating emergency cancellation to restore order consistency")
-                await self.cancel_quotes("Order tracking issue detected")
+            # Log final result
+            total_orders = placed_bids + placed_asks + (placed_triggers if 'placed_triggers' in locals() else 0)
+            self.logger.info(
+                f"Placed {placed_bids} bids, {placed_asks} asks"
+                f"{f', {placed_triggers} triggers' if 'placed_triggers' in locals() and placed_triggers > 0 else ''} "
+                f"(total: {total_orders})"
+            )
             
         except Exception as e:
             self.logger.error(f"Error placing quotes: {str(e)}", exc_info=True)
@@ -2892,14 +2831,7 @@ class AvellanedaQuoter:
                     await asyncio.sleep(0.5)
                     continue
                 
-                # Check take profit conditions (NEW UPNL-based logic)
-                if self.active_trading and not self.risk_recovery_mode:
-                    # Check take profit conditions
-                    if await self._check_take_profit_conditions():
-                        await self._execute_take_profit_flatten()
-                        # Brief pause after take profit
-                        await asyncio.sleep(2.0)
-                        continue
+
                 
                 # Skip if no ticker data
                 if not self.ticker:
@@ -3166,10 +3098,18 @@ class AvellanedaQuoter:
         try:
             self.logger.info(f"Cancelling all orders: {reason}")
             
+            # Cancel trigger orders from market maker
+            if hasattr(self.market_maker, '_cancel_all_trigger_orders'):
+                self.market_maker._cancel_all_trigger_orders(f"Quote cancellation: {reason}")
+                
+            # Clear trigger order tracking in quoter
+            if hasattr(self, 'active_trigger_order_ids'):
+                self.active_trigger_order_ids.clear()
+            
             # Use the order manager to cancel all orders
             if hasattr(self, 'order_manager') and self.order_manager:
                 await self.order_manager.cancel_all_orders()
-                self.logger.info("All orders cancelled successfully")
+                self.logger.info("All orders (grid + trigger) cancelled successfully")
             else:
                 self.logger.warning("Order manager not available, cannot cancel orders")
                 

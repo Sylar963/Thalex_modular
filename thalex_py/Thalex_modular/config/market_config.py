@@ -55,6 +55,17 @@ BOT_CONFIG = {
             "fixed_volatility": 0.01,
             "position_limit": 20,
             "exchange_fee_rate": 0.0001,
+            
+            # Take profit trigger order configuration
+            "enable_take_profit_triggers": True,  # Enable automatic take profit orders
+            "take_profit_spread_bps": 7.0,       # Spread in basis points above entry (6-8 bps)
+            
+            # Predictive adjustment thresholds (to prevent noise)
+            "pa_gamma_adj_threshold": 0.05,           # Minimum gamma adjustment to apply
+            "pa_kappa_adj_threshold": 0.05,           # Minimum kappa adjustment to apply  
+            "pa_res_price_offset_adj_threshold": 0.00005, # Minimum reservation price offset to apply
+            "pa_volatility_adj_threshold": 0.05,     # Minimum volatility adjustment to apply
+            "pa_prediction_max_age_seconds": 300,    # Max age of predictions to use (5 minutes)
         },
         
         # Order execution parameters
@@ -108,7 +119,7 @@ BOT_CONFIG = {
     "risk": {
         "max_position": 20,           # Maximum position size
         "stop_loss_pct": 0.06,         # Stop loss percentage
-        "take_profit_pct": 0.05,       # Take profit percentage (5%)
+
         "max_drawdown": 0.10,          # Maximum drawdown
         "max_consecutive_losses": 5,   # Maximum consecutive losses
         "inventory_target": 0.0,       # Target inventory level
@@ -125,12 +136,7 @@ BOT_CONFIG = {
         "risk_recovery_threshold": 0.8,        # Resume at 80% of risk limits
         "gradual_recovery_steps": 1,           # Number of steps to full recovery
         
-        # UPNL Take Profit Configuration
-        "take_profit_enabled": True,           # Enable UPNL-based take profit
-        "take_profit_threshold": 2.0,        # Take profit at this UPNL level (restored)
-        "take_profit_check_interval": 1,       # Check frequency in seconds
-        "flatten_position_enabled": True,       # Allow position flattening
-        "take_profit_cooldown": 3,            # Cooldown after take profit
+
     },
     
     # Portfolio-wide take profit configuration

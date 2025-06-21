@@ -185,12 +185,12 @@ class OrderManager:
                         direction=th.Direction.BUY if direction == "buy" else th.Direction.SELL,
                         instrument_name=instrument,
                         amount=aligned_amount,
-                        # Use default market handling
+                        order_type=th.OrderType.MARKET,
                         client_order_id=order_id,
                         id=order_id,
                         label=label,
-                        post_only=False  # Can't be post-only
-                        # No collar parameter needed for non-MM trading
+                        post_only=False,
+                        reduce_only=True
                     )
                 else:
                     self.logger.info(
@@ -203,11 +203,11 @@ class OrderManager:
                         instrument_name=instrument,
                         amount=aligned_amount,
                         price=aligned_price,
+                        order_type=th.OrderType.LIMIT,
                         client_order_id=order_id,
                         id=order_id,
                         label=label,
                         post_only=post_only
-                        # No collar parameter needed for non-MM trading
                     )
                 
                 return order_id
