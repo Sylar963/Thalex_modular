@@ -16,11 +16,40 @@ This is an automated trading bot that provides continuous buy and sell quotes on
 - **Risk Management**: Built-in features to control position size and risk
 
 ### Getting Started
-1. Clone this repository
+
+#### Quick Setup (Recommended)
+1. Clone this repository: `git clone <repository-url>`
 2. Install dependencies: `pip install -r requirements.txt`
-3. Create a Thalex account and generate API keys
-4. Configure your API keys in `thalex_py/Thalex_modular/models/keys.py`
+3. Create a Thalex account and generate API keys (testnet recommended for testing)
+4. Run the interactive setup: `python setup_env.py`
 5. Start the bot: `python start_quoter.py`
+
+#### Manual Setup
+1. Copy the environment template: `cp .example.env .env`
+2. Edit `.env` with your API credentials and configuration
+3. Configure your settings according to the comments in the file
+4. Create necessary directories: `mkdir -p logs metrics backups profiles`
+5. Start the bot: `python start_quoter.py`
+
+#### Environment Variables
+Your `.env` file should contain at minimum:
+```bash
+# Required for testnet
+THALEX_TEST_API_KEY_ID="your_testnet_api_key_id"
+THALEX_TEST_PRIVATE_KEY="your_testnet_private_key"
+TRADING_MODE="testnet"
+NETWORK="test"
+
+# Trading parameters
+MAX_POSITION_SIZE="0.01"
+BASE_QUOTE_SIZE="0.001"
+PRIMARY_INSTRUMENT="BTC-PERPETUAL"
+```
+
+⚠️ **Important**: 
+- Never commit your `.env` file to version control
+- Always test on testnet before using production
+- Keep your API keys secure and never share them
 
 ### Simple Configuration
 Basic settings can be adjusted in `thalex_py/Thalex_modular/config/market_config.py`:
