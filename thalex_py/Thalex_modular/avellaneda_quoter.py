@@ -1898,8 +1898,8 @@ class AvellanedaQuoter:
                 else:
                     await self.handle_order_update(notification)
             elif channel == "account.portfolio":
-                if random.random() < LOG_SAMPLING_RATE:
-                    self.logger.info(f"Processing portfolio update")
+                # Always log portfolio updates for debugging position issues
+                self.logger.warning(f"📋 PORTFOLIO UPDATE RECEIVED: {notification}")
                 await self.handle_portfolio_update(notification)
             elif channel == "account.trade_history":
                 if random.random() < LOG_SAMPLING_RATE:
@@ -2390,14 +2390,26 @@ class AvellanedaQuoter:
             
             # CRITICAL FIX: Check for take profit conditions BEFORE inventory limits
             # This ensures positions can be closed even when inventory limits are exceeded
-            self.logger.debug("🔍 Checking take profit conditions before placing grid orders")
+            self.logger.warning("🔍 TAKE PROFIT CHECK: Checking conditions before placing grid orders")
             if hasattr(self.market_maker, 'detect_trading_mode') and hasattr(self.market_maker, 'should_trigger_take_profit'):
                 try:
+                    # Debug portfolio tracker status
+                    portfolio_status = "None" if not self.market_maker.portfolio_tracker else "Available"
+                    self.logger.warning(f"🔍 PORTFOLIO TRACKER: {portfolio_status}")
+                    
+                    if self.market_maker.portfolio_tracker:
+                        positions = self.market_maker.portfolio_tracker.get_positions()
+                        self.logger.warning(f"🔍 POSITIONS: {positions}")
+                    
                     current_mode = self.market_maker.detect_trading_mode()
-                    self.logger.debug(f"🎯 Trading mode detected: {current_mode}")
+                    self.logger.warning(f"🎯 TRADING MODE: {current_mode}")
                     
                     trigger_decision = self.market_maker.should_trigger_take_profit()
-                    self.logger.debug(f"📊 Take profit decision: {trigger_decision.get('should_trigger', False)} - {trigger_decision.get('reason', 'unknown')}")
+                    self.logger.warning(f"📊 TAKE PROFIT DECISION: {trigger_decision.get('should_trigger', False)} - {trigger_decision.get('reason', 'unknown')}")
+                    
+                    # If rate limited, show more details
+                    if trigger_decision.get('reason') == 'rate_limited':
+                        self.logger.warning("⏰ RATE LIMITED: Take profit check is being rate limited")
                     
                     if trigger_decision.get('should_trigger', False):
                         self.logger.warning(
@@ -2428,7 +2440,9 @@ class AvellanedaQuoter:
                                 
                 except Exception as e:
                     # Don't fail quote placement if trigger analysis fails
-                    self.logger.debug(f"Error analyzing trigger conditions: {str(e)}")
+                    self.logger.error(f"❌ ERROR in take profit analysis: {str(e)}", exc_info=True)
+            else:
+                self.logger.warning("❌ TAKE PROFIT: Market maker missing detect_trading_mode or should_trigger_take_profit methods")
             
             # --- INVENTORY CHECKS (only after take profit check) ---
             if not self.active_trading:
