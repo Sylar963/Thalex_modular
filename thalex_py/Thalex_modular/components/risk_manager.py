@@ -31,7 +31,7 @@ class RiskManager:
         self.max_position_abs = RISK_LIMITS.get("max_position", float('inf'))
         self.max_notional_value = RISK_LIMITS.get("max_notional", float('inf'))
         self.stop_loss_pct = RISK_LIMITS.get("stop_loss_pct")
-        self.take_profit_pct = RISK_LIMITS.get("take_profit_pct")
+
         self.max_drawdown = RISK_LIMITS.get("max_drawdown")
         self.max_consecutive_losses = RISK_LIMITS.get("max_consecutive_losses")
         
@@ -64,8 +64,7 @@ class RiskManager:
                 self.logger.warning(f"Unusual stop_loss_pct: {self.stop_loss_pct}, recommended range is 0.01-0.1")
             
             # Check take profit percentage
-            if self.take_profit_pct is not None and (self.take_profit_pct <= 0 or self.take_profit_pct > 0.5):
-                self.logger.warning(f"Unusual take_profit_pct: {self.take_profit_pct}, recommended range is 0.01-0.1")
+            
             
             # Check max drawdown
             if self.max_drawdown is not None and (self.max_drawdown <= 0 or self.max_drawdown > 0.5):
@@ -175,69 +174,7 @@ class RiskManager:
             return True
         return False
 
-    def check_take_profit(self, current_price: float, instrument_name: Optional[str] = None) -> Tuple[bool, str, float]:
-        """
-        Check if take-profit conditions are met.
-        Currently only checks P&L percentage based take profit.
-        Time-based take-profit needs to be re-evaluated in Step 3.
-        
-        Args:
-            current_price: Current market price
-            instrument_name: Optional instrument name for multi-instrument tracking
-            
-        Returns: 
-            Tuple[bool, str, float]: (triggered, reason, portion_to_close) 
-            portion_to_close is always 1.0 for now
-        """
-        if self.take_profit_pct is None:
-            return False, "", 0.0 # Take profit P&L not configured
 
-        metrics = self.position_tracker.get_position_metrics()
-        current_pos_size = metrics.get("position", 0.0)
-
-        if abs(current_pos_size) < ZERO_THRESHOLD:
-            return False, "", 0.0 # No position
-
-        # Update unrealized PnL in PositionTracker before checking
-        self.position_tracker.update_unrealized_pnl(current_price, instrument_name)
-        # Fetch updated metrics
-        metrics_after_upnl_update = self.position_tracker.get_position_metrics()
-        unrealized_pnl_value = metrics_after_upnl_update.get("unrealized_pnl", 0.0)
-        avg_entry_price = metrics_after_upnl_update.get("average_entry")
-
-        if avg_entry_price is None or abs(avg_entry_price * current_pos_size) < ZERO_THRESHOLD:
-            self.logger.debug("Take-profit check: No valid cost basis for PnL calculation.")
-            return False, "", 0.0
-        
-        cost_basis = abs(current_pos_size * avg_entry_price)
-        if cost_basis == 0:
-            return False, "", 0.0
-
-        current_pnl_pct = unrealized_pnl_value / cost_basis
-
-        # P&L based take profit
-        if self.take_profit_pct is not None and current_pnl_pct >= self.take_profit_pct:
-            reason = (
-                f"P&L take profit triggered. Position: {current_pos_size:.4f}, Entry: {avg_entry_price:.2f}, "
-                f"Current Price: {current_price:.2f}, P&L %: {current_pnl_pct:.4%}, Target TP %: {self.take_profit_pct:.2%}"
-            )
-            self.logger.info(reason)
-            return True, reason, 1.0 # Close entire position
-
-        # Time-based take profit (Placeholder - to be refined in Step 3)
-        # if self.position_entry_time_for_current_cycle and self.take_profit_duration_seconds:
-        #     position_duration = time.time() - self.position_entry_time_for_current_cycle
-        #     if position_duration >= self.take_profit_duration_seconds:
-        #         # Ensure minimum profit for time-based closure, e.g. PNL % > 0.001 (0.1%)
-        #         if current_pnl_pct > RISK_LIMITS.get("min_profit_for_timed_exit_pct", 0.001):
-        #             reason = (
-        #                 f"Time-based take profit triggered. Duration: {position_duration:.0f}s >= {self.take_profit_duration_seconds}s "
-        #                 f"with P&L %: {current_pnl_pct:.4%}"
-        #             )
-        #             self.logger.info(reason)
-        #             return True, reason, 1.0 # Close entire position
-        
-        return False, "", 0.0
 
     async def check_risk_limits(self, current_market_price: Optional[float] = None, instrument_name: Optional[str] = None) -> bool:
         """
@@ -327,7 +264,7 @@ class RiskManager:
             "max_position_limit": self.max_position_abs,
             "max_notional_limit": self.max_notional_value,
             "stop_loss_threshold_pct": self.stop_loss_pct,
-            "take_profit_threshold_pct": self.take_profit_pct,
+
             # "active_stop_loss_price": self.calculate_stop_loss_price(), # Would need current_price to calc
             # "active_take_profit_price": self.calculate_take_profit_price() # Would need current_price
         }

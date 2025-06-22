@@ -27,23 +27,23 @@ BOT_CONFIG = {
         # Avellaneda-Stoikov model parameters
         "avellaneda": {
             # Core model parameters
-            "gamma": 0.15,                  # Risk aversion
-            "kappa": 0.5,                  # Inventory risk factor
-            "time_horizon": 3600,          # Time horizon in seconds (1 hour)
-            "order_flow_intensity": 2.0,   # Order flow intensity parameter
+            "gamma": 0.1,                           # Risk aversion parameter
+            "kappa": 1.5,                           # Inventory risk factor
+            "time_horizon": 1.0,                    # Time horizon for optimization
+            "order_flow_intensity": 1.0,            # Order flow intensity
             
             # Spread management
             "base_spread": 14.0,            # Base spread in ticks
             "max_spread": 75.0,            # Maximum spread in ticks
             "spread_multiplier": 1.2,      # Dynamic spread adjustment factor
-            "base_spread_factor": 1.5,     # Multiplier for the base_spread in optimal spread calculation
-            "market_impact_factor": 0.7,   # Factor for market impact component in spread calculation
-            "inventory_factor": 0.7,       # Factor for inventory component in spread calculation
-            "volatility_multiplier": 0.4,  # Multiplier for volatility component in spread calculation
+            "base_spread_factor": 1.0,              # Base spread multiplier
+            "market_impact_factor": 0.5,            # Market impact adjustment
+            "inventory_factor": 0.5,                # Inventory risk adjustment
+            "volatility_multiplier": 0.2,           # Volatility adjustment factor
             
             # Position and inventory management
-            "inventory_weight": 0.8,       # Inventory skew factor
-            "position_fade_time": 9,     # Time to fade position (seconds)
+            "inventory_weight": 0.3,                # Inventory skew factor
+            "position_fade_time": 3600,             # Time to fade position (seconds)
             
             # Quote sizing and levels
             "base_size": 0.1,            
@@ -53,19 +53,24 @@ BOT_CONFIG = {
             
             # Fixed volatility for when calculation fails
             "fixed_volatility": 0.01,
-            "position_limit": 20,
+            "position_limit": 1.0,                  # Maximum position size
             "exchange_fee_rate": 0.0001,
             
             # Take profit trigger order configuration
-            "enable_take_profit_triggers": True,  # Enable automatic take profit orders
-            "take_profit_spread_bps": 7.0,       # Spread in basis points above entry (6-8 bps)
+            "enable_take_profit_triggers": True,          # Enable basic trigger orders
+            "enable_arbitrage_triggers": True,            # Enable enhanced arbitrage triggers
+            "take_profit_spread_bps": 7.0,               # Basic take profit spread (6-8 bps)
+            "arbitrage_profit_threshold_usd": 10.0,      # Trigger arbitrage close at $10 profit
+            "single_instrument_profit_threshold_usd": 5.0, # Trigger single instrument close at $5 profit
+            "spread_profit_threshold_bps": 15.0,         # Trigger close at 15 bps spread profit
+            "arbitrage_check_interval": 2.0,             # Check trigger conditions every 2 seconds
             
-            # Predictive adjustment thresholds (to prevent noise)
-            "pa_gamma_adj_threshold": 0.05,           # Minimum gamma adjustment to apply
-            "pa_kappa_adj_threshold": 0.05,           # Minimum kappa adjustment to apply  
+            # Predictive adjustment thresholds
+            "pa_prediction_max_age_seconds": 300,        # Max age for predictions (5 minutes)
+            "pa_gamma_adj_threshold": 0.05,              # Minimum gamma adjustment to apply
+            "pa_kappa_adj_threshold": 0.05,              # Minimum kappa adjustment to apply  
             "pa_res_price_offset_adj_threshold": 0.00005, # Minimum reservation price offset to apply
-            "pa_volatility_adj_threshold": 0.05,     # Minimum volatility adjustment to apply
-            "pa_prediction_max_age_seconds": 300,    # Max age of predictions to use (5 minutes)
+            "pa_volatility_adj_threshold": 0.05,         # Minimum volatility adjustment to apply
         },
         
         # Order execution parameters
@@ -139,18 +144,7 @@ BOT_CONFIG = {
 
     },
     
-    # Portfolio-wide take profit configuration
-    "portfolio_take_profit": {
-        "enable_portfolio_tp": True,         # Master enable/disable
-        "min_profit_usd": 3.0,              # Minimum profit threshold in USD
-        "profit_after_fees": True,          # Whether threshold applies after fees
-        "check_interval_seconds": 3.0,       # How often to check portfolio P&L
-        "max_position_age_hours": 24,        # Maximum time to hold positions
-        "emergency_close_threshold": -15.0,  # Emergency close if loss exceeds this
-        "partial_profit_threshold": 1.0,     # Take partial profits at this level
-        "position_correlation_check": True,  # Monitor position correlation
-        "fee_estimation_buffer": 1.2        # Multiply estimated fees by this factor
-    },
+
     
     # Trading fees configuration
     "trading_fees": {
@@ -251,7 +245,7 @@ TRADING_CONFIG = {
     "execution": BOT_CONFIG["trading_strategy"]["execution"],
     "volume_candle": BOT_CONFIG["trading_strategy"]["volume_candle"],
     "volatility": DEFAULT_VOLATILITY_CONFIG,
-    "portfolio_take_profit": BOT_CONFIG["portfolio_take_profit"],
+
     "trading_fees": BOT_CONFIG["trading_fees"],
 }
 
@@ -261,21 +255,4 @@ RISK_LIMITS: Dict[str, Any] = BOT_CONFIG["risk"]
 CONNECTION_CONFIG = BOT_CONFIG["connection"]
 
 
-def validate_portfolio_take_profit_config(config: Dict) -> bool:
-    """Validate portfolio take profit configuration"""
-    required_fields = ["min_profit_usd", "check_interval_seconds"]
-    
-    for field in required_fields:
-        if field not in config:
-            logging.error(f"Missing required portfolio take profit field: {field}")
-            return False
-    
-    if config["min_profit_usd"] <= 0:
-        logging.error("min_profit_usd must be positive")
-        return False
-        
-    if config["check_interval_seconds"] < 1.0:
-        logging.error("check_interval_seconds must be at least 1.0")
-        return False
-    
-    return True
+

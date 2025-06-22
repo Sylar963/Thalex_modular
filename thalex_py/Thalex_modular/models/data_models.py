@@ -742,28 +742,7 @@ class PerpQuoter:
             logging.error(f"Error handling risk breach: {str(e)}")
             await asyncio.sleep(5)  # Add delay on error
 
-    async def smart_position_reduction(self, take_profit_pct: float):
-        """Reduce position size based on market conditions"""
-        if self.position_size == 0:
-            return
 
-        reduction_size = self.position_size * 0.25  # Reduce 25% at a time
-        direction = th.Direction.SELL if self.position_size > 0 else th.Direction.BUY
-        
-        price_adjustment = (1 + take_profit_pct) if self.position_size > 0 else (1 - take_profit_pct)
-        target_price = self.entry_price * price_adjustment
-        
-        logging.info(f"Starting smart position reduction: {reduction_size} @ {target_price}")
-        
-        await self.thalex.insert(
-            direction=direction,
-            instrument_name=self.perp_name,
-            amount=abs(reduction_size),
-            price=target_price,
-            client_order_id=self.client_order_id,
-            id=self.client_order_id
-        )
-        self.client_order_id += 1
 
     async def manage_position(self):
         """Enhanced position management with notional limits and inventory controls"""
@@ -2783,7 +2762,7 @@ class PerpQuoter:
             net_profit = self.portfolio_tracker.get_net_profit_after_all_fees()
             
             # Take profit threshold - configurable with default $1.1
-            tp_threshold = BOT_CONFIG.get("portfolio_take_profit", {}).get("min_profit_usd", 1.1)
+            tp_threshold = 1.1  # Default threshold
             
             if net_profit >= tp_threshold:
                 self.logger.info(f"Portfolio take profit triggered: Net profit ${net_profit:.2f} >= ${tp_threshold:.2f}")
@@ -2971,8 +2950,7 @@ class ConfigValidator:
             RISK_LIMITS["max_position"] > 0, # Use RISK_LIMITS directly
             RISK_LIMITS["max_notional"] > 0, # Use RISK_LIMITS directly
             RISK_LIMITS["stop_loss_pct"] > 0, # Use RISK_LIMITS directly
-            RISK_LIMITS.get("base_take_profit_pct", 0) > RISK_LIMITS.get("min_take_profit_pct", -1),
-            RISK_LIMITS.get("max_take_profit_pct", 0) > RISK_LIMITS.get("base_take_profit_pct", -1),
+
             RISK_LIMITS.get("rebalance_threshold", 0) > 0 and RISK_LIMITS.get("rebalance_threshold", 0) < 1
         ]
         return all(checks)

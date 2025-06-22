@@ -9,7 +9,7 @@ import logging
 
 from ..config.market_config import TRADING_CONFIG, RISK_LIMITS, ORDERBOOK_CONFIG
 from ..models.data_models import Ticker, Quote
-from ..models.position_tracker import PositionTracker, Fill
+from ..models.position_tracker import PositionTracker, PortfolioTracker, Fill
 from ..thalex_logging import LoggerFactory
 from ..ringbuffer.volume_candle_buffer import VolumeBasedCandleBuffer
 
@@ -42,7 +42,18 @@ class AvellanedaMarketMaker:
         '_log_counter', '_last_major_log',
         # Take profit trigger order system
         'active_trigger_orders', 'take_profit_spread_bps', 'trigger_order_enabled',
-        'last_trigger_update', 'pending_trigger_cancellations'
+        'last_trigger_update', 'pending_trigger_cancellations',
+        # Multi-instrument support
+        'portfolio_tracker',
+        # Multi-instrument arbitrage take profit system
+        'arbitrage_trigger_enabled', 'arbitrage_profit_threshold_usd', 'single_instrument_profit_threshold_usd',
+        'spread_profit_threshold_bps', 'last_arbitrage_check', 'arbitrage_check_interval',
+        # Trading mode detection
+        'trading_mode', 'last_mode_detection', 'mode_detection_interval',
+        # Instrument configurations
+        'perp_instrument', 'futures_instrument', 'perp_tick_size', 'futures_tick_size',
+        # Predictive trend tracking
+        'trend_direction'
     ]
     
     def __init__(self, exchange_client=None, position_tracker: PositionTracker = None):
@@ -63,6 +74,8 @@ class AvellanedaMarketMaker:
         
         # Position tracking
         self.position_tracker = position_tracker
+        # Portfolio tracker for multi-instrument support (will be set by quoter)
+        self.portfolio_tracker = None
         
         # Market parameters
         self.volatility = TRADING_CONFIG["volatility"]["default"]
@@ -161,12 +174,31 @@ class AvellanedaMarketMaker:
         self._log_counter = 0
         self._last_major_log = 0.0
 
-        # Take profit trigger order system
+        # Enhanced multi-instrument take profit trigger order system
         self.active_trigger_orders = {}  # Dict[str, Quote] - order_id -> trigger order
         self.take_profit_spread_bps = TRADING_CONFIG["avellaneda"].get("take_profit_spread_bps", 7.0)  # 6-8 bps default
         self.trigger_order_enabled = TRADING_CONFIG["avellaneda"].get("enable_take_profit_triggers", True)
         self.last_trigger_update = 0.0
         self.pending_trigger_cancellations = set()  # Set of order IDs pending cancellation
+
+        # NEW: Multi-instrument arbitrage take profit system
+        self.arbitrage_trigger_enabled = TRADING_CONFIG["avellaneda"].get("enable_arbitrage_triggers", True)
+        self.arbitrage_profit_threshold_usd = TRADING_CONFIG["avellaneda"].get("arbitrage_profit_threshold_usd", 10.0)
+        self.single_instrument_profit_threshold_usd = TRADING_CONFIG["avellaneda"].get("single_instrument_profit_threshold_usd", 5.0)
+        self.spread_profit_threshold_bps = TRADING_CONFIG["avellaneda"].get("spread_profit_threshold_bps", 15.0)  # 15 bps for spread profits
+        self.last_arbitrage_check = 0.0
+        self.arbitrage_check_interval = TRADING_CONFIG["avellaneda"].get("arbitrage_check_interval", 2.0)  # Check every 2 seconds
+        
+        # Trading mode detection
+        self.trading_mode = "unknown"  # "single_perp", "single_futures", "arbitrage", "unknown"
+        self.last_mode_detection = 0.0
+        self.mode_detection_interval = 5.0  # Check trading mode every 5 seconds
+        
+        # Instrument configurations (will be updated by quoter)
+        self.perp_instrument = None
+        self.futures_instrument = None
+        self.perp_tick_size = 1.0
+        self.futures_tick_size = 1.0
 
         # Initialize hedge manager (disabled by default)
         if False:  # Force disabled to avoid configuration issues
@@ -1415,17 +1447,14 @@ class AvellanedaMarketMaker:
                 # Now process the fill for hedging
                 self._process_fill_for_hedging(order_id, fill_price, fill_size, is_buy)
             
-            # NEW: Handle take profit trigger order creation/update
-            if self.trigger_order_enabled:
-                self._handle_trigger_order_on_fill(
-                    fill_price, fill_size, is_buy, old_position, old_entry_price
-                )
+            # NOTE: Trigger order logic is now handled separately by the quoter
+            # with instrument-specific information via _handle_trigger_order_on_fill
             
             # Performance: Always log fills but with reduced detail for frequent small fills  
             if fill_size >= 0.01 or random.random() < LOG_SAMPLING_RATE * 10:  # Always log significant fills
                 self.logger.info(
                     f"Order filled: {fill_size} @ {fill_price} ({'BUY' if is_buy else 'SELL'})"
-                    f" - New position: {self.position_tracker.current_position:.4f}, Avg entry: {self.position_tracker.average_entry_price:.2f}" # MODIFIED
+                    f" - New position: {self.position_tracker.current_position:.4f}, Avg entry: {self.position_tracker.average_entry_price:.2f}"
                 )
             
         except Exception as e:
@@ -1492,7 +1521,7 @@ class AvellanedaMarketMaker:
             self.logger.error(f"Error processing fill for hedging: {e}", exc_info=True)
 
     def _handle_trigger_order_on_fill(self, fill_price: float, fill_size: float, is_buy: bool, 
-                                     old_position: float, old_entry_price: float) -> None:
+                                     old_position: float, old_entry_price: float, instrument: str = None) -> None:
         """
         Handle trigger order creation/update when a grid order is filled
         
@@ -1502,49 +1531,85 @@ class AvellanedaMarketMaker:
             is_buy: True if it was a buy order
             old_position: Position before this fill
             old_entry_price: Entry price before this fill
+            instrument: The instrument that was filled (NEW)
         """
         try:
-            current_position = self.position_tracker.current_position
+            # Use the instrument from the fill, or fallback to current instrument
+            target_instrument = instrument or self.instrument
+            if not target_instrument:
+                self.logger.warning("No instrument specified for trigger order creation")
+                return
+            
+            # Get current position for this specific instrument
+            current_position = old_position  # Use old position as fallback
+            
+            # Try to get current position from portfolio tracker if available
+            if hasattr(self, 'portfolio_tracker') and self.portfolio_tracker:
+                if target_instrument in self.portfolio_tracker.instrument_trackers:
+                    instrument_tracker = self.portfolio_tracker.instrument_trackers[target_instrument]
+                    current_position = instrument_tracker.current_position
+                else:
+                    self.logger.warning(f"Instrument {target_instrument} not found in portfolio tracker")
+                    return
+            else:
+                # Fallback to single position tracker (but this won't be instrument-specific)
+                current_position = self.position_tracker.current_position
             
             # Skip if no position (shouldn't happen but safety check)
             if abs(current_position) < 0.001:
-                self.logger.debug("No position after fill, skipping trigger order creation")
+                self.logger.debug(f"No position after fill for {target_instrument}, skipping trigger order creation")
                 return
             
             # Determine if this is a new position or addition to existing position
             position_direction_changed = (old_position >= 0) != (current_position >= 0)
             position_increased = abs(current_position) > abs(old_position)
             
-            # If position direction changed, cancel all existing triggers
+            # If position direction changed, cancel all existing triggers for this instrument
             if position_direction_changed:
-                self._cancel_all_trigger_orders("Position direction changed")
+                self._cancel_trigger_orders_by_instrument(target_instrument, "Position direction changed")
             
             # If position increased (new inventory added), update/create trigger orders
             if position_increased:
-                # Cancel existing trigger orders for this side
+                # Cancel existing trigger orders for this side and instrument
                 side_to_cancel = "sell" if current_position > 0 else "buy"
-                self._cancel_trigger_orders_by_side(side_to_cancel, "Position increased, updating trigger")
+                self._cancel_trigger_orders_by_side_and_instrument(side_to_cancel, target_instrument, "Position increased, updating trigger")
                 
                 # Create new trigger order at updated entry price + spread
-                self._create_trigger_order()
+                self._create_trigger_order_for_instrument(target_instrument)
+                
+                self.logger.info(
+                    f"Updated trigger for {target_instrument}: position {old_position:.4f} → {current_position:.4f}"
+                )
                 
             self.last_trigger_update = time.time()
             
         except Exception as e:
             self.logger.error(f"Error handling trigger order on fill: {str(e)}", exc_info=True)
 
-    def _create_trigger_order(self) -> None:
-        """Create a take profit trigger order based on current position"""
+    def _create_trigger_order_for_instrument(self, instrument: str) -> None:
+        """Create a take profit trigger order for a specific instrument"""
         try:
-            current_position = self.position_tracker.current_position
+            # Get position for this specific instrument from portfolio tracker
+            if not hasattr(self, 'portfolio_tracker') or not self.portfolio_tracker:
+                self.logger.warning("No portfolio tracker available for instrument-specific trigger orders")
+                return
+                
+            # Get instrument tracker
+            if instrument not in self.portfolio_tracker.instrument_trackers:
+                self.logger.warning(f"Instrument {instrument} not found in portfolio tracker")
+                return
+                
+            instrument_tracker = self.portfolio_tracker.instrument_trackers[instrument]
+            current_position = instrument_tracker.current_position
             
             # Skip if no significant position
             if abs(current_position) < 0.001:
+                self.logger.debug(f"No significant position for {instrument}: {current_position:.6f}")
                 return
                 
-            entry_price = self.position_tracker.average_entry_price
+            entry_price = instrument_tracker.average_entry_price
             if entry_price <= 0:
-                self.logger.warning("Invalid entry price, cannot create trigger order")
+                self.logger.warning(f"Invalid entry price for {instrument}: {entry_price}")
                 return
             
             # Calculate take profit price (entry + spread in basis points)
@@ -1559,7 +1624,7 @@ class AvellanedaMarketMaker:
                 trigger_side = "buy"
                 trigger_size = abs(current_position)
             
-            # Round to tick size
+            # Round to tick size (use instrument-specific tick size if available)
             trigger_price = self.round_to_tick(trigger_price)
             
             # Ensure minimum order size
@@ -1568,7 +1633,7 @@ class AvellanedaMarketMaker:
             
             # Create trigger quote
             trigger_quote = Quote(
-                instrument=self.instrument,
+                instrument=instrument,  # Use specific instrument
                 side=trigger_side,
                 price=trigger_price,
                 amount=trigger_size,
@@ -1576,21 +1641,85 @@ class AvellanedaMarketMaker:
                 is_trigger_order=True  # Mark as trigger order
             )
             
-            # Store the trigger order (will be sent by quoter)
-            trigger_id = f"trigger_{trigger_side}_{int(time.time() * 1000)}"
+            # Store the trigger order with instrument-specific ID
+            trigger_id = f"trigger_{instrument}_{trigger_side}_{int(time.time() * 1000)}"
             self.active_trigger_orders[trigger_id] = trigger_quote
             
             self.logger.info(
-                f"Created trigger order: {trigger_side.upper()} {trigger_size:.4f} @ {trigger_price:.2f} "
+                f"Created trigger order for {instrument}: {trigger_side.upper()} {trigger_size:.4f} @ {trigger_price:.2f} "
                 f"(entry: {entry_price:.2f}, spread: {self.take_profit_spread_bps:.1f}bps, "
                 f"position: {current_position:.4f})"
             )
             
         except Exception as e:
-            self.logger.error(f"Error creating trigger order: {str(e)}", exc_info=True)
+            self.logger.error(f"Error creating trigger order for {instrument}: {str(e)}", exc_info=True)
+
+    def _cancel_trigger_orders_by_instrument(self, instrument: str, reason: str) -> None:
+        """Cancel all trigger orders for a specific instrument"""
+        try:
+            orders_to_cancel = []
+            for order_id, trigger_order in self.active_trigger_orders.items():
+                if trigger_order.instrument == instrument:
+                    orders_to_cancel.append(order_id)
+            
+            for order_id in orders_to_cancel:
+                self.pending_trigger_cancellations.add(order_id)
+                del self.active_trigger_orders[order_id]
+                self.logger.info(f"Cancelled trigger order {order_id} for {instrument}: {reason}")
+                
+        except Exception as e:
+            self.logger.error(f"Error cancelling trigger orders for {instrument}: {str(e)}", exc_info=True)
+
+    def _cancel_trigger_orders_by_side_and_instrument(self, side: str, instrument: str, reason: str) -> None:
+        """Cancel trigger orders for a specific side and instrument"""
+        try:
+            orders_to_cancel = []
+            for order_id, trigger_order in self.active_trigger_orders.items():
+                if trigger_order.side == side and trigger_order.instrument == instrument:
+                    orders_to_cancel.append(order_id)
+            
+            for order_id in orders_to_cancel:
+                self.pending_trigger_cancellations.add(order_id)
+                del self.active_trigger_orders[order_id]
+                self.logger.info(f"Cancelled trigger order {order_id} ({side}) for {instrument}: {reason}")
+                
+        except Exception as e:
+            self.logger.error(f"Error cancelling trigger orders by side for {instrument}: {str(e)}", exc_info=True)
+
+    def check_and_create_missing_trigger_orders(self) -> None:
+        """Enhanced check for missing trigger orders with multi-instrument support"""
+        try:
+            if not self.trigger_order_enabled:
+                return
+            
+            # Use enhanced trigger order creation
+            new_triggers = self.create_enhanced_trigger_orders()
+            
+            if new_triggers:
+                self.logger.info(f"Created {len(new_triggers)} enhanced trigger orders")
+            else:
+                self.logger.debug("No new trigger orders needed")
+                
+        except Exception as e:
+            self.logger.error(f"Error checking and creating missing trigger orders: {str(e)}", exc_info=True)
+
+    def _cancel_all_trigger_orders(self, reason: str) -> None:
+        """Cancel all active trigger orders"""
+        try:
+            cancelled_count = 0
+            for order_id in list(self.active_trigger_orders.keys()):
+                self.pending_trigger_cancellations.add(order_id)
+                del self.active_trigger_orders[order_id]
+                cancelled_count += 1
+                
+            if cancelled_count > 0:
+                self.logger.info(f"Cancelled {cancelled_count} trigger orders: {reason}")
+                
+        except Exception as e:
+            self.logger.error(f"Error cancelling all trigger orders: {str(e)}", exc_info=True)
 
     def _cancel_trigger_orders_by_side(self, side: str, reason: str) -> None:
-        """Cancel trigger orders for a specific side"""
+        """Cancel trigger orders for a specific side (all instruments)"""
         try:
             orders_to_cancel = []
             for order_id, trigger_order in self.active_trigger_orders.items():
@@ -1604,19 +1733,6 @@ class AvellanedaMarketMaker:
                 
         except Exception as e:
             self.logger.error(f"Error cancelling trigger orders by side: {str(e)}", exc_info=True)
-
-    def _cancel_all_trigger_orders(self, reason: str) -> None:
-        """Cancel all active trigger orders"""
-        try:
-            for order_id in list(self.active_trigger_orders.keys()):
-                self.pending_trigger_cancellations.add(order_id)
-                del self.active_trigger_orders[order_id]
-                
-            if self.active_trigger_orders:  # Should be empty now
-                self.logger.info(f"Cancelled all trigger orders: {reason}")
-                
-        except Exception as e:
-            self.logger.error(f"Error cancelling all trigger orders: {str(e)}", exc_info=True)
 
     def get_active_trigger_orders(self) -> Dict[str, Quote]:
         """Get current active trigger orders for the quoter to place"""
@@ -1654,29 +1770,87 @@ class AvellanedaMarketMaker:
             self.logger.error(f"Error handling trigger order cancellation: {str(e)}", exc_info=True)
 
     def get_position_metrics(self) -> Dict:
-        """Get position and performance metrics"""
-        metrics = {
-            'position': self.position_tracker.current_position,
-            'entry_price': self.position_tracker.average_entry_price,
-            'realized_pnl': self.position_tracker.realized_pnl,
-            'unrealized_pnl': self.position_tracker.unrealized_pnl,
-            'total_pnl': self.position_tracker.realized_pnl + self.position_tracker.unrealized_pnl,
-            'vwap': self.vwap,
-            'vamp': self.calculate_vamp()
-        }
-        
-        # NEW: Add predictive signals to metrics
+        """Enhanced position metrics with multi-instrument support"""
         try:
-            if hasattr(self, 'volume_buffer'):
-                metrics['predictive_signals'] = self.volume_buffer.get_signal_metrics()['signals']
-                
-                # Add prediction accuracy if available
-                if hasattr(self, 'last_mid_price') and self.last_mid_price > 0:
-                    metrics['prediction_accuracy'] = self.volume_buffer.evaluate_prediction_accuracy(self.last_mid_price)
-        except Exception as e:
-            self.logger.error(f"Error getting predictive metrics: {str(e)}")
+            # Get trading mode and profit metrics
+            mode = self.detect_trading_mode()
             
-        return metrics
+            base_metrics = {
+                'position': self.position_tracker.current_position,
+                'entry_price': self.position_tracker.average_entry_price,
+                'realized_pnl': self.position_tracker.realized_pnl,
+                'unrealized_pnl': self.position_tracker.unrealized_pnl,
+                'total_pnl': self.position_tracker.realized_pnl + self.position_tracker.unrealized_pnl,
+                'vwap': self.vwap,
+                'vamp': self.calculate_vamp(),
+                'trading_mode': mode
+            }
+            
+            # Add multi-instrument metrics
+            if self.portfolio_tracker:
+                portfolio_metrics = self.portfolio_tracker.get_portfolio_metrics()
+                base_metrics.update({
+                    'portfolio_total_pnl': portfolio_metrics.get('total_pnl', 0.0),
+                    'portfolio_net_pnl': portfolio_metrics.get('net_pnl_after_fees', 0.0),
+                    'portfolio_positions': portfolio_metrics.get('instrument_positions', {}),
+                    'estimated_closing_fees': portfolio_metrics.get('estimated_closing_fees', 0.0)
+                })
+                
+                # Add mode-specific profit metrics
+                if mode == "arbitrage":
+                    arb_profit = self.calculate_arbitrage_profit()
+                    base_metrics.update({
+                        'arbitrage_profit_usd': arb_profit['total_profit_usd'],
+                        'spread_profit_bps': arb_profit['spread_profit_bps'],
+                        'arbitrage_net_profit': arb_profit['net_profit_after_fees']
+                    })
+                elif mode in ["single_perp", "single_futures"]:
+                    instrument = self.perp_instrument if mode == "single_perp" else self.futures_instrument
+                    if instrument:
+                        single_profit = self.calculate_single_instrument_profit(instrument)
+                        base_metrics.update({
+                            f'{mode}_profit_usd': single_profit['profit_usd'],
+                            f'{mode}_profit_pct': single_profit.get('profit_percentage', 0.0)
+                        })
+            
+            # Add trigger decision info
+            try:
+                trigger_decision = self.should_trigger_take_profit()
+                base_metrics.update({
+                    'should_trigger_take_profit': trigger_decision['should_trigger'],
+                    'trigger_reason': trigger_decision.get('reason', ''),
+                    'active_trigger_orders': len(self.active_trigger_orders)
+                })
+            except:
+                # Don't fail if trigger logic has issues
+                pass
+            
+            # NEW: Add predictive signals to metrics
+            try:
+                if hasattr(self, 'volume_buffer') and self.volume_buffer:
+                    base_metrics['predictive_signals'] = self.volume_buffer.get_signal_metrics()['signals']
+                    
+                    # Add prediction accuracy if available
+                    if hasattr(self, 'last_mid_price') and self.last_mid_price > 0:
+                        base_metrics['prediction_accuracy'] = self.volume_buffer.evaluate_prediction_accuracy(self.last_mid_price)
+            except Exception as e:
+                self.logger.error(f"Error getting predictive metrics: {str(e)}")
+                
+            return base_metrics
+            
+        except Exception as e:
+            self.logger.error(f"Error getting position metrics: {str(e)}", exc_info=True)
+            # Return basic metrics as fallback
+            return {
+                'position': getattr(self.position_tracker, 'current_position', 0),
+                'entry_price': getattr(self.position_tracker, 'average_entry_price', 0),
+                'realized_pnl': getattr(self.position_tracker, 'realized_pnl', 0),
+                'unrealized_pnl': getattr(self.position_tracker, 'unrealized_pnl', 0),
+                'total_pnl': 0,
+                'vwap': self.vwap,
+                'vamp': self.calculate_vamp(),
+                'trading_mode': 'error'
+            }
 
     def align_price_to_tick(self, price: float) -> float:
         """
@@ -2095,3 +2269,437 @@ class AvellanedaMarketMaker:
             self.logger.info(f"Current P&L: ${hedge_position.pnl:.2f}")
         else:
             self.logger.info(f"No active hedge for {self.instrument} position (${monetary_position:.2f})")
+
+    def set_instrument_config(self, perp_instrument: str = None, futures_instrument: str = None, 
+                             perp_tick_size: float = 1.0, futures_tick_size: float = 1.0):
+        """
+        Configure instruments for multi-instrument take profit logic
+        
+        Args:
+            perp_instrument: Perpetual contract instrument name (e.g. "BTC-PERPETUAL")
+            futures_instrument: Futures contract instrument name (e.g. "BTC-25JUL25")
+            perp_tick_size: Tick size for perpetual contract
+            futures_tick_size: Tick size for futures contract
+        """
+        self.perp_instrument = perp_instrument
+        self.futures_instrument = futures_instrument
+        self.perp_tick_size = perp_tick_size
+        self.futures_tick_size = futures_tick_size
+        
+        self.logger.info(
+            f"Instrument config updated: Perp={perp_instrument} (tick:{perp_tick_size}), "
+            f"Futures={futures_instrument} (tick:{futures_tick_size})"
+        )
+
+    def detect_trading_mode(self) -> str:
+        """
+        Detect current trading mode based on active positions
+        
+        Returns:
+            str: "single_perp", "single_futures", "arbitrage", or "unknown"
+        """
+        try:
+            current_time = time.time()
+            
+            # Don't check too frequently for performance
+            if current_time - self.last_mode_detection < self.mode_detection_interval:
+                return self.trading_mode
+                
+            self.last_mode_detection = current_time
+            
+            if not self.portfolio_tracker:
+                self.logger.debug("No portfolio tracker available for mode detection")
+                return "unknown"
+            
+            # Get positions for both instruments
+            perp_position = 0.0
+            futures_position = 0.0
+            
+            if self.perp_instrument and self.perp_instrument in self.portfolio_tracker.instrument_trackers:
+                perp_position = self.portfolio_tracker.instrument_trackers[self.perp_instrument].current_position
+                
+            if self.futures_instrument and self.futures_instrument in self.portfolio_tracker.instrument_trackers:
+                futures_position = self.portfolio_tracker.instrument_trackers[self.futures_instrument].current_position
+            
+            # Position thresholds
+            position_threshold = 0.001  # Minimum position to consider significant
+            
+            # Detect mode based on positions
+            has_perp = abs(perp_position) > position_threshold
+            has_futures = abs(futures_position) > position_threshold
+            
+            if has_perp and has_futures:
+                # Check if positions are opposite (arbitrage) or same direction
+                if (perp_position > 0 and futures_position < 0) or (perp_position < 0 and futures_position > 0):
+                    new_mode = "arbitrage"
+                else:
+                    # Both positions in same direction - likely hedged or directional multi-leg
+                    new_mode = "arbitrage"  # Still treat as arbitrage for profit calculation
+            elif has_perp and not has_futures:
+                new_mode = "single_perp"
+            elif has_futures and not has_perp:
+                new_mode = "single_futures"
+            else:
+                new_mode = "unknown"  # No significant positions
+            
+            # Log mode changes
+            if new_mode != self.trading_mode:
+                self.logger.info(
+                    f"Trading mode changed: {self.trading_mode} → {new_mode} "
+                    f"(Perp: {perp_position:.4f}, Futures: {futures_position:.4f})"
+                )
+                self.trading_mode = new_mode
+            
+            return self.trading_mode
+            
+        except Exception as e:
+            self.logger.error(f"Error detecting trading mode: {str(e)}", exc_info=True)
+            return "unknown"
+
+    def calculate_single_instrument_profit(self, instrument: str) -> Dict[str, float]:
+        """
+        Calculate profit metrics for a single instrument position
+        
+        Args:
+            instrument: Instrument name
+            
+        Returns:
+            Dict with profit metrics
+        """
+        try:
+            if not self.portfolio_tracker or instrument not in self.portfolio_tracker.instrument_trackers:
+                return {"profit_usd": 0.0, "position_size": 0.0, "entry_price": 0.0, "mark_price": 0.0}
+            
+            tracker = self.portfolio_tracker.instrument_trackers[instrument]
+            position_size = tracker.current_position
+            
+            if abs(position_size) < 0.001:
+                return {"profit_usd": 0.0, "position_size": 0.0, "entry_price": 0.0, "mark_price": 0.0}
+            
+            entry_price = tracker.average_entry_price
+            mark_price = self.portfolio_tracker.mark_prices.get(instrument, 0.0)
+            
+            if entry_price <= 0 or mark_price <= 0:
+                return {"profit_usd": 0.0, "position_size": position_size, "entry_price": entry_price, "mark_price": mark_price}
+            
+            # Calculate profit
+            profit_per_unit = mark_price - entry_price if position_size > 0 else entry_price - mark_price
+            profit_usd = profit_per_unit * abs(position_size)
+            
+            return {
+                "profit_usd": profit_usd,
+                "position_size": position_size,
+                "entry_price": entry_price,
+                "mark_price": mark_price,
+                "profit_per_unit": profit_per_unit,
+                "profit_percentage": (profit_per_unit / entry_price) * 100 if entry_price > 0 else 0.0
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating single instrument profit for {instrument}: {str(e)}", exc_info=True)
+            return {"profit_usd": 0.0, "position_size": 0.0, "entry_price": 0.0, "mark_price": 0.0}
+
+    def calculate_arbitrage_profit(self) -> Dict[str, Any]:
+        """
+        Calculate combined profit metrics for arbitrage positions
+        
+        Returns:
+            Dict with combined profit metrics
+        """
+        try:
+            if not self.portfolio_tracker:
+                return {"total_profit_usd": 0.0, "spread_profit_bps": 0.0, "legs": {}}
+            
+            # Get individual leg profits
+            perp_metrics = self.calculate_single_instrument_profit(self.perp_instrument) if self.perp_instrument else {}
+            futures_metrics = self.calculate_single_instrument_profit(self.futures_instrument) if self.futures_instrument else {}
+            
+            # Calculate combined metrics
+            total_profit_usd = perp_metrics.get("profit_usd", 0.0) + futures_metrics.get("profit_usd", 0.0)
+            
+            # Calculate spread profit in basis points
+            spread_profit_bps = 0.0
+            if perp_metrics.get("position_size", 0) != 0 and futures_metrics.get("position_size", 0) != 0:
+                # Use the larger position size as the base for BPS calculation
+                base_notional = max(
+                    abs(perp_metrics.get("position_size", 0) * perp_metrics.get("mark_price", 0)),
+                    abs(futures_metrics.get("position_size", 0) * futures_metrics.get("mark_price", 0))
+                )
+                if base_notional > 0:
+                    spread_profit_bps = (total_profit_usd / base_notional) * 10000
+            
+            # Estimate closing fees
+            closing_fees = 0.0
+            if hasattr(self.portfolio_tracker, 'estimate_closing_fees'):
+                closing_fees = self.portfolio_tracker.estimate_closing_fees()
+            
+            return {
+                "total_profit_usd": total_profit_usd,
+                "spread_profit_bps": spread_profit_bps,
+                "estimated_closing_fees": closing_fees,
+                "net_profit_after_fees": total_profit_usd - closing_fees,
+                "legs": {
+                    "perp": perp_metrics,
+                    "futures": futures_metrics
+                },
+                "combined_position_value": (
+                    abs(perp_metrics.get("position_size", 0) * perp_metrics.get("mark_price", 0)) +
+                    abs(futures_metrics.get("position_size", 0) * futures_metrics.get("mark_price", 0))
+                )
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating arbitrage profit: {str(e)}", exc_info=True)
+            return {"total_profit_usd": 0.0, "spread_profit_bps": 0.0, "legs": {}}
+
+    def should_trigger_take_profit(self) -> Dict[str, Any]:
+        """
+        Determine if take profit should be triggered based on current positions and profits
+        
+        Returns:
+            Dict with trigger decision and details
+        """
+        try:
+            current_time = time.time()
+            
+            # Don't check too frequently for performance
+            if current_time - self.last_arbitrage_check < self.arbitrage_check_interval:
+                return {"should_trigger": False, "reason": "rate_limited"}
+            
+            self.last_arbitrage_check = current_time
+            
+            # Detect current trading mode
+            mode = self.detect_trading_mode()
+            
+            if mode == "unknown":
+                return {"should_trigger": False, "reason": "no_significant_positions", "mode": mode}
+            
+            result = {
+                "should_trigger": False,
+                "reason": "",
+                "mode": mode,
+                "trigger_type": "",
+                "instruments_to_close": [],
+                "profit_metrics": {}
+            }
+            
+            if mode == "arbitrage":
+                # Arbitrage mode - check combined profit
+                arb_profit = self.calculate_arbitrage_profit()
+                result["profit_metrics"] = arb_profit
+                
+                total_profit = arb_profit["total_profit_usd"]
+                net_profit = arb_profit["net_profit_after_fees"]
+                spread_bps = arb_profit["spread_profit_bps"]
+                
+                self.logger.debug(
+                    f"Arbitrage profit check: Total=${total_profit:.2f}, Net=${net_profit:.2f}, "
+                    f"Spread={spread_bps:.1f}bps, Threshold=${self.arbitrage_profit_threshold_usd:.2f}"
+                )
+                
+                # Check if arbitrage profit exceeds threshold
+                if net_profit >= self.arbitrage_profit_threshold_usd or spread_bps >= self.spread_profit_threshold_bps:
+                    result["should_trigger"] = True
+                    result["trigger_type"] = "arbitrage"
+                    result["reason"] = f"arbitrage_profit_threshold (${net_profit:.2f} >= ${self.arbitrage_profit_threshold_usd:.2f} OR {spread_bps:.1f}bps >= {self.spread_profit_threshold_bps:.1f}bps)"
+                    
+                    # Close both legs
+                    if self.perp_instrument and abs(arb_profit["legs"]["perp"].get("position_size", 0)) > 0.001:
+                        result["instruments_to_close"].append(self.perp_instrument)
+                    if self.futures_instrument and abs(arb_profit["legs"]["futures"].get("position_size", 0)) > 0.001:
+                        result["instruments_to_close"].append(self.futures_instrument)
+                        
+            elif mode in ["single_perp", "single_futures"]:
+                # Single instrument mode
+                instrument = self.perp_instrument if mode == "single_perp" else self.futures_instrument
+                if not instrument:
+                    return {"should_trigger": False, "reason": "instrument_not_configured", "mode": mode}
+                
+                single_profit = self.calculate_single_instrument_profit(instrument)
+                result["profit_metrics"] = {instrument: single_profit}
+                
+                profit_usd = single_profit["profit_usd"]
+                
+                self.logger.debug(
+                    f"Single instrument profit check ({instrument}): ${profit_usd:.2f}, "
+                    f"Threshold=${self.single_instrument_profit_threshold_usd:.2f}"
+                )
+                
+                # Check if single instrument profit exceeds threshold
+                if profit_usd >= self.single_instrument_profit_threshold_usd:
+                    result["should_trigger"] = True
+                    result["trigger_type"] = "single_instrument"
+                    result["reason"] = f"single_instrument_threshold (${profit_usd:.2f} >= ${self.single_instrument_profit_threshold_usd:.2f})"
+                    result["instruments_to_close"] = [instrument]
+            
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Error checking take profit trigger: {str(e)}", exc_info=True)
+            return {"should_trigger": False, "reason": "error", "error": str(e)}
+
+    def create_enhanced_trigger_orders(self) -> List[Quote]:
+        """
+        Create enhanced trigger orders based on current trading mode and positions
+        
+        Returns:
+            List of trigger orders to place
+        """
+        try:
+            # Check if we should trigger take profit
+            trigger_decision = self.should_trigger_take_profit()
+            
+            if not trigger_decision["should_trigger"]:
+                # No immediate trigger needed, create standard trigger orders for existing positions
+                return self._create_standard_trigger_orders()
+            
+            # Create immediate trigger orders to close positions
+            trigger_orders = []
+            instruments_to_close = trigger_decision.get("instruments_to_close", [])
+            
+            self.logger.info(
+                f"Creating enhanced trigger orders: {trigger_decision['trigger_type']} trigger "
+                f"for {len(instruments_to_close)} instruments - {trigger_decision['reason']}"
+            )
+            
+            for instrument in instruments_to_close:
+                if not self.portfolio_tracker or instrument not in self.portfolio_tracker.instrument_trackers:
+                    continue
+                
+                tracker = self.portfolio_tracker.instrument_trackers[instrument]
+                position_size = tracker.current_position
+                
+                if abs(position_size) < 0.001:
+                    continue
+                
+                # Get current mark price
+                mark_price = self.portfolio_tracker.mark_prices.get(instrument, 0.0)
+                if mark_price <= 0:
+                    self.logger.warning(f"No mark price for {instrument}, skipping trigger order")
+                    continue
+                
+                # Determine appropriate tick size with safety check
+                tick_size = self.perp_tick_size if instrument == self.perp_instrument else self.futures_tick_size
+                if tick_size <= 0:
+                    self.logger.warning(f"Invalid tick size {tick_size} for {instrument}, using default 1.0")
+                    tick_size = 1.0
+                
+                # Create aggressive trigger order to close position quickly
+                # Use a small buffer to ensure fills (0.1% for market-like execution)
+                price_buffer = 0.001  # 10 basis points
+                
+                if position_size > 0:  # Long position - create sell trigger
+                    trigger_price = mark_price * (1 - price_buffer)
+                    trigger_side = "sell"
+                else:  # Short position - create buy trigger
+                    trigger_price = mark_price * (1 + price_buffer)
+                    trigger_side = "buy"
+                
+                # Round to appropriate tick size
+                trigger_price = round(trigger_price / tick_size) * tick_size
+                trigger_size = abs(position_size)
+                
+                # Create trigger order
+                trigger_quote = Quote(
+                    instrument=instrument,
+                    side=trigger_side,
+                    price=trigger_price,
+                    amount=trigger_size,
+                    timestamp=time.time(),
+                    is_trigger_order=True
+                )
+                
+                # Generate unique trigger ID
+                trigger_id = f"enhanced_trigger_{instrument}_{trigger_side}_{int(time.time() * 1000)}"
+                
+                # Store trigger order
+                self.active_trigger_orders[trigger_id] = trigger_quote
+                trigger_orders.append(trigger_quote)
+                
+                self.logger.info(
+                    f"Created enhanced trigger: {instrument} {trigger_side.upper()} {trigger_size:.4f} @ {trigger_price:.2f} "
+                    f"(mark: {mark_price:.2f}, buffer: {price_buffer:.1%})"
+                )
+            
+            return trigger_orders
+            
+        except Exception as e:
+            self.logger.error(f"Error creating enhanced trigger orders: {str(e)}", exc_info=True)
+            return []
+
+    def _create_standard_trigger_orders(self) -> List[Quote]:
+        """
+        Create standard trigger orders for existing positions (non-urgent)
+        
+        Returns:
+            List of standard trigger orders
+        """
+        try:
+            if not self.portfolio_tracker:
+                return []
+            
+            trigger_orders = []
+            
+            for instrument, tracker in self.portfolio_tracker.instrument_trackers.items():
+                position_size = tracker.current_position
+                
+                if abs(position_size) < 0.001:
+                    continue
+                
+                entry_price = tracker.average_entry_price
+                if entry_price <= 0:
+                    continue
+                
+                # Calculate standard take profit price (entry + spread)
+                spread_multiplier = self.take_profit_spread_bps / 10000.0
+                
+                if position_size > 0:  # Long position - sell trigger above entry
+                    trigger_price = entry_price * (1 + spread_multiplier)
+                    trigger_side = "sell"
+                else:  # Short position - buy trigger below entry
+                    trigger_price = entry_price * (1 - spread_multiplier)
+                    trigger_side = "buy"
+                
+                # Determine appropriate tick size with safety check
+                tick_size = self.perp_tick_size if instrument == self.perp_instrument else self.futures_tick_size
+                if tick_size <= 0:
+                    self.logger.warning(f"Invalid tick size {tick_size} for {instrument}, using default 1.0")
+                    tick_size = 1.0
+                trigger_price = round(trigger_price / tick_size) * tick_size
+                
+                # Check if we already have a similar trigger order
+                existing_similar = False
+                for existing_id, existing_quote in self.active_trigger_orders.items():
+                    if (existing_quote.instrument == instrument and 
+                        existing_quote.side == trigger_side and
+                        abs(existing_quote.price - trigger_price) < tick_size * 2):
+                        existing_similar = True
+                        break
+                
+                if existing_similar:
+                    continue
+                
+                # Create standard trigger order
+                trigger_quote = Quote(
+                    instrument=instrument,
+                    side=trigger_side,
+                    price=trigger_price,
+                    amount=abs(position_size),
+                    timestamp=time.time(),
+                    is_trigger_order=True
+                )
+                
+                trigger_id = f"standard_trigger_{instrument}_{trigger_side}_{int(time.time() * 1000)}"
+                self.active_trigger_orders[trigger_id] = trigger_quote
+                trigger_orders.append(trigger_quote)
+                
+                self.logger.debug(
+                    f"Created standard trigger: {instrument} {trigger_side.upper()} {abs(position_size):.4f} @ {trigger_price:.2f} "
+                    f"(entry: {entry_price:.2f}, spread: {self.take_profit_spread_bps:.1f}bps)"
+                )
+            
+            return trigger_orders
+            
+        except Exception as e:
+            self.logger.error(f"Error creating standard trigger orders: {str(e)}", exc_info=True)
+            return []

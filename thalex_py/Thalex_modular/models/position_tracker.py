@@ -522,7 +522,7 @@ class PortfolioTracker:
             # Get fee estimation buffer from config
             try:
                 from ..config.market_config import TRADING_CONFIG
-                fee_buffer = TRADING_CONFIG.get("portfolio_take_profit", {}).get("fee_estimation_buffer", 1.1)
+                fee_buffer = 1.1  # Default fee estimation buffer
             except ImportError:
                 fee_buffer = 1.1  # Default 10% buffer
             

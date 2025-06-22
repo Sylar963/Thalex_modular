@@ -265,7 +265,13 @@ class AvellanedaQuoter:
         # Set up the market maker components
         self.portfolio_tracker = PortfolioTracker() # Initialize PortfolioTracker for multi-instrument support
         self.position_tracker = PositionTracker() # Initialize PositionTracker first - keep for backward compatibility
-        self.market_maker = AvellanedaMarketMaker(exchange_client=self.thalex, position_tracker=self.position_tracker) # MODIFIED: Pass position_tracker
+        self.market_maker = AvellanedaMarketMaker(
+            exchange_client=self.thalex,
+            position_tracker=self.position_tracker
+        )
+        
+        # Set portfolio tracker reference in market maker for multi-instrument support
+        self.market_maker.portfolio_tracker = self.portfolio_tracker
         self.order_manager = OrderManager(self.thalex)
         self.risk_manager = RiskManager(self.position_tracker) # Then pass it to RiskManager
         self.performance_monitor = PerformanceMonitor(record_interval=1, buffer_size=1)  # Record every 1 second, immediate write
@@ -297,7 +303,7 @@ class AvellanedaQuoter:
         self.perp_name = None
         self.futures_instrument_name = None
         self.futures_ticker = None
-        self.futures_tick_size = 0.0 # Added for futures, if needed for order placement
+        self.futures_tick_size = 1.0 # Added for futures, if needed for order placement
         self.market_data = MarketDataBuffer(
             volatility_window=TRADING_CONFIG["volatility"]["window"],
             capacity=TRADING_CONFIG["volatility"]["min_samples"]
@@ -1236,6 +1242,9 @@ class AvellanedaQuoter:
                 elif self.futures_instrument_name:
                     self.logger.warning(f"Futures instrument {self.futures_instrument_name} configured but not found. Risk monitoring for futures P&L might be impaired if price data isn't received.")
 
+                # NEW: Configure enhanced multi-instrument trigger system
+                self._setup_enhanced_trigger_system()
+
                 return True
                 
             except Exception as e:
@@ -1245,6 +1254,52 @@ class AvellanedaQuoter:
         except Exception as e:
             self.logger.error(f"Error in await_instruments: {str(e)}")
             raise
+            
+    def _setup_enhanced_trigger_system(self):
+        """Configure the enhanced multi-instrument trigger system"""
+        try:
+            # Configure instrument settings in market maker
+            self.market_maker.set_instrument_config(
+                perp_instrument=self.perp_name,
+                futures_instrument=self.futures_instrument_name,
+                perp_tick_size=self.tick_size,
+                futures_tick_size=self.futures_tick_size
+            )
+            
+            # Register both instruments with portfolio tracker if not already done
+            if self.perp_name:
+                self.portfolio_tracker.register_instrument(self.perp_name)
+                self.logger.info(f"Registered perpetual instrument: {self.perp_name}")
+                
+            if self.futures_instrument_name:
+                self.portfolio_tracker.register_instrument(self.futures_instrument_name)
+                self.logger.info(f"Registered futures instrument: {self.futures_instrument_name}")
+            
+            # Log the enhanced trigger system configuration
+            mode = self.market_maker.detect_trading_mode()
+            self.logger.info(
+                f"Enhanced trigger system configured - "
+                f"Mode: {mode}, "
+                f"Perp: {self.perp_name} (tick: {self.tick_size}), "
+                f"Futures: {self.futures_instrument_name} (tick: {self.futures_tick_size})"
+            )
+            
+            # Verify trigger system is enabled
+            if hasattr(self.market_maker, 'trigger_order_enabled') and self.market_maker.trigger_order_enabled:
+                self.logger.info("Enhanced multi-instrument trigger orders: ENABLED")
+                
+                # Log thresholds
+                self.logger.info(
+                    f"Profit thresholds - "
+                    f"Arbitrage: ${self.market_maker.arbitrage_profit_threshold_usd:.2f}, "
+                    f"Single: ${self.market_maker.single_instrument_profit_threshold_usd:.2f}, "
+                    f"Spread: {self.market_maker.spread_profit_threshold_bps:.1f}bps"
+                )
+            else:
+                self.logger.warning("Enhanced trigger orders are DISABLED")
+                
+        except Exception as e:
+            self.logger.error(f"Error setting up enhanced trigger system: {str(e)}", exc_info=True)
 
     # Add a new profile-guided optimization task
     async def profile_optimization_task(self):
@@ -1704,6 +1759,31 @@ class AvellanedaQuoter:
                 # Validate quotes
                 bid_quotes, ask_quotes = await self.validate_quotes(bid_quotes, ask_quotes)
                 
+                # CHECK FOR TAKE PROFIT CONDITIONS BEFORE PLACING GRID ORDERS
+                if hasattr(self.market_maker, 'should_trigger_take_profit'):
+                    try:
+                        trigger_decision = self.market_maker.should_trigger_take_profit()
+                        
+                        if trigger_decision.get('should_trigger', False):
+                            trading_mode = trigger_decision.get('mode', 'unknown')
+                            self.logger.warning(
+                                f"🚨 TAKE PROFIT TRIGGERED: {trading_mode} mode - {trigger_decision.get('reason', 'unknown')}"
+                            )
+                            
+                            # Place immediate closing orders instead of grid orders
+                            await self._place_immediate_closing_orders(trigger_decision, trading_mode)
+                            return  # Skip placing grid orders
+                        else:
+                            # Log current profit status occasionally
+                            if random.random() < 0.1:  # 10% of the time
+                                profit_metrics = trigger_decision.get('profit_metrics', {})
+                                if profit_metrics:
+                                    self.logger.debug(f"Take profit check: {trading_mode} mode, not yet profitable enough")
+                                    
+                    except Exception as e:
+                        self.logger.error(f"Error checking take profit conditions: {str(e)}")
+                        # Continue with normal grid orders if take profit check fails
+                
                 self.current_quotes = (bid_quotes, ask_quotes)
                 
                 # Place the quotes now rather than signaling
@@ -1919,9 +1999,65 @@ class AvellanedaQuoter:
                         self.position_tracker.update_on_fill(fill_object)
                     except Exception:
                         pass  # Silent fail for HFT performance
+
+                # CRITICAL FIX: Update PortfolioTracker for take profit logic
+                if self.portfolio_tracker:
+                    try:
+                        # Extract instrument from order data
+                        fill_instrument = getattr(order, 'instrument_id', None) or order_data.get("instrument_name", self.perp_name)
+                        
+                        # Ensure instrument is registered
+                        if fill_instrument not in self.portfolio_tracker.instrument_trackers:
+                            self.portfolio_tracker.register_instrument(fill_instrument)
+                        
+                        # Create fill object for portfolio tracker
+                        fill_timestamp_raw = order_data.get("timestamp", order_data.get("create_time", time.time()))
+                        if isinstance(fill_timestamp_raw, (int, float)):
+                            fill_time = datetime.fromtimestamp(fill_timestamp_raw, tz=timezone.utc)
+                        elif isinstance(fill_timestamp_raw, str):
+                            try:
+                                fill_time = datetime.fromisoformat(fill_timestamp_raw.replace("Z", "+00:00"))
+                            except ValueError:
+                                fill_time = datetime.now(timezone.utc)
+                        else:
+                            fill_time = datetime.now(timezone.utc)
+
+                        portfolio_fill = Fill(
+                            order_id=str(order.id),
+                            fill_price=order.price,
+                            fill_size=order.amount,
+                            fill_time=fill_time,
+                            side=order.direction.lower(),
+                            is_maker=order_data.get("is_maker", True)
+                        )
+                        
+                        # Update portfolio tracker with fill for the specific instrument
+                        self.portfolio_tracker.update_instrument_fill(fill_instrument, portfolio_fill)
+                        
+                        self.logger.info(f"Updated portfolio tracker: {fill_instrument} {order.direction.upper()} {order.amount:.4f} @ {order.price:.2f}")
+                        
+                    except Exception as e:
+                        self.logger.error(f"Error updating portfolio tracker on fill: {str(e)}")
+                        pass  # Continue execution
                 
                 # Update market maker with fill information (for both trigger and grid orders)
-                self.market_maker.on_order_filled(str(order.id), order.price, order.amount, is_buy_flag)
+                # Extract instrument from order data for multi-instrument support
+                fill_instrument = getattr(order, 'instrument_id', None) or order_data.get("instrument_name", self.perp_name)
+                
+                # Update market maker with fill information and instrument
+                if hasattr(self.market_maker, '_handle_trigger_order_on_fill'):
+                    # Get old position for trigger order logic
+                    old_position = self.position_tracker.get_position_metrics().get("position", 0.0)
+                    old_entry_price = self.position_tracker.get_position_metrics().get("entry_price", 0.0)
+                    
+                    # Call the new method with instrument information
+                    self.market_maker.on_order_filled(str(order.id), order.price, order.amount, is_buy_flag)
+                    self.market_maker._handle_trigger_order_on_fill(
+                        order.price, order.amount, is_buy_flag, old_position, old_entry_price, fill_instrument
+                    )
+                else:
+                    # Fallback to old method
+                    self.market_maker.on_order_filled(str(order.id), order.price, order.amount, is_buy_flag)
                 
                 # Sync position data after fill to ensure consistency
                 self._sync_position_data()
@@ -2245,17 +2381,60 @@ class AvellanedaQuoter:
             self.logger.error(f"Error handling error message: {str(e)}")
 
     async def place_quotes(self, bid_quotes: List[Quote], ask_quotes: List[Quote]):
-        """Place quotes using limit orders
-        
-        Args:
-            bid_quotes: List of bid quotes to place
-            ask_quotes: List of ask quotes to place
-        """
-        if not self.active_trading:
-            self.logger.warning("Trading is halted due to a prior risk limit breach. Skipping quote placement.")
-            return
-
+        """Place bid and ask quotes on the exchange with enhanced inventory management"""
         try:
+            # Initialize counters
+            placed_bids = 0
+            placed_asks = 0
+            max_levels = TRADING_CONFIG["avellaneda"]["max_levels"]
+            
+            # CRITICAL FIX: Check for take profit conditions BEFORE inventory limits
+            # This ensures positions can be closed even when inventory limits are exceeded
+            self.logger.debug("🔍 Checking take profit conditions before placing grid orders")
+            if hasattr(self.market_maker, 'detect_trading_mode') and hasattr(self.market_maker, 'should_trigger_take_profit'):
+                try:
+                    current_mode = self.market_maker.detect_trading_mode()
+                    self.logger.debug(f"🎯 Trading mode detected: {current_mode}")
+                    
+                    trigger_decision = self.market_maker.should_trigger_take_profit()
+                    self.logger.debug(f"📊 Take profit decision: {trigger_decision.get('should_trigger', False)} - {trigger_decision.get('reason', 'unknown')}")
+                    
+                    if trigger_decision.get('should_trigger', False):
+                        self.logger.warning(
+                            f"🚨 TAKE PROFIT CONDITION MET: {current_mode} mode - {trigger_decision.get('reason', 'unknown')}"
+                        )
+                        
+                        # Log profit metrics
+                        profit_metrics = trigger_decision.get('profit_metrics', {})
+                        if current_mode == "arbitrage":
+                            arb_profit = profit_metrics.get('total_profit_usd', 0)
+                            spread_bps = profit_metrics.get('spread_profit_bps', 0)
+                            self.logger.warning(
+                                f"Arbitrage profit: ${arb_profit:.2f}, Spread: {spread_bps:.1f}bps"
+                            )
+                        elif current_mode in ["single_perp", "single_futures"]:
+                            for instrument, metrics in profit_metrics.items():
+                                profit_usd = metrics.get('profit_usd', 0)
+                                self.logger.warning(f"{instrument} profit: ${profit_usd:.2f}")
+                        
+                        # IMMEDIATELY PLACE CLOSING ORDERS (bypassing inventory limits)
+                        self.logger.warning("🚀 PLACING IMMEDIATE CLOSING ORDERS - BYPASSING INVENTORY LIMITS")
+                        try:
+                            await self._place_immediate_closing_orders(trigger_decision, current_mode)
+                            return  # Exit early - don't place grid orders when closing positions
+                        except Exception as trigger_error:
+                            self.logger.error(f"Error placing immediate closing orders: {str(trigger_error)}", exc_info=True)
+                            # Continue with normal logic if closing orders fail
+                                
+                except Exception as e:
+                    # Don't fail quote placement if trigger analysis fails
+                    self.logger.debug(f"Error analyzing trigger conditions: {str(e)}")
+            
+            # --- INVENTORY CHECKS (only after take profit check) ---
+            if not self.active_trading:
+                self.logger.warning("Trading is halted due to a prior risk limit breach. Skipping quote placement.")
+                return
+
             if not self.quoting_enabled:
                 self.logger.debug("Quoting is disabled, skipping quote placement")
                 return
@@ -2267,7 +2446,6 @@ class AvellanedaQuoter:
                 return
             
             # Enforce max order levels from config
-            max_levels = TRADING_CONFIG["quoting"].get("levels", 6)
             if len(bid_quotes) > max_levels:
                 self.logger.warning(f"Limiting bid quotes to configured max levels: {max_levels}")
                 bid_quotes = bid_quotes[:max_levels]
@@ -2349,38 +2527,61 @@ class AvellanedaQuoter:
             # --- BEGIN INVENTORY CHECK FOR ONE-SIDED QUOTING ---
             current_inventory = 0.0
             
-            # Try to get position from multiple sources
-            if hasattr(self, 'position_tracker') and self.position_tracker:
-                # Primary source: position tracker
-                metrics = self.position_tracker.get_position_metrics()
-                current_inventory = metrics.get("position", 0.0)
-            elif hasattr(self.market_maker, 'position_size'):
-                # Secondary source: market maker
-                current_inventory = self.market_maker.position_size
-            else:
-                # Fallback: use 0 inventory
-                self.logger.debug("No position tracking available. Inventory check will use 0 inventory.")
+            # FIXED: Proper position retrieval with debugging
+            current_inventory = 0.0
+            inventory_source = "unknown"
+            
+            try:
+                if hasattr(self, 'position_tracker') and self.position_tracker:
+                    # Primary source: position tracker
+                    metrics = self.position_tracker.get_position_metrics()
+                    current_inventory = metrics.get("position", 0.0)
+                    inventory_source = "position_tracker"
+                elif hasattr(self.market_maker, 'position_tracker') and self.market_maker.position_tracker:
+                    # Secondary source: market maker's position tracker
+                    metrics = self.market_maker.position_tracker.get_position_metrics()
+                    current_inventory = metrics.get("position", 0.0)
+                    inventory_source = "market_maker.position_tracker"
+                else:
+                    # Fallback: use 0 inventory
+                    current_inventory = 0.0
+                    inventory_source = "fallback_zero"
+                    self.logger.debug("🏦 No position tracking available. Using 0 inventory for limit checks.")
+                    
+            except Exception as e:
+                current_inventory = 0.0
+                inventory_source = "error_fallback"
+                self.logger.warning(f"🏦 Error getting position for inventory check: {e}. Using 0.")
+            
+            self.logger.debug(f"🏦 Inventory check: position={current_inventory:.4f} (source: {inventory_source})")
 
             max_inventory_deviation = RISK_LIMITS.get("max_position", float('inf')) # Changed from TRADING_PARAMS
             if not isinstance(max_inventory_deviation, (int, float)) or max_inventory_deviation < 0:
                 self.logger.warning(f"Invalid 'max_position' from RISK_LIMITS ({max_inventory_deviation}). Using infinity (feature disabled).")
                 max_inventory_deviation = float('inf')
             
+            # Enhanced debugging for inventory limits
+            self.logger.debug(f"🚧 Inventory limit logic: position={current_inventory:.4f}, max_allowed=±{max_inventory_deviation}")
+            
             can_place_bids_inventory_wise = True
             if current_inventory > max_inventory_deviation:  # Inventory is too long
                 can_place_bids_inventory_wise = False
-                self.logger.info(
-                    f"Inventory ({current_inventory:.4f}) exceeds +max_allowed_inventory_deviation ({max_inventory_deviation:.4f}). "
+                self.logger.warning(
+                    f"🚫 INVENTORY LIMIT BREACH: Position ({current_inventory:.4f}) > +{max_inventory_deviation:.4f}. "
                     f"Temporarily stopping new bid orders."
                 )
             
             can_place_asks_inventory_wise = True
             if current_inventory < -max_inventory_deviation:  # Inventory is too short
                 can_place_asks_inventory_wise = False
-                self.logger.info(
-                    f"Inventory ({current_inventory:.4f}) is less than -max_allowed_inventory_deviation ({-max_inventory_deviation:.4f}). "
+                self.logger.warning(
+                    f"🚫 INVENTORY LIMIT BREACH: Position ({current_inventory:.4f}) < -{max_inventory_deviation:.4f}. "
                     f"Temporarily stopping new ask orders."
                 )
+                
+            # Log if inventory limits are NOT preventing trading
+            if can_place_bids_inventory_wise and can_place_asks_inventory_wise:
+                self.logger.debug(f"✅ Inventory check passed: position={current_inventory:.4f} within ±{max_inventory_deviation} limits")
             # --- END INVENTORY CHECK ---
             
             # Place bid quotes as individual limit orders
@@ -2444,57 +2645,9 @@ class AvellanedaQuoter:
             # Record successful quote placement
             self.last_quote_time = time.time()
             
-            # Place trigger orders from market maker
-            if hasattr(self.market_maker, 'get_active_trigger_orders'):
-                trigger_orders = self.market_maker.get_active_trigger_orders()
-                placed_triggers = 0
-                
-                for trigger_id, trigger_quote in trigger_orders.items():
-                    try:
-                        # Check if this trigger order is already placed
-                        if trigger_id in getattr(self, 'active_trigger_order_ids', set()):
-                            continue
-                            
-                        # Validate trigger order
-                        if trigger_quote.price <= 0 or trigger_quote.amount <= 0:
-                            self.logger.warning(f"Invalid trigger order: {trigger_quote.price}@{trigger_quote.amount}")
-                            continue
-                        
-                        # Place trigger order
-                        await self.order_manager.place_order(
-                            instrument=self.perp_name,
-                            direction=trigger_quote.side,
-                            price=trigger_quote.price,
-                            amount=trigger_quote.amount,
-                            label="TakeProfitTrigger",
-                            post_only=False,  # Allow trigger orders to be taker orders
-                            client_id=trigger_id  # Use trigger_id as client_id for tracking
-                        )
-                        
-                        # Track active trigger orders
-                        if not hasattr(self, 'active_trigger_order_ids'):
-                            self.active_trigger_order_ids = set()
-                        self.active_trigger_order_ids.add(trigger_id)
-                        
-                        placed_triggers += 1
-                        self.logger.info(
-                            f"Placed trigger order: {trigger_quote.side.upper()} {trigger_quote.amount:.4f} @ {trigger_quote.price:.2f} "
-                            f"(trigger_id: {trigger_id})"
-                        )
-                        
-                    except Exception as e:
-                        self.logger.error(f"Error placing trigger order {trigger_id}: {str(e)}")
-                
-                if placed_triggers > 0:
-                    self.logger.info(f"Successfully placed {placed_triggers} trigger orders for take profit")
-            
             # Log final result
-            total_orders = placed_bids + placed_asks + (placed_triggers if 'placed_triggers' in locals() else 0)
-            self.logger.info(
-                f"Placed {placed_bids} bids, {placed_asks} asks"
-                f"{f', {placed_triggers} triggers' if 'placed_triggers' in locals() and placed_triggers > 0 else ''} "
-                f"(total: {total_orders})"
-            )
+            total_orders = placed_bids + placed_asks
+            self.logger.info(f"Placed {placed_bids} bids, {placed_asks} asks (total: {total_orders})")
             
         except Exception as e:
             self.logger.error(f"Error placing quotes: {str(e)}", exc_info=True)
@@ -3098,18 +3251,10 @@ class AvellanedaQuoter:
         try:
             self.logger.info(f"Cancelling all orders: {reason}")
             
-            # Cancel trigger orders from market maker
-            if hasattr(self.market_maker, '_cancel_all_trigger_orders'):
-                self.market_maker._cancel_all_trigger_orders(f"Quote cancellation: {reason}")
-                
-            # Clear trigger order tracking in quoter
-            if hasattr(self, 'active_trigger_order_ids'):
-                self.active_trigger_order_ids.clear()
-            
             # Use the order manager to cancel all orders
             if hasattr(self, 'order_manager') and self.order_manager:
                 await self.order_manager.cancel_all_orders()
-                self.logger.info("All orders (grid + trigger) cancelled successfully")
+                self.logger.info("All orders cancelled successfully")
             else:
                 self.logger.warning("Order manager not available, cannot cancel orders")
                 
@@ -3117,6 +3262,88 @@ class AvellanedaQuoter:
         except Exception as e:
             self.logger.error(f"Error cancelling orders: {str(e)}")
             return False
+
+    async def _place_immediate_closing_orders(self, trigger_decision: Dict, trading_mode: str):
+        """Place immediate closing orders when take profit conditions are met"""
+        try:
+            instruments_to_close = trigger_decision.get('instruments_to_close', [])
+            profit_metrics = trigger_decision.get('profit_metrics', {})
+            
+            if not instruments_to_close:
+                self.logger.error("No instruments specified for closing despite trigger condition")
+                return
+            
+            self.logger.warning(f"Placing immediate closing orders for {len(instruments_to_close)} instruments")
+            
+            # Get current market data for aggressive pricing
+            current_ticker = self.market_data.get_ticker()
+            mark_price = self.market_data.get_mark_price()
+            
+            for instrument in instruments_to_close:
+                try:
+                    # Get position for this instrument
+                    position_size = 0
+                    if instrument == self.perp_name:
+                        position_size = getattr(self.position_tracker, 'current_position', 0)
+                    elif instrument == self.futures_instrument_name and self.portfolio_tracker:
+                        if instrument in self.portfolio_tracker.instrument_trackers:
+                            tracker = self.portfolio_tracker.instrument_trackers[instrument]
+                            position_size = tracker.current_position
+                    
+                    if abs(position_size) < 0.001:
+                        self.logger.warning(f"No significant position for {instrument}: {position_size:.6f}")
+                        continue
+                    
+                    # Determine order side and aggressive price
+                    if position_size > 0:  # Long position - sell to close
+                        side = "sell"
+                        # Use bid price - small buffer for aggressive selling
+                        if current_ticker and current_ticker.best_bid_price:
+                            close_price = current_ticker.best_bid_price * 0.999  # 0.1% below bid
+                        else:
+                            close_price = mark_price * 0.998  # 0.2% below mark
+                    else:  # Short position - buy to close
+                        side = "buy"
+                        # Use ask price + small buffer for aggressive buying
+                        if current_ticker and current_ticker.best_ask_price:
+                            close_price = current_ticker.best_ask_price * 1.001  # 0.1% above ask
+                        else:
+                            close_price = mark_price * 1.002  # 0.2% above mark
+                    
+                    # Round to tick size
+                    close_price = round(close_price)
+                    amount = abs(position_size)
+                    
+                    self.logger.warning(
+                        f"IMMEDIATE CLOSE: {instrument} {side.upper()} {amount:.4f} @ {close_price:.2f} "
+                        f"(position: {position_size:.4f}, mode: {trading_mode})"
+                    )
+                    
+                    # Place the immediate closing order
+                    await self.order_manager.place_order(
+                        instrument=instrument,
+                        direction=side,
+                        price=close_price,
+                        amount=amount,
+                        label="TakeProfitClose",
+                        post_only=False,  # Allow taker orders for immediate execution
+                        client_id=f"takeprofit_{instrument}_{int(time.time() * 1000)}"
+                    )
+                    
+                    # Log profit info
+                    if trading_mode == "arbitrage":
+                        total_profit = profit_metrics.get('total_profit_usd', 0)
+                        spread_bps = profit_metrics.get('spread_profit_bps', 0)
+                        self.logger.warning(f"Arbitrage take profit: ${total_profit:.2f}, {spread_bps:.1f}bps")
+                    elif instrument in profit_metrics:
+                        instrument_profit = profit_metrics[instrument].get('profit_usd', 0)
+                        self.logger.warning(f"{instrument} take profit: ${instrument_profit:.2f}")
+                    
+                except Exception as e:
+                    self.logger.error(f"Error placing immediate close for {instrument}: {str(e)}")
+            
+        except Exception as e:
+            self.logger.error(f"Error in _place_immediate_closing_orders: {str(e)}", exc_info=True)
 
     async def _close_both_positions(self, reason: str):
         """
