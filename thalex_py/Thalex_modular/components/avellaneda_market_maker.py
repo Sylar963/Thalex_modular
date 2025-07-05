@@ -38,7 +38,7 @@ class AvellanedaMarketMaker:
         'aggressive_buys_sum', 'aggressive_sells_sum', 'market_impact', 'active_quotes',
         'current_bid_quotes', 'current_ask_quotes', 'hedge_manager', 'use_hedging',
         # Performance optimization caches
-        '_cached_spread', '_cached_mid_price', '_cached_volatility_factor', '_cache_timestamp',
+        '_cached_spread', '_cached_mid_price', '_cached_volatility_factor', '_cached_position', '_cache_timestamp',
         '_log_counter', '_last_major_log',
         # Take profit trigger order system
         'active_trigger_orders', 'take_profit_spread_bps', 'trigger_order_enabled',
@@ -170,6 +170,7 @@ class AvellanedaMarketMaker:
         self._cached_spread = 0.0
         self._cached_mid_price = 0.0
         self._cached_volatility_factor = 1.0
+        self._cached_position = 0.0
         self._cache_timestamp = 0.0
         self._log_counter = 0
         self._last_major_log = 0.0
@@ -225,25 +226,89 @@ class AvellanedaMarketMaker:
         self.min_tick = tick_size
         self.logger.info(f"Tick size set to {tick_size}")
 
+    def _get_default_tick_size(self) -> float:
+        """Get appropriate default tick size based on instrument type"""
+        # Check if we have instrument information to determine proper tick size
+        if hasattr(self, 'instrument') and self.instrument:
+            instrument_name = str(self.instrument).upper()
+            if 'BTC' in instrument_name:
+                return 1.0  # BTC derivatives typically have 1 USD tick size
+            elif 'ETH' in instrument_name:
+                return 0.1  # ETH derivatives typically have 0.1 USD tick size
+            else:
+                return 1.0  # Default for unknown instruments
+        
+        # Check if we have perp or futures instrument names
+        if hasattr(self, 'perp_instrument') and self.perp_instrument:
+            if 'BTC' in str(self.perp_instrument).upper():
+                return 1.0
+            elif 'ETH' in str(self.perp_instrument).upper():
+                return 0.1
+        
+        if hasattr(self, 'futures_instrument') and self.futures_instrument:
+            if 'BTC' in str(self.futures_instrument).upper():
+                return 1.0
+            elif 'ETH' in str(self.futures_instrument).upper():
+                return 0.1
+        
+        # Fallback to BTC default
+        return 1.0
+
     def update_market_conditions(self, volatility: float, market_impact: float):
         """Update the market conditions used for quote generation"""
         self.volatility = volatility
         self.market_impact = market_impact
-        self.logger.debug(f"Market conditions updated: vol={self.volatility:.6f}, impact={market_impact:.6f}")
+        if random.random() < LOG_SAMPLING_RATE:
+            self.logger.debug(f"Market conditions updated: vol={self.volatility:.6f}, impact={market_impact:.6f}")
     
     def update_vamp(self, price: float, volume: float, is_buy: bool, is_aggressive: bool=False):
-        """Update Volume-Adjusted Market Price calculations"""
+        """Update Volume-Adjusted Market Price calculations with improved edge case handling"""
+        # Input validation to prevent corrupted VAMP calculations
+        if not isinstance(price, (int, float)) or not np.isfinite(price) or price <= 0:
+            self.logger.warning(f"Invalid price {price} in VAMP update, skipping")
+            return self.vamp_value if hasattr(self, 'vamp_value') else 0.0
+            
+        if not isinstance(volume, (int, float)) or not np.isfinite(volume) or volume <= 0:
+            self.logger.warning(f"Invalid volume {volume} in VAMP update, skipping")
+            return self.vamp_value if hasattr(self, 'vamp_value') else 0.0
+        
         if random.random() < LOG_SAMPLING_RATE:
             side_str = "BUY" if is_buy else "SELL"
             agg_str = "aggressive" if is_aggressive else "passive"
             self.logger.debug(f"Updating VAMP with {side_str} {volume:.6f} @ {price:.2f} ({agg_str})")
         
-        old_vwap = getattr(self, 'vwap', 0)
-        old_vamp_value = getattr(self, 'vamp_value', 0)
+        old_vwap = getattr(self, 'vwap', 0.0)
+        old_vamp_value = getattr(self, 'vamp_value', 0.0)
         
-        # Update VWAP (Volume-Weighted Average Price)
-        self.volume_price_sum += price * volume
+        # Initialize attributes safely if they don't exist
+        if not hasattr(self, 'volume_price_sum'):
+            self.volume_price_sum = 0.0
+        if not hasattr(self, 'total_volume'):
+            self.total_volume = 0.0
+        
+        # Update VWAP (Volume-Weighted Average Price) with overflow protection
+        price_volume = price * volume
+        if not np.isfinite(price_volume):
+            self.logger.warning(f"Price*volume overflow: {price}*{volume}, skipping VAMP update")
+            return old_vamp_value
+            
+        self.volume_price_sum += price_volume
         self.total_volume += volume
+        
+        # Prevent accumulation of excessive data that could cause precision issues
+        max_total_volume = 1e6  # Reset after 1M volume to maintain precision
+        if self.total_volume > max_total_volume:
+            # Scale down proportionally to maintain VWAP accuracy
+            scale_factor = 0.5
+            self.volume_price_sum *= scale_factor
+            self.total_volume *= scale_factor
+            self.market_buys_volume *= scale_factor
+            self.market_sells_volume *= scale_factor
+            self.aggressive_buys_sum *= scale_factor
+            self.aggressive_sells_sum *= scale_factor
+            if random.random() < LOG_SAMPLING_RATE:
+                self.logger.info(f"VAMP data scaled down by {scale_factor} to maintain precision")
+        
         if self.total_volume > 0:
             self.vwap = self.volume_price_sum / self.total_volume
             if random.random() < LOG_SAMPLING_RATE:
@@ -383,17 +448,31 @@ class AvellanedaMarketMaker:
         """
         # Performance: Check cache first to avoid expensive recalculation
         current_time = time.time()
-        if (current_time - self._cache_timestamp < 0.1 and  
-            abs(market_impact) < 0.001 and  
-            self._cached_spread > 0):
+        # Cache is only valid if key parameters haven't changed significantly
+        try:
+            current_position = getattr(self.position_tracker, 'current_position', 0.0)
+            cache_valid = (
+                current_time - self._cache_timestamp < 0.1 and  # Time-based expiry
+                abs(market_impact) < 0.001 and  # Market impact hasn't changed much
+                self._cached_spread > 0 and  # Valid cached value exists
+                abs(self.volatility - getattr(self, '_cached_volatility_factor', self.volatility)) < 0.001 and  # Volatility stable
+                abs(current_position - getattr(self, '_cached_position', current_position)) < 0.001  # Position stable
+            )
+        except Exception:
+            # If cache validation fails, invalidate cache
+            cache_valid = False
+        
+        if cache_valid:
             return self._cached_spread
             
         try:
             min_spread_ticks = ORDERBOOK_CONFIG["min_spread"]
             
             if self.tick_size <= 0:
-                self.logger.warning("Invalid tick_size detected in calculate_optimal_spread. Using default of 1.0")
-                self.tick_size = 1.0
+                # Use proper tick size based on instrument type
+                default_tick_size = self._get_default_tick_size()
+                self.logger.warning(f"Invalid tick_size detected in calculate_optimal_spread. Using instrument default: {default_tick_size}")
+                self.tick_size = default_tick_size
                 
             min_spread = min_spread_ticks * self.tick_size
             
@@ -479,7 +558,18 @@ class AvellanedaMarketMaker:
                     self.position_limit = 0.1
                     self.logger.warning(f"Invalid position_limit, using minimum: {self.position_limit}")
             
-            inventory_risk = abs(self.position_tracker.current_position) / max(self.position_limit, 0.001)
+            # Safe division with proper bounds checking and validation
+            current_position = getattr(self.position_tracker, 'current_position', 0.0)
+            if not isinstance(current_position, (int, float)) or not np.isfinite(current_position):
+                self.logger.warning(f"Invalid current_position value: {current_position}, using 0.0")
+                current_position = 0.0
+            
+            # Ensure position_limit is always positive and reasonable
+            safe_position_limit = max(0.001, abs(self.position_limit))
+            inventory_risk = abs(current_position) / safe_position_limit
+            
+            # Cap inventory risk to prevent extreme values
+            inventory_risk = min(inventory_risk, 10.0)  # Cap at 10x position limit
             inventory_component = self.inventory_factor * inventory_risk * volatility_term
             
             market_state_factor = 1.0
@@ -510,8 +600,10 @@ class AvellanedaMarketMaker:
             
             final_spread = max(optimal_spread, fee_coverage_spread)
             
-            # Performance: Cache the result
+            # Performance: Cache the result with current state
             self._cached_spread = final_spread
+            self._cached_volatility_factor = volatility
+            self._cached_position = getattr(self.position_tracker, 'current_position', 0.0)
             self._cache_timestamp = current_time
             
             if random.random() < LOG_SAMPLING_RATE:
@@ -530,7 +622,7 @@ class AvellanedaMarketMaker:
             fee_based_fallback = reference_price * (maker_fee_rate * 2 + 0.0005)
             min_spread_ticks = ORDERBOOK_CONFIG.get("min_spread", 35)
             if self.tick_size <= 0:
-                self.tick_size = 1.0
+                self.tick_size = self._get_default_tick_size()
             return max(min_spread_ticks * self.tick_size, fee_based_fallback)
 
     def calculate_skewed_prices(self, mid_price: float, spread: float) -> Tuple[float, float]:
@@ -709,8 +801,9 @@ class AvellanedaMarketMaker:
         """Generate quotes using Avellaneda-Stoikov market making model with dynamic grid updates"""
         try:
             if self.tick_size <= 0:
-                self.logger.warning("Invalid tick size detected in generate_quotes. Setting default value of 1.0")
-                self.tick_size = 1.0
+                default_tick = self._get_default_tick_size()
+                self.logger.warning(f"Invalid tick size detected in generate_quotes. Setting default value of {default_tick}")
+                self.tick_size = default_tick
                 
             timestamp = getattr(ticker, 'timestamp', time.time())
             
@@ -1143,8 +1236,9 @@ class AvellanedaMarketMaker:
             
         # Ensure tick size is valid    
         if self.tick_size <= 0:
-            self.logger.warning(f"Invalid tick_size {self.tick_size} in _calculate_level_price. Using default of 1.0")
-            self.tick_size = 1.0
+            default_tick = self._get_default_tick_size()
+            self.logger.warning(f"Invalid tick_size {self.tick_size} in _calculate_level_price. Using default of {default_tick}")
+            self.tick_size = default_tick
         
         # Early return for level 0
         if level == 0:
@@ -1398,9 +1492,10 @@ class AvellanedaMarketMaker:
             return round(value / self.tick_size) * self.tick_size
         
         # Fallback path with occasional logging
+        default_tick = self._get_default_tick_size()
         if random.random() < LOG_SAMPLING_RATE:
-            self.logger.warning(f"Invalid tick size ({self.tick_size}) in round_to_tick. Using default of 1.0")
-        self.tick_size = 1.0
+            self.logger.warning(f"Invalid tick size ({self.tick_size}) in round_to_tick. Using default of {default_tick}")
+        self.tick_size = default_tick
         return round(value / self.tick_size) * self.tick_size
 
     def on_order_filled(self, order_id: str, fill_price: float, fill_size: float, is_buy: bool) -> None:
@@ -1871,16 +1966,16 @@ class AvellanedaMarketMaker:
         if price <= 0:
             if random.random() < LOG_SAMPLING_RATE:
                 self.logger.warning(f"Invalid price {price} in align_price_to_tick. Using minimum tick size.")
-            return self.tick_size if self.tick_size > 0 else 1.0
+            return self.tick_size if self.tick_size > 0 else self._get_default_tick_size()
             
         if not self.tick_size or self.tick_size <= 0:
             if random.random() < LOG_SAMPLING_RATE:
                 self.logger.warning("Invalid tick size, using default alignment")
                 old_tick_size = self.tick_size
-                self.tick_size = 1.0
+                self.tick_size = self._get_default_tick_size()
                 self.logger.info(f"Updated tick size from {old_tick_size} to {self.tick_size}")
             else:
-                self.tick_size = 1.0  # Set default without logging
+                self.tick_size = self._get_default_tick_size()  # Set default without logging
             return round(price, 2)  # Default to 2 decimal places
 
     def set_instrument(self, instrument: str):
@@ -2581,8 +2676,9 @@ class AvellanedaMarketMaker:
                 # Determine appropriate tick size with safety check
                 tick_size = self.perp_tick_size if instrument == self.perp_instrument else self.futures_tick_size
                 if tick_size <= 0:
-                    self.logger.warning(f"Invalid tick size {tick_size} for {instrument}, using default 1.0")
-                    tick_size = 1.0
+                    default_tick = self._get_default_tick_size()
+                    self.logger.warning(f"Invalid tick size {tick_size} for {instrument}, using default {default_tick}")
+                    tick_size = default_tick
                 
                 # Create aggressive trigger order to close position quickly
                 # Use a small buffer to ensure fills (0.1% for market-like execution)
@@ -2663,8 +2759,9 @@ class AvellanedaMarketMaker:
                 # Determine appropriate tick size with safety check
                 tick_size = self.perp_tick_size if instrument == self.perp_instrument else self.futures_tick_size
                 if tick_size <= 0:
-                    self.logger.warning(f"Invalid tick size {tick_size} for {instrument}, using default 1.0")
-                    tick_size = 1.0
+                    default_tick = self._get_default_tick_size()
+                    self.logger.warning(f"Invalid tick size {tick_size} for {instrument}, using default {default_tick}")
+                    tick_size = default_tick
                 trigger_price = round(trigger_price / tick_size) * tick_size
                 
                 # Check if we already have a similar trigger order
