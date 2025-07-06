@@ -33,9 +33,9 @@ BOT_CONFIG = {
             "order_flow_intensity": 1.0,            # Order flow intensity
             
             # Spread management
-            "base_spread": 14.0,            # Base spread in ticks
-            "max_spread": 75.0,            # Maximum spread in ticks
-            "spread_multiplier": 1.2,      # Dynamic spread adjustment factor
+            "base_spread": 3.0,             # Base spread in ticks (more aggressive)
+            "max_spread": 20.0,             # Maximum spread in ticks (much tighter)
+            "spread_multiplier": 1.1,       # Dynamic spread adjustment factor (less aggressive)
             "base_spread_factor": 1.0,              # Base spread multiplier
             "market_impact_factor": 0.5,            # Market impact adjustment
             "inventory_factor": 0.5,                # Inventory risk adjustment
@@ -46,10 +46,10 @@ BOT_CONFIG = {
             "position_fade_time": 3600,             # Time to fade position (seconds)
             
             # Quote sizing and levels
-            "base_size": 0.1,            
-            "size_multipliers": [1.0, 1.5, 2.0, 2.5, 3.0],
-            "max_levels": 3,               # Maximum number of quote levels
-            "level_spacing": 150,          # Base spacing between levels in ticks
+            "base_size": 0.3,                           # Larger base size for more liquidity
+            "size_multipliers": [1.0, 1.3, 1.8, 2.2, 2.8],
+            "max_levels": 4,                            # More levels for depth
+            "level_spacing": 8,                         # Much tighter level spacing
             
             # Fixed volatility for when calculation fails
             "fixed_volatility": 0.01,
@@ -80,12 +80,12 @@ BOT_CONFIG = {
         
         # Quote management
         "quote_timing": {
-            "min_interval": 8.0,           # Minimum time between quotes
-            "max_lifetime": 60,             # Maximum quote lifetime in seconds
-            "operation_interval": 0.5,     # Time between order operations
-            "max_pending": 6,              # Maximum concurrent operations
-            "grid_update_interval": 10.0,   # Interval for updating quote grid
-            "position_check_interval": 5.0 # Interval for position-based quote updates
+            "min_interval": 2.0,            # Much faster quoting for aggressive MM
+            "max_lifetime": 30,             # Shorter lifetime for fresher quotes
+            "operation_interval": 0.3,      # Faster operations
+            "max_pending": 8,               # More concurrent operations
+            "grid_update_interval": 4.0,    # More frequent grid updates
+            "position_check_interval": 2.0  # Faster position checks
         },
         
         # Volume Candle configuration
@@ -101,17 +101,17 @@ BOT_CONFIG = {
     
     # Orderbook specific parameters
     "orderbook": {
-        "min_spread": 14,                # Minimum spread in ticks
-        "base_order_size": 0.02,        # Base order size for quoting
-        "min_order_size": 0.01,        # Absolute minimum order size
-        "levels": 3,                    # Number of order book levels for quoting logic
-        "bid_step": 15,                 # Default step for placing bid orders (in ticks)
-        "ask_step": 15,                 # Default step for placing ask orders (in ticks)
-        "quote_lifetime": 45,           # Max lifetime for quotes in seconds
-        "amend_threshold": 35,          # Price movement (in ticks) to trigger quote amendment
-        "min_quote_interval": 3.0,      # Minimum interval between quote updates in seconds
-        "bid_sizes": [1.0, 1.5, 2.0], # Size multipliers for bid side levels
-        "ask_sizes": [1.0, 1.5, 2.0]  # Size multipliers for ask side levels
+        "min_spread": 3,                 # Minimum spread in ticks (tighter)
+        "base_order_size": 0.15,         # Larger base order size
+        "min_order_size": 0.01,          # Absolute minimum order size
+        "levels": 4,                     # More levels for depth
+        "bid_step": 4,                   # Tighter bid step (in ticks)
+        "ask_step": 4,                   # Tighter ask step (in ticks)
+        "quote_lifetime": 25,            # Shorter lifetime for fresher quotes
+        "amend_threshold": 10,           # Lower threshold for amendments
+        "min_quote_interval": 1.5,       # Faster quote updates
+        "bid_sizes": [1.0, 1.3, 1.8, 2.2], # More aggressive sizing
+        "ask_sizes": [1.0, 1.3, 1.8, 2.2]  # More aggressive sizing
     },
     
     # Risk management
