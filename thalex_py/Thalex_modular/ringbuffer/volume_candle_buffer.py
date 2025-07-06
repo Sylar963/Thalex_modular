@@ -11,7 +11,7 @@ from ..thalex_logging import LoggerFactory
 
 TRADE_ID_CACHE_SIZE = 10000 # Define cache size
 SIGNAL_EVAL_LOG_MAX_SIZE = 1000 # Max in-memory signal events before older ones (if not written) are pushed out
-LOGS_DIR = "/home/aladhimarkets/Thalex_SimpleQuouter/logs" # User-provided log directory
+LOGS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "logs") # Project logs directory
 
 class VolumeCandle:
     """Simple container for volume-based candle data"""

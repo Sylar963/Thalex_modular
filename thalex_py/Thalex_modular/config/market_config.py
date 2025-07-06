@@ -16,7 +16,7 @@ Simplified configuration for the Thalex Avellaneda-Stoikov market maker.
 BOT_CONFIG = {
     # Market parameters
     "market": {
-        "underlying": "BTC-PERPETUAL",
+        "underlying": "BTC-25JUL25",
         "futures_instrument": "BTC-25JUL25",
         "network": Network.TEST,
         "label": "F",
@@ -56,14 +56,8 @@ BOT_CONFIG = {
             "position_limit": 1.0,                  # Maximum position size
             "exchange_fee_rate": 0.0001,
             
-            # Take profit trigger order configuration
-            "enable_take_profit_triggers": True,          # Enable basic trigger orders
+            # Trigger order configuration (rescue trades only)
             "enable_arbitrage_triggers": True,            # Enable enhanced arbitrage triggers
-            "take_profit_spread_bps": 7.0,               # Basic take profit spread (6-8 bps)
-            "arbitrage_profit_threshold_usd": 10.0,      # Trigger arbitrage close at $10 profit
-            "single_instrument_profit_threshold_usd": 5.0, # Trigger single instrument close at $5 profit
-            "spread_profit_threshold_bps": 15.0,         # Trigger close at 15 bps spread profit
-            "arbitrage_check_interval": 2.0,             # Check trigger conditions every 2 seconds
             
             # Predictive adjustment thresholds
             "pa_prediction_max_age_seconds": 300,        # Max age for predictions (5 minutes)
