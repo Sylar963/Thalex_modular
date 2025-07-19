@@ -241,6 +241,21 @@ TRADING_CONFIG = {
     "volatility": DEFAULT_VOLATILITY_CONFIG,
 
     "trading_fees": BOT_CONFIG["trading_fees"],
+    
+    # Rescue trading strategy configuration
+    "rescue": {
+        "enabled": True,  # Boolean to enable/disable the rescue trade logic
+        "threshold_pct": 0.003,  # Decimal: Percentage price drop from average entry to trigger rescue (0.3%)
+        "profit_bps": 7.0,  # Float: Basis points profit target on the averaged position to exit rescue (0.07%)
+        "max_steps": 3,  # Integer: Maximum number of averaging-down steps allowed before halting rescue
+        "size_multiplier": 1.0,  # Float: Multiplier for the base order size for each rescue order
+        "min_interval_seconds": 5.0,  # Float: Minimum time (seconds) between placing new rescue orders
+        "order_label": "RescueTrade",  # String: Specific label for rescue orders
+        "exit_label": "RescueExit",  # String: Specific label for rescue exit orders
+        "aggressive_exit": True,  # Boolean: Use market orders for exits to ensure fills
+        "max_rescue_position_ratio": 2.0,  # Float: Max rescue position as ratio of base position limit
+        "cooldown_after_exit_seconds": 30.0,  # Float: Cooldown period after rescue exit before re-entry
+    },
 }
 
 # RISK_LIMITS - Direct access to risk parameters

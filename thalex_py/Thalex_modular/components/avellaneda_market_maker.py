@@ -36,9 +36,9 @@ class AvellanedaMarketMaker:
         'market_state', 'last_quote_time', 'min_tick', 'last_position_check', 'last_quote_update',
         'vwap', 'total_volume', 'volume_price_sum', 'market_buys_volume', 'market_sells_volume',
         'aggressive_buys_sum', 'aggressive_sells_sum', 'market_impact', 'active_quotes',
-        'current_bid_quotes', 'current_ask_quotes', 'hedge_manager', 'use_hedging',
+        'current_bid_quotes', 'current_ask_quotes',
         # Performance optimization caches
-        '_cached_spread', '_cached_mid_price', '_cached_volatility_factor', '_cache_timestamp',
+        '_cached_spread', '_cached_mid_price', '_cached_volatility_factor', '_cached_position', '_cache_timestamp',
         '_log_counter', '_last_major_log',
         # Take profit trigger order system
         'active_trigger_orders', 'take_profit_spread_bps', 'trigger_order_enabled',
@@ -162,14 +162,11 @@ class AvellanedaMarketMaker:
         self.current_bid_quotes: List[Quote] = []
         self.current_ask_quotes: List[Quote] = []
 
-        # Hedge manager integration
-        self.hedge_manager = None
-        self.use_hedging = False  # Always disable hedging
-        
         # Performance optimization: Initialize caches
         self._cached_spread = 0.0
         self._cached_mid_price = 0.0
         self._cached_volatility_factor = 1.0
+        self._cached_position = 0.0
         self._cache_timestamp = 0.0
         self._log_counter = 0
         self._last_major_log = 0.0
@@ -200,50 +197,95 @@ class AvellanedaMarketMaker:
         self.perp_tick_size = 1.0
         self.futures_tick_size = 1.0
 
-        # Initialize hedge manager (disabled by default)
-        if False:  # Force disabled to avoid configuration issues
-            from .hedge import create_hedge_manager
-            hedge_config_dict = {}
-            hedge_strategy = TRADING_CONFIG.get("hedging", {}).get("strategy", "notional")
-            if hedge_strategy:
-                hedge_config_dict["strategy"] = hedge_strategy
-                
-            self.hedge_manager = create_hedge_manager(
-                config_path=TRADING_CONFIG.get("hedging", {}).get("config_path"),
-                config_dict=hedge_config_dict if hedge_config_dict else None,
-                exchange_client=self.exchange_client
-            )
-            self.hedge_manager.start()
-            self.logger.info("Hedge manager initialized and started")
-        else:
-            if random.random() < LOG_SAMPLING_RATE:
-                self.logger.info("Hedging is disabled")
-
     def set_tick_size(self, tick_size: float):
         """Set the tick size for the instrument"""
         self.tick_size = tick_size
         self.min_tick = tick_size
         self.logger.info(f"Tick size set to {tick_size}")
 
+    def _get_default_tick_size(self) -> float:
+        """Get appropriate default tick size based on instrument type"""
+        # Check if we have instrument information to determine proper tick size
+        if hasattr(self, 'instrument') and self.instrument:
+            instrument_name = str(self.instrument).upper()
+            if 'BTC' in instrument_name:
+                return 1.0  # BTC derivatives typically have 1 USD tick size
+            elif 'ETH' in instrument_name:
+                return 0.1  # ETH derivatives typically have 0.1 USD tick size
+            else:
+                return 1.0  # Default for unknown instruments
+        
+        # Check if we have perp or futures instrument names
+        if hasattr(self, 'perp_instrument') and self.perp_instrument:
+            if 'BTC' in str(self.perp_instrument).upper():
+                return 1.0
+            elif 'ETH' in str(self.perp_instrument).upper():
+                return 0.1
+        
+        if hasattr(self, 'futures_instrument') and self.futures_instrument:
+            if 'BTC' in str(self.futures_instrument).upper():
+                return 1.0
+            elif 'ETH' in str(self.futures_instrument).upper():
+                return 0.1
+        
+        # Fallback to BTC default
+        return 1.0
+
     def update_market_conditions(self, volatility: float, market_impact: float):
         """Update the market conditions used for quote generation"""
         self.volatility = volatility
         self.market_impact = market_impact
-        self.logger.debug(f"Market conditions updated: vol={self.volatility:.6f}, impact={market_impact:.6f}")
+        if random.random() < LOG_SAMPLING_RATE:
+            self.logger.debug(f"Market conditions updated: vol={self.volatility:.6f}, impact={market_impact:.6f}")
     
     def update_vamp(self, price: float, volume: float, is_buy: bool, is_aggressive: bool=False):
-        """Update Volume-Adjusted Market Price calculations"""
+        """Update Volume-Adjusted Market Price calculations with improved edge case handling"""
+        # Input validation to prevent corrupted VAMP calculations
+        if not isinstance(price, (int, float)) or not np.isfinite(price) or price <= 0:
+            self.logger.warning(f"Invalid price {price} in VAMP update, skipping")
+            return self.vamp_value if hasattr(self, 'vamp_value') else 0.0
+            
+        if not isinstance(volume, (int, float)) or not np.isfinite(volume) or volume <= 0:
+            self.logger.warning(f"Invalid volume {volume} in VAMP update, skipping")
+            return self.vamp_value if hasattr(self, 'vamp_value') else 0.0
+        
         if random.random() < LOG_SAMPLING_RATE:
             side_str = "BUY" if is_buy else "SELL"
             agg_str = "aggressive" if is_aggressive else "passive"
             self.logger.debug(f"Updating VAMP with {side_str} {volume:.6f} @ {price:.2f} ({agg_str})")
         
-        old_vwap = getattr(self, 'vwap', 0)
-        old_vamp_value = getattr(self, 'vamp_value', 0)
+        old_vwap = getattr(self, 'vwap', 0.0)
+        old_vamp_value = getattr(self, 'vamp_value', 0.0)
         
-        # Update VWAP (Volume-Weighted Average Price)
-        self.volume_price_sum += price * volume
+        # Initialize attributes safely if they don't exist
+        if not hasattr(self, 'volume_price_sum'):
+            self.volume_price_sum = 0.0
+        if not hasattr(self, 'total_volume'):
+            self.total_volume = 0.0
+        
+        # Update VWAP (Volume-Weighted Average Price) with overflow protection
+        price_volume = price * volume
+        if not np.isfinite(price_volume):
+            self.logger.warning(f"Price*volume overflow: {price}*{volume}, skipping VAMP update")
+            return old_vamp_value
+            
+        self.volume_price_sum += price_volume
         self.total_volume += volume
+        
+        # Prevent accumulation of excessive data that could cause precision issues
+        max_total_volume = 1e6  # Reset after 1M volume to maintain precision
+        if self.total_volume > max_total_volume:
+            # Scale down proportionally to maintain VWAP accuracy
+            scale_factor = 0.5
+            self.volume_price_sum *= scale_factor
+            self.total_volume *= scale_factor
+            self.market_buys_volume *= scale_factor
+            self.market_sells_volume *= scale_factor
+            self.aggressive_buys_sum *= scale_factor
+            self.aggressive_sells_sum *= scale_factor
+            if random.random() < LOG_SAMPLING_RATE:
+                self.logger.info(f"VAMP data scaled down by {scale_factor} to maintain precision")
+        
         if self.total_volume > 0:
             self.vwap = self.volume_price_sum / self.total_volume
             if random.random() < LOG_SAMPLING_RATE:
@@ -383,17 +425,31 @@ class AvellanedaMarketMaker:
         """
         # Performance: Check cache first to avoid expensive recalculation
         current_time = time.time()
-        if (current_time - self._cache_timestamp < 0.1 and  
-            abs(market_impact) < 0.001 and  
-            self._cached_spread > 0):
+        # Cache is only valid if key parameters haven't changed significantly
+        try:
+            current_position = getattr(self.position_tracker, 'current_position', 0.0)
+            cache_valid = (
+                current_time - self._cache_timestamp < 0.1 and  # Time-based expiry
+                abs(market_impact) < 0.001 and  # Market impact hasn't changed much
+                self._cached_spread > 0 and  # Valid cached value exists
+                abs(self.volatility - getattr(self, '_cached_volatility_factor', self.volatility)) < 0.001 and  # Volatility stable
+                abs(current_position - getattr(self, '_cached_position', current_position)) < 0.001  # Position stable
+            )
+        except Exception:
+            # If cache validation fails, invalidate cache
+            cache_valid = False
+        
+        if cache_valid:
             return self._cached_spread
             
         try:
             min_spread_ticks = ORDERBOOK_CONFIG["min_spread"]
             
             if self.tick_size <= 0:
-                self.logger.warning("Invalid tick_size detected in calculate_optimal_spread. Using default of 1.0")
-                self.tick_size = 1.0
+                # Use proper tick size based on instrument type
+                default_tick_size = self._get_default_tick_size()
+                self.logger.warning(f"Invalid tick_size detected in calculate_optimal_spread. Using instrument default: {default_tick_size}")
+                self.tick_size = default_tick_size
                 
             min_spread = min_spread_ticks * self.tick_size
             
@@ -479,7 +535,18 @@ class AvellanedaMarketMaker:
                     self.position_limit = 0.1
                     self.logger.warning(f"Invalid position_limit, using minimum: {self.position_limit}")
             
-            inventory_risk = abs(self.position_tracker.current_position) / max(self.position_limit, 0.001)
+            # Safe division with proper bounds checking and validation
+            current_position = getattr(self.position_tracker, 'current_position', 0.0)
+            if not isinstance(current_position, (int, float)) or not np.isfinite(current_position):
+                self.logger.warning(f"Invalid current_position value: {current_position}, using 0.0")
+                current_position = 0.0
+            
+            # Ensure position_limit is always positive and reasonable
+            safe_position_limit = max(0.001, abs(self.position_limit))
+            inventory_risk = abs(current_position) / safe_position_limit
+            
+            # Cap inventory risk to prevent extreme values
+            inventory_risk = min(inventory_risk, 10.0)  # Cap at 10x position limit
             inventory_component = self.inventory_factor * inventory_risk * volatility_term
             
             market_state_factor = 1.0
@@ -510,8 +577,10 @@ class AvellanedaMarketMaker:
             
             final_spread = max(optimal_spread, fee_coverage_spread)
             
-            # Performance: Cache the result
+            # Performance: Cache the result with current state
             self._cached_spread = final_spread
+            self._cached_volatility_factor = volatility
+            self._cached_position = getattr(self.position_tracker, 'current_position', 0.0)
             self._cache_timestamp = current_time
             
             if random.random() < LOG_SAMPLING_RATE:
@@ -530,7 +599,7 @@ class AvellanedaMarketMaker:
             fee_based_fallback = reference_price * (maker_fee_rate * 2 + 0.0005)
             min_spread_ticks = ORDERBOOK_CONFIG.get("min_spread", 35)
             if self.tick_size <= 0:
-                self.tick_size = 1.0
+                self.tick_size = self._get_default_tick_size()
             return max(min_spread_ticks * self.tick_size, fee_based_fallback)
 
     def calculate_skewed_prices(self, mid_price: float, spread: float) -> Tuple[float, float]:
@@ -709,8 +778,9 @@ class AvellanedaMarketMaker:
         """Generate quotes using Avellaneda-Stoikov market making model with dynamic grid updates"""
         try:
             if self.tick_size <= 0:
-                self.logger.warning("Invalid tick size detected in generate_quotes. Setting default value of 1.0")
-                self.tick_size = 1.0
+                default_tick = self._get_default_tick_size()
+                self.logger.warning(f"Invalid tick size detected in generate_quotes. Setting default value of {default_tick}")
+                self.tick_size = default_tick
                 
             timestamp = getattr(ticker, 'timestamp', time.time())
             
@@ -1143,8 +1213,9 @@ class AvellanedaMarketMaker:
             
         # Ensure tick size is valid    
         if self.tick_size <= 0:
-            self.logger.warning(f"Invalid tick_size {self.tick_size} in _calculate_level_price. Using default of 1.0")
-            self.tick_size = 1.0
+            default_tick = self._get_default_tick_size()
+            self.logger.warning(f"Invalid tick_size {self.tick_size} in _calculate_level_price. Using default of {default_tick}")
+            self.tick_size = default_tick
         
         # Early return for level 0
         if level == 0:
@@ -1398,9 +1469,10 @@ class AvellanedaMarketMaker:
             return round(value / self.tick_size) * self.tick_size
         
         # Fallback path with occasional logging
+        default_tick = self._get_default_tick_size()
         if random.random() < LOG_SAMPLING_RATE:
-            self.logger.warning(f"Invalid tick size ({self.tick_size}) in round_to_tick. Using default of 1.0")
-        self.tick_size = 1.0
+            self.logger.warning(f"Invalid tick size ({self.tick_size}) in round_to_tick. Using default of {default_tick}")
+        self.tick_size = default_tick
         return round(value / self.tick_size) * self.tick_size
 
     def on_order_filled(self, order_id: str, fill_price: float, fill_size: float, is_buy: bool) -> None:
@@ -1427,26 +1499,6 @@ class AvellanedaMarketMaker:
             # NEW: Update volume candle buffer with fill data
             self.volume_buffer.update(fill_price, fill_size, is_buy, int(time.time() * 1000))
             
-            # Check if we're using the hedge manager and have a valid instrument
-            if self.use_hedging and self.hedge_manager is not None:
-                # Ensure we have a valid instrument before processing for hedging
-                if not self.instrument or self.instrument == "unknown":
-                    # Try one more time to determine the instrument from exchange client
-                    if self.exchange_client and hasattr(self.exchange_client, 'get_current_instrument'):
-                        current_instrument = self.exchange_client.get_current_instrument()
-                        if current_instrument:
-                            self.instrument = current_instrument
-                            self.logger.info(f"Setting instrument from current exchange context: {self.instrument}")
-                        else:
-                            self.logger.error(f"No instrument set for fill - cannot process trade. Aborting fill processing.")
-                            return  # Stop processing if no instrument is set
-                    else:
-                        self.logger.error(f"No instrument set for fill and no way to determine it - cannot process trade. Aborting fill processing.")
-                        return  # Stop processing if no instrument is set
-                
-                # Now process the fill for hedging
-                self._process_fill_for_hedging(order_id, fill_price, fill_size, is_buy)
-            
             # NOTE: Trigger order logic is now handled separately by the quoter
             # with instrument-specific information via _handle_trigger_order_on_fill
             
@@ -1459,66 +1511,6 @@ class AvellanedaMarketMaker:
             
         except Exception as e:
             self.logger.error(f"Error handling order fill: {str(e)}")
-
-    def _process_fill_for_hedging(self, order_id: str, fill_price: float, fill_size: float, is_buy: bool):
-        """
-        Process a fill through the hedge manager
-        
-        Args:
-            order_id: Order ID
-            fill_price: Fill price
-            fill_size: Fill size
-            is_buy: Whether it was a buy (True) or sell (False)
-        """
-        try:
-            # Make sure we have a valid instrument
-            if not self.instrument or self.instrument == "unknown":
-                # Try one more time to determine the instrument from exchange client
-                if self.exchange_client and hasattr(self.exchange_client, 'get_current_instrument'):
-                    current_instrument = self.exchange_client.get_current_instrument()
-                    if current_instrument:
-                        self.instrument = current_instrument
-                        self.logger.info(f"Setting instrument from current exchange context: {self.instrument}")
-                    else:
-                        self.logger.error(f"No instrument set for fill - cannot process trade. Aborting fill processing.")
-                        return  # Stop processing if no instrument is set
-                else:
-                    self.logger.error(f"No instrument set for fill and no way to determine it - cannot process trade. Aborting fill processing.")
-                    return  # Stop processing if no instrument is set
-            
-            # Create a fill object suitable for the hedge manager
-            class HedgeFill:
-                def __init__(self, instrument, price, size, is_buy, order_id):
-                    self.instrument = instrument
-                    self.price = price
-                    self.size = size
-                    self.is_buy = is_buy
-                    self.fill_id = order_id
-            
-            instrument = self.instrument
-                
-            # Create the fill object
-            fill = HedgeFill(
-                instrument=instrument,
-                price=fill_price,
-                size=fill_size,
-                is_buy=is_buy,
-                order_id=order_id
-            )
-            
-            # Process the fill through hedge manager
-            self.hedge_manager.on_fill(fill)
-            self.logger.info(f"Processed fill for hedging: {instrument} {'BUY' if is_buy else 'SELL'} {fill_size} @ {fill_price}")
-            
-            # Get current position status for logging
-            hedge_position = self.hedge_manager.get_hedged_position(instrument)
-            if hedge_position:
-                self.logger.info(
-                    f"Current hedge: {hedge_position.primary_position} {instrument} hedged with "
-                    f"{hedge_position.hedge_position} {hedge_position.hedge_asset} (ratio: {hedge_position.hedge_ratio:.2f})"
-                )
-        except Exception as e:
-            self.logger.error(f"Error processing fill for hedging: {e}", exc_info=True)
 
     def _handle_trigger_order_on_fill(self, fill_price: float, fill_size: float, is_buy: bool, 
                                      old_position: float, old_entry_price: float, instrument: str = None) -> None:
@@ -1871,16 +1863,16 @@ class AvellanedaMarketMaker:
         if price <= 0:
             if random.random() < LOG_SAMPLING_RATE:
                 self.logger.warning(f"Invalid price {price} in align_price_to_tick. Using minimum tick size.")
-            return self.tick_size if self.tick_size > 0 else 1.0
+            return self.tick_size if self.tick_size > 0 else self._get_default_tick_size()
             
         if not self.tick_size or self.tick_size <= 0:
             if random.random() < LOG_SAMPLING_RATE:
                 self.logger.warning("Invalid tick size, using default alignment")
                 old_tick_size = self.tick_size
-                self.tick_size = 1.0
+                self.tick_size = self._get_default_tick_size()
                 self.logger.info(f"Updated tick size from {old_tick_size} to {self.tick_size}")
             else:
-                self.tick_size = 1.0  # Set default without logging
+                self.tick_size = self._get_default_tick_size()  # Set default without logging
             return round(price, 2)  # Default to 2 decimal places
 
     def set_instrument(self, instrument: str):
@@ -2452,6 +2444,91 @@ class AvellanedaMarketMaker:
             self.logger.error(f"Error calculating arbitrage profit: {str(e)}", exc_info=True)
             return {"total_profit_usd": 0.0, "spread_profit_bps": 0.0, "legs": {}}
 
+    def should_trigger_take_profit(self) -> Dict[str, Any]:
+        """
+        Determine if take profit should be triggered based on current positions and profits
+        
+        Returns:
+            Dict with trigger decision and details
+        """
+        try:
+            current_time = time.time()
+            
+            # Don't check too frequently for performance
+            if current_time - self.last_arbitrage_check < self.arbitrage_check_interval:
+                return {"should_trigger": False, "reason": "rate_limited"}
+            
+            self.last_arbitrage_check = current_time
+            
+            # Detect current trading mode
+            mode = self.detect_trading_mode()
+            
+            if mode == "unknown":
+                return {"should_trigger": False, "reason": "no_significant_positions", "mode": mode}
+            
+            result = {
+                "should_trigger": False,
+                "reason": "",
+                "mode": mode,
+                "trigger_type": "",
+                "instruments_to_close": [],
+                "profit_metrics": {}
+            }
+            
+            if mode == "arbitrage":
+                # Arbitrage mode - check combined profit
+                arb_profit = self.calculate_arbitrage_profit()
+                result["profit_metrics"] = arb_profit
+                
+                total_profit = arb_profit["total_profit_usd"]
+                net_profit = arb_profit["net_profit_after_fees"]
+                spread_bps = arb_profit["spread_profit_bps"]
+                
+                self.logger.debug(
+                    f"Arbitrage profit check: Total=${total_profit:.2f}, Net=${net_profit:.2f}, "
+                    f"Spread={spread_bps:.1f}bps, Threshold=${self.arbitrage_profit_threshold_usd:.2f}"
+                )
+                
+                # Check if arbitrage profit exceeds threshold
+                if net_profit >= self.arbitrage_profit_threshold_usd or spread_bps >= self.spread_profit_threshold_bps:
+                    result["should_trigger"] = True
+                    result["trigger_type"] = "arbitrage"
+                    result["reason"] = f"arbitrage_profit_threshold (${net_profit:.2f} >= ${self.arbitrage_profit_threshold_usd:.2f} OR {spread_bps:.1f}bps >= {self.spread_profit_threshold_bps:.1f}bps)"
+                    
+                    # Close both legs
+                    if self.perp_instrument and abs(arb_profit["legs"]["perp"].get("position_size", 0)) > 0.001:
+                        result["instruments_to_close"].append(self.perp_instrument)
+                    if self.futures_instrument and abs(arb_profit["legs"]["futures"].get("position_size", 0)) > 0.001:
+                        result["instruments_to_close"].append(self.futures_instrument)
+                        
+            elif mode in ["single_perp", "single_futures"]:
+                # Single instrument mode
+                instrument = self.perp_instrument if mode == "single_perp" else self.futures_instrument
+                if not instrument:
+                    return {"should_trigger": False, "reason": "instrument_not_configured", "mode": mode}
+                
+                single_profit = self.calculate_single_instrument_profit(instrument)
+                result["profit_metrics"] = {instrument: single_profit}
+                
+                profit_usd = single_profit["profit_usd"]
+                
+                self.logger.debug(
+                    f"Single instrument profit check ({instrument}): ${profit_usd:.2f}, "
+                    f"Threshold=${self.single_instrument_profit_threshold_usd:.2f}"
+                )
+                
+                # Check if single instrument profit exceeds threshold
+                if profit_usd >= self.single_instrument_profit_threshold_usd:
+                    result["should_trigger"] = True
+                    result["trigger_type"] = "single_instrument"
+                    result["reason"] = f"single_instrument_threshold (${profit_usd:.2f} >= ${self.single_instrument_profit_threshold_usd:.2f})"
+                    result["instruments_to_close"] = [instrument]
+            
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Error checking take profit trigger: {str(e)}", exc_info=True)
+            return {"should_trigger": False, "reason": "error", "error": str(e)}
 
     def create_enhanced_trigger_orders(self) -> List[Quote]:
         """
@@ -2461,8 +2538,82 @@ class AvellanedaMarketMaker:
             List of trigger orders to place
         """
         try:
-            # Create standard trigger orders for existing positions
-            return self._create_standard_trigger_orders()
+            # Check if we should trigger take profit
+            trigger_decision = self.should_trigger_take_profit()
+            
+            if not trigger_decision["should_trigger"]:
+                # No immediate trigger needed, create standard trigger orders for existing positions
+                return self._create_standard_trigger_orders()
+            
+            # Create immediate trigger orders to close positions
+            trigger_orders = []
+            instruments_to_close = trigger_decision.get("instruments_to_close", [])
+            
+            self.logger.info(
+                f"Creating enhanced trigger orders: {trigger_decision['trigger_type']} trigger "
+                f"for {len(instruments_to_close)} instruments - {trigger_decision['reason']}"
+            )
+            
+            for instrument in instruments_to_close:
+                if not self.portfolio_tracker or instrument not in self.portfolio_tracker.instrument_trackers:
+                    continue
+                
+                tracker = self.portfolio_tracker.instrument_trackers[instrument]
+                position_size = tracker.current_position
+                
+                if abs(position_size) < 0.001:
+                    continue
+                
+                # Get current mark price
+                mark_price = self.portfolio_tracker.mark_prices.get(instrument, 0.0)
+                if mark_price <= 0:
+                    self.logger.warning(f"No mark price for {instrument}, skipping trigger order")
+                    continue
+                
+                # Determine appropriate tick size with safety check
+                tick_size = self.perp_tick_size if instrument == self.perp_instrument else self.futures_tick_size
+                if tick_size <= 0:
+                    self.logger.warning(f"Invalid tick size {tick_size} for {instrument}, using default 1.0")
+                    tick_size = 1.0
+                
+                # Create aggressive trigger order to close position quickly
+                # Use a small buffer to ensure fills (0.1% for market-like execution)
+                price_buffer = 0.001  # 10 basis points
+                
+                if position_size > 0:  # Long position - create sell trigger
+                    trigger_price = mark_price * (1 - price_buffer)
+                    trigger_side = "sell"
+                else:  # Short position - create buy trigger
+                    trigger_price = mark_price * (1 + price_buffer)
+                    trigger_side = "buy"
+                
+                # Round to appropriate tick size
+                trigger_price = round(trigger_price / tick_size) * tick_size
+                trigger_size = abs(position_size)
+                
+                # Create trigger order
+                trigger_quote = Quote(
+                    instrument=instrument,
+                    side=trigger_side,
+                    price=trigger_price,
+                    amount=trigger_size,
+                    timestamp=time.time(),
+                    is_trigger_order=True
+                )
+                
+                # Generate unique trigger ID
+                trigger_id = f"enhanced_trigger_{instrument}_{trigger_side}_{int(time.time() * 1000)}"
+                
+                # Store trigger order
+                self.active_trigger_orders[trigger_id] = trigger_quote
+                trigger_orders.append(trigger_quote)
+                
+                self.logger.info(
+                    f"Created enhanced trigger: {instrument} {trigger_side.upper()} {trigger_size:.4f} @ {trigger_price:.2f} "
+                    f"(mark: {mark_price:.2f}, buffer: {price_buffer:.1%})"
+                )
+            
+            return trigger_orders
             
         except Exception as e:
             self.logger.error(f"Error creating enhanced trigger orders: {str(e)}", exc_info=True)

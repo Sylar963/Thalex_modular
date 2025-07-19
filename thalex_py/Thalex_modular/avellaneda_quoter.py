@@ -61,7 +61,7 @@ from thalex_py.Thalex_modular.models.position_tracker import PositionTracker, Po
 from thalex_py.Thalex_modular.components.risk_manager import RiskManager
 from thalex_py.Thalex_modular.components.order_manager import OrderManager
 from thalex_py.Thalex_modular.components.avellaneda_market_maker import AvellanedaMarketMaker
-from thalex_py.Thalex_modular.models.keys import key_ids, private_keys
+from thalex_py.Thalex_modular.models.keys import get_key_ids, get_private_keys
 from thalex_py.Thalex_modular.performance_monitor import PerformanceMonitor
 from thalex_py.Thalex_modular.thalex_logging import LoggerFactory
 from thalex_py.Thalex_modular.ringbuffer.market_data_buffer import MarketDataBuffer
@@ -95,29 +95,41 @@ class ObjectPool:
         with self.lock:
             self.items.append(item)
 
-# Lock-free queue implementation for high-frequency components
-class LockFreeQueue:
+# Thread-safe queue implementation for high-frequency components
+class ThreadSafeQueue:
     def __init__(self, maxsize=1000):
         self.maxsize = maxsize
         self.queue = np.zeros(maxsize, dtype=np.uint64)
-        self.head = 0
-        self.tail = 0
+        self._head = 0
+        self._tail = 0
+        self._lock = threading.Lock()  # Lightweight lock for atomicity
 
     def put(self, item):
-        """Put item in queue without locking"""
-        if (self.tail + 1) % self.maxsize == self.head:
-            return False  # Queue is full
-        self.queue[self.tail] = item
-        self.tail = (self.tail + 1) % self.maxsize
-        return True
+        """Put item in queue with thread safety"""
+        with self._lock:
+            if (self._tail + 1) % self.maxsize == self._head:
+                return False  # Queue is full
+            self.queue[self._tail] = item
+            self._tail = (self._tail + 1) % self.maxsize
+            return True
 
     def get(self):
-        """Get item from queue without locking"""
-        if self.head == self.tail:
-            return None  # Queue is empty
-        item = self.queue[self.head]
-        self.head = (self.head + 1) % self.maxsize
-        return item
+        """Get item from queue with thread safety"""
+        with self._lock:
+            if self._head == self._tail:
+                return None  # Queue is empty
+            item = self.queue[self._head]
+            self._head = (self._head + 1) % self.maxsize
+            return item
+    
+    @property
+    def size(self):
+        """Get current queue size"""
+        with self._lock:
+            if self._tail >= self._head:
+                return self._tail - self._head
+            else:
+                return self.maxsize - self._head + self._tail
 
 # Memory-mapped structure for IPC - SIMPLIFIED DEFINITION
 class SharedMarketData(ctypes.Structure):
@@ -174,7 +186,7 @@ class AvellanedaQuoter:
         'order_pool', 'ticker_pool', 'quote_pool',
         
         # Shared memory and IPC
-        'shm_obj', 'shared_market_data_struct',
+        'shm_obj', 'shared_market_data_struct', '_shm_creator',
         
         # Performance tracing
         'performance_tracer', 'volume_buffer',
@@ -192,7 +204,11 @@ class AvellanedaQuoter:
         'orders_by_id', 'orders_by_client_id', 'active_bid_count', 'active_ask_count',
         
         # Logging control
-        'verbose_logging', 'log_sampling_counter'
+        'verbose_logging', 'log_sampling_counter',
+        
+        # Rescue trading state management
+        'rescue_config', 'rescue_mode_active', 'current_rescue_step', 'last_rescue_order_time',
+        'active_rescue_orders', 'base_order_size', 'rescue_exit_cooldown'
     ]
     
     def _create_empty_order(self):
@@ -378,49 +394,348 @@ class AvellanedaQuoter:
         # Initialize instrument data cache
         self.instrument_data_cache = {}
         
-        # Create shared memory for IPC
+        # Create shared memory for IPC with improved cleanup tracking
         self.shm_obj = None
         self.shared_market_data_struct = None
+        self._shm_creator = False  # Track if this instance created the shared memory
+        
         try:
             shm_size = ctypes.sizeof(SharedMarketData)
             # Try to create the shared memory segment
             self.shm_obj = shared_memory.SharedMemory(name="thalex_market_data", create=True, size=shm_size)
+            self._shm_creator = True  # Mark as creator for proper cleanup
             self.logger.info(f"Created shared memory segment 'thalex_market_data' with size {shm_size}")
         except FileExistsError:
             # If it already exists, connect to it
             try:
-                shm_size = ctypes.sizeof(SharedMarketData) # Recalculate size just in case
-                self.shm_obj = shared_memory.SharedMemory(name="thalex_market_data", create=False, size=shm_size)
-                self.logger.info(f"Connected to existing shared memory segment 'thalex_market_data' size {shm_size}")
+                self.shm_obj = shared_memory.SharedMemory(name="thalex_market_data", create=False)
+                self._shm_creator = False  # Not the creator, so don't unlink on shutdown
+                self.logger.info(f"Connected to existing shared memory segment 'thalex_market_data'")
             except Exception as e_conn:
                 self.logger.error(f"Failed to connect to existing shared memory 'thalex_market_data': {e_conn}")
-                self.shm_obj = None # Ensure it's None on failure
+                self.shm_obj = None
         except Exception as e_create:
             self.logger.error(f"Failed to create shared memory 'thalex_market_data': {e_create}")
-            self.shm_obj = None # Ensure it's None on failure
+            self.shm_obj = None
 
-        if self.shm_obj:
+        # Safely map the shared memory buffer with proper error handling
+        if self.shm_obj is not None:
             try:
-                # Map the shared memory buffer to the ctypes structure
                 self.shared_market_data_struct = SharedMarketData.from_buffer(self.shm_obj.buf)
                 self.logger.info("Successfully mapped shared memory buffer to SharedMarketData structure.")
             except Exception as e_map:
                 self.logger.error(f"Failed to map shared memory buffer: {e_map}")
                 self.shared_market_data_struct = None
-                # If mapping fails, close and unlink the shm_obj as it's unusable by this instance
-                try:
-                    self.shm_obj.close()
-                    self.shm_obj.unlink() # Attempt to unlink, might fail if not creator or permissions issue
-                except FileNotFoundError:
-                    pass # It might have been unlinked by another process or never fully created
-                except Exception as e_cleanup:
-                    self.logger.error(f"Error cleaning up shm_obj after mapping failure: {e_cleanup}")
-                self.shm_obj = None
+                # Clean up the shared memory object safely
+                self._cleanup_shared_memory_on_error()
+        else:
+            self.shared_market_data_struct = None
         
         # Performance tracing
         self.performance_tracer = PerformanceTracer()
         
-        self.logger.info("Avellaneda quoter initialized with HFT optimizations")
+        # Initialize rescue trading state management
+        self.rescue_config = TRADING_CONFIG.get("rescue", {})
+        self.base_order_size = TRADING_CONFIG["avellaneda"].get("base_size", 0.01)
+        
+        # Initialize rescue state tracking dictionaries
+        # These will be populated once instruments are known
+        self.rescue_mode_active: Dict[str, bool] = {}
+        self.current_rescue_step: Dict[str, int] = {}
+        self.last_rescue_order_time: Dict[str, float] = {}
+        self.active_rescue_orders: Dict[str, Dict[str, Order]] = {}
+        self.rescue_exit_cooldown: Dict[str, float] = {}
+        
+        self.logger.info("Avellaneda quoter initialized with HFT optimizations and rescue trading")
+
+    def _initialize_rescue_state_for_instrument(self, instrument_name: str):
+        """Initialize rescue trading state for a specific instrument"""
+        if instrument_name and instrument_name not in self.rescue_mode_active:
+            self.rescue_mode_active[instrument_name] = False
+            self.current_rescue_step[instrument_name] = 0
+            self.last_rescue_order_time[instrument_name] = 0.0
+            self.active_rescue_orders[instrument_name] = {}
+            self.rescue_exit_cooldown[instrument_name] = 0.0
+            self.logger.info(f"Initialized rescue trading state for {instrument_name}")
+
+    async def _manage_rescue_trades(self, instrument_name: str):
+        """
+        Manages the lifecycle of rescue trades for a specific instrument.
+        Places new rescue orders if underwater, and flattens position if profitable.
+        """
+        if not self.rescue_config.get("enabled", False) or not self.active_trading:
+            return
+
+        # Initialize rescue state for this instrument if not done yet
+        self._initialize_rescue_state_for_instrument(instrument_name)
+
+        # Get current price data
+        current_price = 0.0
+        if instrument_name == self.perp_name and self.ticker:
+            current_price = self.ticker.mark_price
+        elif instrument_name == self.futures_instrument_name and self.futures_ticker:
+            current_price = self.futures_ticker.mark_price
+        
+        if current_price <= 0:
+            return  # No valid price data
+
+        current_time = time.time()
+        
+        # Check if we're in exit cooldown period
+        if current_time < self.rescue_exit_cooldown.get(instrument_name, 0.0):
+            return  # Still in cooldown after rescue exit
+
+        # Get position and PnL for the specific instrument from portfolio tracker
+        try:
+            position_metrics = self.portfolio_tracker.get_instrument_metrics(instrument_name)
+            position = position_metrics.get("position", 0.0)
+            average_entry = position_metrics.get("average_entry", 0.0)
+            unrealized_pnl_usd = position_metrics.get("unrealized_pnl_usd", 0.0)
+        except Exception as e:
+            self.logger.warning(f"Could not get position metrics for {instrument_name}: {str(e)}")
+            return
+
+        # Skip if no significant position
+        if abs(position) < ZERO_THRESHOLD:
+            # If we were in rescue mode but position is now flat, reset state
+            if self.rescue_mode_active.get(instrument_name, False):
+                self.logger.info(f"Position for {instrument_name} is flat, exiting rescue mode")
+                await self._reset_rescue_state(instrument_name)
+            return
+
+        # Determine if we are "underwater" (position has significant unrealized loss)
+        is_underwater = False
+        if abs(position) > ZERO_THRESHOLD and average_entry > 0:
+            # Calculate loss threshold based on position value
+            position_value = abs(position) * current_price
+            loss_threshold_usd = self.rescue_config["threshold_pct"] * position_value
+            
+            if unrealized_pnl_usd < -loss_threshold_usd:
+                is_underwater = True
+
+        # --- Handle placing new rescue orders ---
+        if is_underwater:
+            if not self.rescue_mode_active.get(instrument_name, False):
+                self.logger.warning(f"🚨 ENTERING RESCUE MODE for {instrument_name}! Position: {position:.4f}, UPNL: ${unrealized_pnl_usd:.2f}")
+                self.rescue_mode_active[instrument_name] = True
+                self.current_rescue_step[instrument_name] = 0
+
+            # Check if we can place another rescue order
+            max_steps = self.rescue_config["max_steps"]
+            current_step = self.current_rescue_step.get(instrument_name, 0)
+            
+            if current_step < max_steps:
+                min_interval = self.rescue_config["min_interval_seconds"]
+                last_order_time = self.last_rescue_order_time.get(instrument_name, 0.0)
+                
+                if current_time - last_order_time >= min_interval:
+                    await self._place_rescue_order(instrument_name, position, current_price, current_time)
+                else:
+                    remaining_time = min_interval - (current_time - last_order_time)
+                    self.logger.debug(f"Rescue order cooldown for {instrument_name}: {remaining_time:.1f}s remaining")
+            else:
+                self.logger.warning(f"Max rescue steps ({max_steps}) reached for {instrument_name}")
+
+        # --- Handle exiting rescue mode (flattening position for profit) ---
+        elif self.rescue_mode_active.get(instrument_name, False) and abs(position) > ZERO_THRESHOLD:
+            # Calculate profit target
+            position_value = abs(position) * (average_entry if average_entry > 0 else current_price)
+            profit_target_usd = (self.rescue_config["profit_bps"] / 10000) * position_value
+            
+            if unrealized_pnl_usd >= profit_target_usd:
+                self.logger.warning(f"🎉 RESCUE EXIT TRIGGERED for {instrument_name}! UPNL: ${unrealized_pnl_usd:.2f} >= Target: ${profit_target_usd:.2f}")
+                await self._execute_rescue_exit(instrument_name, position, current_price, current_time)
+
+    async def _place_rescue_order(self, instrument_name: str, position: float, current_price: float, current_time: float):
+        """Place a rescue order to average down the position"""
+        try:
+            # Determine direction and target price for averaging down
+            side_to_average = ""
+            rescue_price = 0.0
+            
+            if position > 0:  # Long position underwater - buy more at best bid
+                side_to_average = "buy"
+                if instrument_name == self.perp_name and self.ticker and self.ticker.best_bid_price > 0:
+                    rescue_price = self.ticker.best_bid_price
+                elif instrument_name == self.futures_instrument_name and self.futures_ticker and self.futures_ticker.best_bid_price > 0:
+                    rescue_price = self.futures_ticker.best_bid_price
+                else:
+                    rescue_price = current_price * 0.999  # Fallback: slightly below mark
+            
+            elif position < 0:  # Short position underwater - sell more at best ask
+                side_to_average = "sell"
+                if instrument_name == self.perp_name and self.ticker and self.ticker.best_ask_price > 0:
+                    rescue_price = self.ticker.best_ask_price
+                elif instrument_name == self.futures_instrument_name and self.futures_ticker and self.futures_ticker.best_ask_price > 0:
+                    rescue_price = self.futures_ticker.best_ask_price
+                else:
+                    rescue_price = current_price * 1.001  # Fallback: slightly above mark
+
+            if rescue_price <= 0:
+                self.logger.warning(f"Could not determine valid rescue price for {instrument_name}")
+                return
+
+            # Calculate rescue order size
+            rescue_amount = self.base_order_size * self.rescue_config["size_multiplier"]
+            if rescue_amount <= ZERO_THRESHOLD:
+                self.logger.warning(f"Rescue amount too small for {instrument_name}: {rescue_amount}")
+                return
+
+            # Align price to tick size
+            tick_size = self.tick_size if instrument_name == self.perp_name else self.futures_tick_size
+            if tick_size > 0:
+                if side_to_average == "buy":
+                    rescue_price = math.floor(rescue_price / tick_size) * tick_size
+                else:
+                    rescue_price = math.ceil(rescue_price / tick_size) * tick_size
+
+            # Generate unique client ID for rescue order
+            step = self.current_rescue_step[instrument_name]
+            client_id = f"{self.rescue_config['order_label']}_{instrument_name}_{step}_{int(current_time * 1000)}"
+
+            self.logger.info(f"Placing rescue order for {instrument_name}: {side_to_average.upper()} {rescue_amount:.4f} @ {rescue_price:.2f} (Step {step + 1}/{self.rescue_config['max_steps']})")
+
+            # Place the rescue order
+            order_id = await self.order_manager.place_order(
+                instrument=instrument_name,
+                direction=side_to_average,
+                price=rescue_price,
+                amount=rescue_amount,
+                label=self.rescue_config["order_label"],
+                post_only=True,  # Use limit orders for rescue trades
+                client_id=client_id
+            )
+
+            if order_id:
+                # Track the rescue order
+                rescue_order = Order(
+                    id=order_id,
+                    price=rescue_price,
+                    amount=rescue_amount,
+                    status=OrderStatus.PENDING,
+                    direction=side_to_average,
+                    instrument_id=instrument_name,
+                    client_id=client_id,
+                    label=self.rescue_config["order_label"]
+                )
+                
+                self.active_rescue_orders[instrument_name][client_id] = rescue_order
+                self.current_rescue_step[instrument_name] += 1
+                self.last_rescue_order_time[instrument_name] = current_time
+                
+                self.logger.info(f"Rescue order placed successfully: {client_id}")
+            else:
+                self.logger.error(f"Failed to place rescue order for {instrument_name}")
+
+        except Exception as e:
+            self.logger.error(f"Error placing rescue order for {instrument_name}: {str(e)}")
+
+    async def _execute_rescue_exit(self, instrument_name: str, position: float, current_price: float, current_time: float):
+        """Execute rescue exit by flattening the position"""
+        try:
+            # Cancel any pending rescue orders first
+            if instrument_name in self.active_rescue_orders:
+                for client_id, order_obj in list(self.active_rescue_orders[instrument_name].items()):
+                    try:
+                        await self.order_manager.cancel_order(order_obj.id, instrument_name, client_id)
+                        self.logger.info(f"Cancelled pending rescue order {client_id}")
+                    except Exception as e:
+                        self.logger.warning(f"Error cancelling rescue order {client_id}: {str(e)}")
+
+            # Determine exit direction and price
+            side_to_flatten = "sell" if position > 0 else "buy"
+            exit_price = 0.0
+
+            if self.rescue_config.get("aggressive_exit", True):
+                # Use aggressive pricing for quick exit
+                if side_to_flatten == "sell":
+                    if instrument_name == self.perp_name and self.ticker and self.ticker.best_ask_price > 0:
+                        exit_price = self.ticker.best_ask_price * 0.9999  # Slightly aggressive
+                    elif instrument_name == self.futures_instrument_name and self.futures_ticker and self.futures_ticker.best_ask_price > 0:
+                        exit_price = self.futures_ticker.best_ask_price * 0.9999
+                    else:
+                        exit_price = current_price * 0.9998
+                else:  # buy
+                    if instrument_name == self.perp_name and self.ticker and self.ticker.best_bid_price > 0:
+                        exit_price = self.ticker.best_bid_price * 1.0001  # Slightly aggressive
+                    elif instrument_name == self.futures_instrument_name and self.futures_ticker and self.futures_ticker.best_bid_price > 0:
+                        exit_price = self.futures_ticker.best_bid_price * 1.0001
+                    else:
+                        exit_price = current_price * 1.0002
+            else:
+                # Use market price for guaranteed fill
+                exit_price = current_price
+
+            if exit_price <= 0:
+                self.logger.error(f"Could not determine exit price for {instrument_name}")
+                return
+
+            # Align price to tick size
+            tick_size = self.tick_size if instrument_name == self.perp_name else self.futures_tick_size
+            if tick_size > 0:
+                if side_to_flatten == "buy":
+                    exit_price = math.ceil(exit_price / tick_size) * tick_size
+                else:
+                    exit_price = math.floor(exit_price / tick_size) * tick_size
+
+            client_id = f"{self.rescue_config['exit_label']}_{instrument_name}_{int(current_time * 1000)}"
+
+            self.logger.warning(f"Executing rescue exit for {instrument_name}: {side_to_flatten.upper()} {abs(position):.4f} @ {exit_price:.2f}")
+
+            # Place exit order
+            exit_order_id = await self.order_manager.place_order(
+                instrument=instrument_name,
+                direction=side_to_flatten,
+                price=exit_price,
+                amount=abs(position),
+                label=self.rescue_config["exit_label"],
+                post_only=not self.rescue_config.get("aggressive_exit", True),  # Market order if aggressive
+                client_id=client_id
+            )
+
+            if exit_order_id:
+                self.logger.info(f"Rescue exit order placed: {client_id}")
+                await self._reset_rescue_state(instrument_name)
+                
+                # Set cooldown period
+                cooldown_seconds = self.rescue_config.get("cooldown_after_exit_seconds", 30.0)
+                self.rescue_exit_cooldown[instrument_name] = current_time + cooldown_seconds
+                self.logger.info(f"Rescue exit cooldown set for {instrument_name}: {cooldown_seconds}s")
+            else:
+                self.logger.error(f"Failed to place rescue exit order for {instrument_name}")
+
+        except Exception as e:
+            self.logger.error(f"Error executing rescue exit for {instrument_name}: {str(e)}")
+
+    async def _reset_rescue_state(self, instrument_name: str):
+        """Reset rescue trading state for an instrument"""
+        self.rescue_mode_active[instrument_name] = False
+        self.current_rescue_step[instrument_name] = 0
+        self.active_rescue_orders[instrument_name].clear()
+        self.logger.info(f"Reset rescue state for {instrument_name}")
+
+    def _cleanup_shared_memory_on_error(self):
+        """Safely cleanup shared memory when an error occurs during initialization"""
+        if self.shm_obj is not None:
+            try:
+                self.shm_obj.close()
+                self.logger.info("Closed shared memory object after error")
+                
+                # Only attempt to unlink if we created it
+                if self._shm_creator:
+                    try:
+                        self.shm_obj.unlink()
+                        self.logger.info("Unlinked shared memory segment after error")
+                    except FileNotFoundError:
+                        # Already unlinked by another process
+                        pass
+                    except Exception as e_unlink:
+                        self.logger.warning(f"Could not unlink shared memory after error: {e_unlink}")
+                        
+            except Exception as e_close:
+                self.logger.error(f"Error closing shared memory object during cleanup: {e_close}")
+            finally:
+                self.shm_obj = None
         
     async def _handle_risk_breach(self, reason: str, price_at_breach: Optional[float]):
         """Handles actions to take when a risk limit is breached."""
@@ -727,8 +1042,8 @@ class AvellanedaQuoter:
                 # Retrieve credentials from configuration
                 network = MARKET_CONFIG["network"]
 
-                key_id_raw = key_ids[network]
-                private_key_raw = private_keys[network]
+                key_id_raw = get_key_ids()[network]
+                private_key_raw = get_private_keys()[network]
 
                 # self.logger.info(f"PHASE 0.5 DEBUG: Raw key_id from models.keys: '{key_id_raw}' (type: {type(key_id_raw)})")
                 # if private_key_raw and isinstance(private_key_raw, str):
@@ -1021,35 +1336,45 @@ class AvellanedaQuoter:
             except Exception as e:
                 self.logger.error(f"Error stopping volume candle buffer: {str(e)}")
 
-            # Close shared memory resources
+            # Close shared memory resources with improved safety
             try:
                 self.logger.info("Cleaning up shared memory resources...")
+                
+                # Clean up ctypes structure reference
                 if hasattr(self, 'shared_market_data_struct') and self.shared_market_data_struct is not None:
                     self.logger.info("Deleting reference to SharedMarketData ctypes structure.")
-                    del self.shared_market_data_struct # Explicitly delete the ctypes structure
-                    self.shared_market_data_struct = None
+                    try:
+                        del self.shared_market_data_struct
+                        self.shared_market_data_struct = None
+                    except Exception as e_struct:
+                        self.logger.warning(f"Error deleting ctypes structure: {e_struct}")
+                        self.shared_market_data_struct = None
 
-                if hasattr(self, 'shm_obj') and self.shm_obj:
+                # Clean up shared memory object with creator awareness
+                if hasattr(self, 'shm_obj') and self.shm_obj is not None:
                     try:
                         self.shm_obj.close()
                         self.logger.info("Shared memory object closed.")
                     except Exception as e_close:
                         self.logger.error(f"Error closing shared memory object: {e_close}")
                     
-                    # Attempt to unlink. This might be the responsibility of the process that created it.
-                    # If multiple processes use it, only one should typically unlink.
-                    # For robustness, we can try and catch FileNotFoundError if already unlinked.
-                    try:
-                        # Check if this process was the creator (if we stored that info) or just always try to unlink
-                        # For now, let's assume this instance might be responsible or it's okay to try.
-                        self.shm_obj.unlink()
-                        self.logger.info("Shared memory segment 'thalex_market_data' unlinked.")
-                    except FileNotFoundError:
-                        self.logger.info("Shared memory segment 'thalex_market_data' was already unlinked or not created by this instance.")
-                    except Exception as e_unlink:
-                        self.logger.error(f"Error unlinking shared memory segment 'thalex_market_data': {e_unlink}")
+                    # Only attempt to unlink if this instance created the shared memory
+                    if getattr(self, '_shm_creator', False):
+                        try:
+                            self.shm_obj.unlink()
+                            self.logger.info("Shared memory segment 'thalex_market_data' unlinked (creator).")
+                        except FileNotFoundError:
+                            self.logger.info("Shared memory segment was already unlinked.")
+                        except Exception as e_unlink:
+                            self.logger.warning(f"Error unlinking shared memory segment: {e_unlink}")
+                    else:
+                        self.logger.info("Not the creator - skipping unlink of shared memory segment.")
+                    
+                    # Clear the reference
+                    self.shm_obj = None
                 else:
-                    self.logger.info("No shared memory object (self.shm_obj) to clean up or it was already None.")
+                    self.logger.info("No shared memory object to clean up.")
+                    
             except Exception as e_outer_shm:
                 self.logger.error(f"Outer error during shared memory cleanup: {e_outer_shm}")
             
@@ -1359,7 +1684,7 @@ class AvellanedaQuoter:
                         
                         # Re-authenticate
                         network = MARKET_CONFIG["network"]
-                        await self.thalex.login(key_ids[network], private_keys[network], id=CALL_ID_LOGIN)
+                        await self.thalex.login(get_key_ids()[network], get_private_keys()[network], id=CALL_ID_LOGIN)
                         await self._subscribe_to_websocket_topics()
                         
                         backoff_time = 0.1
@@ -1923,11 +2248,24 @@ class AvellanedaQuoter:
                 is_buy_flag = order.direction.lower() == "buy"
                 significant_fill_threshold = TRADING_CONFIG["avellaneda"].get("significant_fill_threshold", 0.1)
                 
-                # Check if this is a trigger order fill
+                # Check if this is a trigger order or rescue order fill
                 order_label = order_data.get("label", "")
                 client_id = order_data.get("client_id", "")
                 is_trigger_order = (order_label == "TakeProfitTrigger" or 
                                   (client_id and client_id.startswith("trigger_")))
+                
+                # Check if this is a rescue order
+                is_rescue_order = False
+                rescue_instrument = None
+                if hasattr(self, 'rescue_config') and self.rescue_config.get("enabled", False):
+                    rescue_labels = [
+                        self.rescue_config.get("order_label", "RescueTrade"),
+                        self.rescue_config.get("exit_label", "RescueExit")
+                    ]
+                    is_rescue_order = order_label in rescue_labels
+                    if is_rescue_order:
+                        # Extract instrument from client_id or order data
+                        rescue_instrument = getattr(order, 'instrument_id', None) or order_data.get("instrument_name", self.perp_name)
                 
                 if is_trigger_order:
                     # Handle trigger order fill
@@ -1943,6 +2281,24 @@ class AvellanedaQuoter:
                     # Notify market maker about trigger order fill
                     if hasattr(self.market_maker, 'on_trigger_order_filled'):
                         self.market_maker.on_trigger_order_filled(str(order.id), order.price, order.amount)
+                elif is_rescue_order:
+                    # Handle rescue order fill
+                    self.logger.warning(
+                        f"🔄 RESCUE ORDER FILLED: {order.direction.upper()} {order.amount:.4f} @ {order.price:.2f} "
+                        f"({rescue_instrument}, order_id: {order.id}, client_id: {client_id})"
+                    )
+                    
+                    # Remove from active rescue orders tracking
+                    if (hasattr(self, 'active_rescue_orders') and rescue_instrument and 
+                        rescue_instrument in self.active_rescue_orders and 
+                        client_id in self.active_rescue_orders[rescue_instrument]):
+                        del self.active_rescue_orders[rescue_instrument][client_id]
+                        self.logger.info(f"Removed filled rescue order {client_id} from tracking")
+                    
+                    # For rescue exit orders, reset rescue state
+                    if order_label == self.rescue_config.get("exit_label", "RescueExit"):
+                        self.logger.warning(f"🎉 RESCUE EXIT COMPLETED for {rescue_instrument}")
+                        await self._reset_rescue_state(rescue_instrument)
                 else:
                     # Handle normal grid order fill
                     self.logger.info(
@@ -2996,6 +3352,22 @@ class AvellanedaQuoter:
                 
                 last_quote_time = current_time
                 
+                # === RESCUE TRADING INTEGRATION ===
+                # Check and manage rescue trades for all instruments after quote updates
+                if (hasattr(self, 'rescue_config') and self.rescue_config.get("enabled", False) and 
+                    hasattr(self, 'portfolio_tracker') and self.portfolio_tracker):
+                    try:
+                        # Run rescue trading for perpetual instrument
+                        if self.perp_name:
+                            await self._manage_rescue_trades(self.perp_name)
+                        
+                        # Run rescue trading for futures instrument if available
+                        if self.futures_instrument_name:
+                            await self._manage_rescue_trades(self.futures_instrument_name)
+                            
+                    except Exception as e:
+                        self.logger.error(f"Error in rescue trading management: {str(e)}")
+                
                 # Add a delay after successfully updating quotes to prevent excessive updates
                 await asyncio.sleep(0.5)
                     
@@ -3186,14 +3558,28 @@ class AvellanedaQuoter:
         return valid_bids, valid_asks
 
     async def cancel_quotes(self, reason: str):
-        """Cancel all existing quotes"""
+        """Cancel all existing quotes while preserving rescue orders"""
         try:
-            self.logger.info(f"Cancelling all orders: {reason}")
+            self.logger.info(f"Cancelling AS orders (preserving rescue trades): {reason}")
             
-            # Use the order manager to cancel all orders
+            # Use the order manager to cancel all orders except rescue trades
             if hasattr(self, 'order_manager') and self.order_manager:
-                await self.order_manager.cancel_all_orders()
-                self.logger.info("All orders cancelled successfully")
+                # Get rescue order labels to preserve
+                rescue_labels = []
+                if hasattr(self, 'rescue_config') and self.rescue_config.get("enabled", False):
+                    rescue_labels.extend([
+                        self.rescue_config.get("order_label", "RescueTrade"),
+                        self.rescue_config.get("exit_label", "RescueExit")
+                    ])
+                
+                if rescue_labels:
+                    # Cancel all orders except rescue orders
+                    await self.order_manager.cancel_all_but_labels(rescue_labels)
+                    self.logger.info(f"AS orders cancelled, preserved rescue orders with labels: {rescue_labels}")
+                else:
+                    # No rescue trading enabled, cancel all orders
+                    await self.order_manager.cancel_all_orders()
+                    self.logger.info("All orders cancelled successfully")
             else:
                 self.logger.warning("Order manager not available, cannot cancel orders")
                 

@@ -2,51 +2,59 @@
 
 ## Overview
 
-The Thalex SimpleQuoter is a sophisticated, high-performance market making system implementing the **Avellaneda-Stoikov optimal market making model** for cryptocurrency perpetual futures and options trading on the Thalex exchange. The system is designed for production-grade algorithmic trading with microsecond-level optimizations, comprehensive risk management, advanced mathematical modeling, and real-time performance monitoring.
+The Thalex SimpleQuoter is a production-ready, high-performance cryptocurrency market making system implementing the **Avellaneda-Stoikov optimal market making model** for Bitcoin perpetuals and futures trading on the Thalex exchange. The system features async/await architecture, comprehensive risk management, volume-based predictive signals, and performance optimizations designed for algorithmic trading.
 
 ## Core Philosophy
 
-- **Mathematical Rigor**: Based on the Avellaneda-Stoikov optimal market making framework with advanced extensions
-- **High Performance**: Async/await architecture with lock-free data structures, memory pools, and shared memory IPC
-- **Risk Management**: Multi-layered risk controls with real-time position monitoring, recovery modes, and emergency procedures
-- **Modularity**: Clean separation of concerns with pluggable components and optimized object pools
-- **Observability**: Comprehensive logging, performance monitoring, real-time metrics, and advanced profiling
+- **Mathematical Foundation**: Complete Avellaneda-Stoikov implementation with VAMP (Volume Adjusted Market Pressure) extensions
+- **Performance Optimization**: Object pooling, shared memory structures, lock-free queues, and sampling-based logging
+- **Risk Management**: Multi-layered position limits, recovery systems, and emergency procedures with take profit triggers
+- **Modular Design**: Clean component separation with event-driven communication and pluggable architecture
+- **Production Monitoring**: Structured logging, performance metrics, and comprehensive observability
 
 ---
 
-## Project Structure
+## Current Project Structure
 
 ```
 Thalex_SimpleQuoter/
-├── start_quoter.py                    # Main entry point
+├── start_quoter.py                    # Main entry point (278 lines)
 ├── thalex_py/
 │   └── Thalex_modular/
-│       ├── avellaneda_quoter.py       # Core quoter orchestrator (3469 lines)
-│       ├── components/                # Core trading components
-│       │   ├── avellaneda_market_maker.py  # A-S model implementation
-│       │   ├── order_manager.py       # Order lifecycle management
-│       │   ├── risk_manager.py        # Risk monitoring & controls
-│       │   └── hedge/                 # Hedging subsystem
-│       ├── models/                    # Data models & state
-│       │   ├── data_models.py         # Core data structures with call IDs
-│       │   ├── position_tracker.py    # Position state management
-│       │   └── keys.py               # API credentials management
-│       ├── config/                    # Configuration management
-│       │   ├── market_config.py       # Trading parameters & risk limits
-│       │   └── hedge/                # Hedging configurations
-│       ├── ringbuffer/               # High-performance data structures
-│       │   ├── market_data_buffer.py  # Market data circular buffer
-│       │   └── volume_candle_buffer.py # Volume-based candle formation
-│       ├── thalex_logging/           # Advanced logging infrastructure
-│       ├── profiling/                # Performance monitoring & tracing
-│       │   └── performance_tracer.py  # Real-time performance analysis
-│       ├── performance_monitor.py     # System performance tracking
-│       └── logging/                  # Log management
-├── metrics/                          # Performance analytics
-├── docs/                            # Documentation
-├── dashboard/                       # Real-time monitoring UI
-├── analysis/                        # Post-trade analysis tools
-└── logs/                           # Runtime logs
+│       ├── avellaneda_quoter.py       # Core orchestrator (3,901 lines)
+│       ├── components/                # Trading components
+│       │   ├── avellaneda_market_maker.py  # A-S model with VAMP
+│       │   ├── order_manager.py       # Individual order management
+│       │   ├── risk_manager.py        # Position limits & recovery
+│       │   ├── event_bus.py          # Inter-component communication
+│       │   └── health_monitor.py     # System health monitoring
+│       ├── models/                   # Data models & state
+│       │   ├── data_models.py        # Core data structures
+│       │   ├── position_tracker.py   # Dual position/portfolio tracking
+│       │   └── keys.py              # API credentials management
+│       ├── config/                   # Configuration system
+│       │   └── market_config.py      # Single source of truth (274 lines)
+│       ├── ringbuffer/              # High-performance data structures
+│       │   ├── market_data_buffer.py # Market data buffering
+│       │   ├── volume_candle_buffer.py # Volume-based candles
+│       │   └── fast_ringbuffer.py   # Lock-free ring buffer
+│       ├── thalex_logging/          # Structured logging
+│       │   ├── logger_factory.py    # Component-specific loggers
+│       │   └── async_logger.py      # Non-blocking logging
+│       ├── profiling/               # Performance monitoring
+│       │   └── performance_tracer.py # Method-level profiling
+│       ├── orderbook/              # Order book management
+│       └── exchange_clients/       # Exchange client adapters
+├── analysis/data/performance_monitor.py # Performance analytics
+├── dashboard/monitor.py             # Real-time monitoring UI
+├── metrics/                        # CSV performance data
+└── logs/                          # Organized runtime logs
+    ├── market/                    # Market maker decisions
+    ├── orders/                    # Order execution
+    ├── risk/                      # Risk events
+    ├── performance/               # Performance data
+    ├── exchange/                  # Exchange communications
+    └── positions/                 # Position tracking
 ```
 
 ---
@@ -54,363 +62,248 @@ Thalex_SimpleQuoter/
 ## Core Components
 
 ### 1. **AvellanedaQuoter** (`avellaneda_quoter.py`)
-**Role**: Main orchestrator and high-frequency event loop coordinator
-**Memory Optimization**: Uses `__slots__` for minimal memory footprint and maximum performance
+**Role**: Central orchestrator managing all trading system components (3,901 lines)
+**Architecture**: High-performance async/await with HFT optimizations and `__slots__` memory management
 
-**Advanced State Management**: 
-- **Market Data Aggregation**: Real-time ticker processing with zero-copy optimizations
-- **WebSocket Management**: Connection resilience with heartbeat monitoring and automatic reconnection
-- **Task Coordination**: Manages 6+ concurrent async tasks with proper lifecycle management
-- **Performance Monitoring**: Real-time profiling with `PerformanceTracer` integration
-- **Shared Memory IPC**: Memory-mapped structures for inter-process communication
+**Core Responsibilities**:
+- **WebSocket Management**: Thalex connection with 60s startup timeout, auto-reconnection, and graceful shutdown
+- **Task Orchestration**: 7 concurrent async tasks (quote generation, risk monitoring, heartbeat, logging, profiling)
+- **Market Data Processing**: Real-time ticker updates with 100ms caching and shared memory structures
+- **Performance Optimization**: Object pools, message buffers (32KB-1MB), and 5% debug log sampling
+- **Signal Handling**: Proper SIGINT/SIGTERM with 10s shutdown timeout and complete resource cleanup
 
-**Key Responsibilities**:
-- **Connection Management**: WebSocket connections with circuit breaker logic and rate limiting
-- **Task Orchestration**: Quote generation, risk monitoring, heartbeat, status logging, and profile optimization
-- **Market Data Processing**: Optimized ticker handling with 100ms caching for HFT performance
-- **Risk Coordination**: Integration with risk recovery modes and emergency procedures
-- **Performance Optimization**: Dynamic buffer sizing and memory pool management
+**Performance Features**:
+- **Object Pools**: Pre-allocated Order, Quote, and Ticker objects with configurable pool sizes
+- **Shared Memory**: `SharedMarketData` ctypes structure for inter-process communication
+- **ThreadSafeQueue**: Lock-free operations for high-frequency market data processing
+- **Message Buffers**: Expandable byte arrays (32KB-1MB) with memory views for zero-copy processing
+- **Log Sampling**: 5% sampling rate for debug operations, 30s intervals for major events
 
-**High-Performance Features**:
-- **Object Pools**: Pre-allocated Order, Quote, and Ticker objects to minimize GC pressure
-- **Lock-Free Queues**: `LockFreeQueue` implementation for high-frequency operations
-- **Message Buffer Optimization**: Expandable byte arrays with memory views for zero-copy processing
-- **Shared Memory**: `SharedMarketData` ctypes structure for IPC with external processes
+**Current Configuration**:
+- **Network**: TEST (configurable via market_config.py)
+- **Instrument**: BTC-PERPETUAL primary, BTC-25JUL25 futures
+- **Quote Levels**: 3 levels with 150-tick spacing
+- **Heartbeat**: 60-second intervals with WebSocket health monitoring
 
 ### 2. **AvellanedaMarketMaker** (`components/avellaneda_market_maker.py`)
-**Role**: Core mathematical engine implementing enhanced Avellaneda-Stoikov model
-**Integration**: Deep integration with PositionTracker for real-time position awareness
+**Role**: Complete Avellaneda-Stoikov implementation with VAMP extensions and take profit triggers
+**Integration**: Deep integration with PositionTracker and VolumeCandle system for enhanced decision making
 
-**Advanced Mathematical Framework**:
+**Current Implementation**:
+- **Gamma (Risk Aversion)**: 0.1 (configurable via market_config.py)
+- **Kappa (Inventory Risk)**: 1.5 (market depth parameter)
+- **Base Spread**: 14 ticks, Maximum: 75 ticks
+- **Quote Levels**: 3 levels with 150-tick spacing
+- **Size Multipliers**: [1.0, 1.5, 2.0, 2.5, 3.0] for progressive sizing
+
+**Mathematical Framework**:
 
 #### **Enhanced Optimal Spread Calculation**:
 ```python
-# Base A-S formula with dynamic adjustments
-δ_ask = δ_bid = γσ²(T-t) + (2/γ)ln(1 + γ/κ) + market_impact + volume_adjustment
+# Avellaneda-Stoikov with market impact and volume adjustments
+spread = base_spread * spread_multiplier * (1 + market_impact_factor + volume_adjustment)
+delta_bid = delta_ask = spread / 2
 ```
 
-#### **Dynamic Reservation Price with VAMP**:
+#### **VAMP (Volume Adjusted Market Pressure)**:
 ```python
-r = S - q·γ·σ²·(T-t) + vamp_adjustment + inventory_cost
+# Real implementation tracking aggressive volume
+aggressive_buy_volume = sum(buy_trades_above_mid)
+aggressive_sell_volume = sum(sell_trades_below_mid)
+vamp = (aggressive_buy_volume - aggressive_sell_volume) / total_volume
+reservation_price_adjustment = vamp * inventory_factor
 ```
 
-#### **Volume-Based Predictive Adjustments**:
-- **Volume Candle Integration**: Real-time volume candle completion signals
-- **VAMP (Volume Adjusted Market Pressure)**: Market microstructure analysis
-- **Predictive Parameters**: Short-term price movement predictions
-- **Dynamic Gamma**: Risk aversion adaptation based on market volatility
+#### **Take Profit Trigger System**:
+- **Basic Triggers**: 7 bps spread profit threshold
+- **Arbitrage Triggers**: $10 USD profit threshold for cross-instrument
+- **Single Instrument**: $5 USD profit threshold
+- **Check Interval**: 2-second monitoring for trigger conditions
 
-### 3. **Enhanced Risk Management System**
-**Multi-Component Risk Architecture**:
+#### **Volume Candle Integration**:
+- **Threshold**: 1.0 BTC volume per candle
+- **Predictive Signals**: Momentum, reversal, volatility, exhaustion (0-1 scale)
+- **Parameter Adjustment**: Dynamic gamma/kappa based on volume signals
+- **Max Age**: 300 seconds for prediction validity
 
-#### **RiskManager** (`components/risk_manager.py`)
-- **Real-time Risk Monitoring**: Continuous position and P&L tracking
-- **Multi-Instrument Support**: Separate risk tracking for perpetuals and futures
-- **Stop Loss/Take Profit**: Automated position closure triggers
-- **Risk Breach Callbacks**: Event-driven risk violation handling
+### 3. **Risk Management System** (`components/risk_manager.py`)
+**Production Risk Controls**: Real-time position monitoring with automated recovery system
 
-#### **Advanced Risk Features in AvellanedaQuoter**:
-- **Risk Recovery Mode**: Gradual trading resumption after risk breaches
-- **Take Profit System**: UPNL-based profit realization with configurable thresholds
-- **Emergency Position Closure**: Automatic flattening of both perpetual and futures positions
-- **Inventory Management**: One-sided quoting based on position limits
+**Current Risk Limits** (from market_config.py):
+- **Max Position**: 20 BTC per instrument
+- **Max Notional**: 100,000,000 USD total exposure
+- **Stop Loss**: 6% from entry price
+- **Max Drawdown**: 10% portfolio level
+- **Take Profit**: Enabled with UPNL-based triggers
 
-#### **Risk Monitoring Task** (`_risk_monitoring_task`):
-- **Adaptive Monitoring**: Variable intervals based on position size
-- **Multi-Instrument Checks**: Separate monitoring for perpetuals and futures
-- **Recovery Logic**: Automatic assessment of risk condition improvements
-- **Circuit Breaker Integration**: Coordination with connection management
-
-### 4. **OrderManager** (`components/order_manager.py`)
-**Role**: Individual order management with advanced execution logic
-**Evolution**: Moved from mass quotes to individual limit orders for better control
-
-**Key Features**:
-- **Individual Order Placement**: Each quote becomes a separate limit order
-- **Inventory-Aware Trading**: Position-based quote restriction
-- **Order Validation**: Pre-trade risk checks and tick size alignment
-- **Advanced Cancellation**: Emergency cancellation with retry logic
-
-### 5. **PositionTracker** (`models/position_tracker.py`)
-**Role**: Centralized position and P&L state management with Fill integration
-**Enhanced Integration**: Deep integration with risk management and market maker
+**Risk Recovery System**:
+- **Breach Detection**: Real-time monitoring with immediate trading halt
+- **Cooldown Period**: 9 seconds after risk breach before recovery assessment
+- **Recovery Threshold**: 80% of risk limits for gradual re-entry
+- **Recovery Steps**: 1-step process for quick resumption
+- **Check Interval**: 30-second assessment of recovery conditions
 
 **Advanced Features**:
-- **Fill Processing**: Complete fill lifecycle management with Fill objects
-- **Multi-Instrument Tracking**: Separate position tracking for different instruments
-- **Unrealized P&L Updates**: Real-time mark-to-market calculations
-- **Position Metrics**: Comprehensive position analytics and reporting
+- **Multi-Instrument Tracking**: Separate limits for perpetuals and futures
+- **Event-Driven Callbacks**: Risk breach notifications to AvellanedaQuoter
+- **Position-Based Quoting**: Inventory management with one-sided quotes
+- **Emergency Procedures**: Automatic position flattening on severe breaches
 
-### 6. **Volume Candle Buffer** (`ringbuffer/volume_candle_buffer.py`)
-**Role**: Advanced predictive market analysis through volume-based candle formation
-**Integration**: Provides signals to market maker for enhanced quote generation
+### 4. **OrderManager** (`components/order_manager.py`)
+**Role**: Individual limit order management with collision detection and semaphore control
+**Architecture**: Post-only orders with tick-aligned pricing and comprehensive validation
 
-**Predictive Features**:
-- **Volume-Based Candles**: Formation based on volume thresholds rather than time
-- **Market Signals**: Momentum, reversal, volatility, and exhaustion indicators
-- **Real-time Updates**: Integration with trade flow for immediate signal generation
-- **Prediction Parameters**: Enhanced market conditions for quote optimization
+**Current Implementation**:
+- **Order Type**: Individual limit orders (not mass quotes)
+- **Post-Only**: All orders use post-only execution to ensure maker rebates
+- **Tick Alignment**: Automatic price alignment to exchange tick size (1 USD for BTC)
+- **Size Validation**: 0.1 BTC minimum, 0.001 BTC increments
+- **Collision Detection**: UUID-based order ID collision prevention
 
-### 7. **Performance Monitoring System**
-**Multi-Layer Performance Architecture**:
+**Operation Control**:
+- **Semaphore Limits**: Maximum 6 pending operations (configurable)
+- **Operation Interval**: 0.5-second minimum between order operations
+- **Retry Logic**: 2 maximum retry attempts for failed operations
+- **Emergency Cancellation**: Immediate order cancellation for risk events
 
-#### **PerformanceTracer** (`profiling/performance_tracer.py`)
-- **Real-time Profiling**: Method-level performance measurement
-- **Critical Path Analysis**: Identification of performance bottlenecks
-- **Dynamic Optimization**: Runtime optimization based on performance data
+### 5. **Position Tracking System** (`models/position_tracker.py`)
+**Dual Architecture**: PositionTracker for single instruments + PortfolioTracker for multi-instrument
 
-#### **PerformanceMonitor** (`performance_monitor.py`)
-- **System Metrics**: CPU, memory, and throughput monitoring
-- **Trading Metrics**: P&L, fill rates, and execution quality
-- **Real-time Recording**: Continuous performance data collection
+**PositionTracker Features**:
+- **Weighted Average Entry**: Automatic calculation on each fill
+- **Thread-Safe Updates**: Concurrent-safe position modifications
+- **Realized/Unrealized PnL**: Real-time mark-to-market calculations
+- **Exit Price Tracking**: Complete trade lifecycle management
 
----
+**PortfolioTracker Features**:
+- **Multi-Instrument**: Separate tracking for BTC-PERPETUAL and futures
+- **Cross-Asset Risk**: Combined notional exposure calculations
+- **Portfolio Metrics**: Aggregate P&L, correlation tracking
+- **Fill Integration**: Processing of Fill objects from exchange
 
-## Advanced Data Flow Architecture
+### 6. **Volume Candle System** (`ringbuffer/volume_candle_buffer.py`)
+**Role**: Real-time volume-based candle formation with predictive signal generation
 
-### **High-Performance Market Data Pipeline**:
-```
-Thalex WebSocket → Optimized Message Processing → MarketDataBuffer → AvellanedaMarketMaker
-       ↓                    ↓                         ↓                    ↓
-Object Pools → Zero-Copy Processing → Shared Memory IPC → Volume Candle Analysis
-       ↓                    ↓                         ↓                    ↓
-Performance Tracing → Risk Monitoring → Position Updates → Quote Generation
-```
+**Current Configuration**:
+- **Volume Threshold**: 1.0 BTC per candle completion
+- **Maximum Candles**: 100 stored candles in ring buffer
+- **Time Limit**: 300 seconds maximum before forced candle completion
+- **Prediction Minimum**: 5+ candles required before generating signals
 
-### **Enhanced Quote Generation Flow**:
-```
-Market Data → Volatility + VAMP → A-S Model + Volume Signals → Quote Generation → Risk Validation → Order Placement
-     ↓              ↓                    ↓                         ↓                ↓                 ↓
-Ticker Processing → Market Conditions → Predictive Adjustments → Inventory Check → Pre-trade Risk → Individual Orders
-```
+**Predictive Signal Generation**:
+- **Momentum Signal**: Direction and strength (-1 to +1 scale)
+- **Reversal Probability**: Market reversal likelihood (0 to 1 scale)
+- **Volatility Prediction**: Expected volatility increase (0 to 1 scale)
+- **Exhaustion Detection**: Market exhaustion signals (0 to 1 scale)
 
-### **Multi-Layer Risk Monitoring**:
-```
-Position Updates → Real-time Calculation → Multi-Instrument Checks → Risk Assessment → Breach Handling
-       ↓                    ↓                      ↓                    ↓              ↓
-Fill Processing → P&L Tracking → Perpetual + Futures → Recovery Logic → Emergency Actions
-       ↓                    ↓                      ↓                    ↓              ↓
-UPNL Monitoring → Take Profit Check → Stop Loss Triggers → Position Closure → Trading Halt
-```
+### 7. **Rescue Trading System** (Integrated in Market Maker)
+**Role**: Automated averaging-down strategy for adverse position management
 
----
+**Current Configuration**:
+- **Trigger Threshold**: 0.3% price drop from average entry price
+- **Profit Target**: 7 bps (0.07%) profit on averaged position
+- **Maximum Steps**: 3 averaging-down steps before halt
+- **Size Multiplier**: 1.0x base size for each rescue order
+- **Minimum Interval**: 5 seconds between rescue orders
 
-## Advanced State Management
-
-### **Memory-Optimized State**:
-- **Object Pools**: Separate pools for Order, Quote, and Ticker objects with configurable sizes
-- **Shared Memory**: `SharedMarketData` ctypes structure for IPC with external analytics processes
-- **Circular Buffers**: Fixed-size NumPy arrays for price history and market data
-- **Lock-Free Structures**: High-frequency data structures with atomic operations
-
-### **Performance-Critical State**:
-- **Cached Market Conditions**: 100ms caching for HFT performance optimization
-- **Price History Optimization**: NumPy arrays with rolling window calculations
-- **Order Tracking**: Fast lookup structures with separate bid/ask counters
-- **Message Buffers**: Expandable byte arrays with memory views for zero-copy processing
-
-### **Risk State Management**:
-- **Recovery Mode Tracking**: Multi-step recovery process with cooldown periods
-- **Take Profit State**: UPNL-based profit realization with configurable thresholds
-- **Emergency States**: Circuit breaker logic with automatic position closure
-- **Multi-Instrument Risk**: Separate risk tracking for perpetuals and futures
+**Execution Strategy**:
+- **Entry Orders**: Limit orders with "RescueTrade" label
+- **Exit Orders**: Market orders with "RescueExit" label for guaranteed fills
+- **Position Limits**: Maximum 2.0x base position limit for rescue positions
+- **Cooldown**: 30 seconds after rescue exit before system re-entry
 
 ---
 
-## Enhanced Mathematical Models
+## Current Configuration Architecture
 
-### **Advanced Avellaneda-Stoikov Implementation**:
-
-#### **1. Volume Candle Enhanced VAMP**:
+### **Single Source of Truth** (`market_config.py`):
 ```python
-VAMP = (Σ(aggressive_buy_volume × price) - Σ(aggressive_sell_volume × price)) / total_volume
-volume_momentum = candle_signals.get('momentum', 0.0)
-enhanced_vamp = VAMP + volume_momentum * momentum_weight
+BOT_CONFIG = {
+    "market": {
+        "underlying": "BTC-PERPETUAL",
+        "futures_instrument": "BTC-25JUL25", 
+        "network": Network.TEST,  # TEST/LIVE configurable
+    },
+    "trading_strategy": {
+        "avellaneda": {
+            "gamma": 0.1,                    # Risk aversion parameter
+            "kappa": 1.5,                    # Inventory risk factor
+            "base_spread": 14.0,             # Base spread in ticks
+            "max_spread": 75.0,              # Maximum spread limit
+            "max_levels": 3,                 # Quote levels
+            "level_spacing": 150,            # Tick spacing between levels
+        }
+    },
+    "risk": {
+        "max_position": 20,                  # BTC per instrument
+        "max_notional": 100000000,           # USD total exposure
+        "stop_loss_pct": 0.06,               # 6% stop loss
+        "recovery_cooldown_seconds": 9,      # Risk recovery cooldown
+        "risk_recovery_threshold": 0.8,      # 80% for recovery
+    }
+}
 ```
 
-#### **2. Dynamic Risk Aversion with Market Conditions**:
-```python
-γ_dynamic = γ_base × (1 + volatility_multiplier × σ_current/σ_baseline) × market_stress_factor
+### **Command-Line Configuration Overrides**:
+- `--gamma X`: Override risk aversion parameter
+- `--kappa X`: Override inventory risk factor  
+- `--levels X`: Override number of quote levels
+- `--spacing X`: Override grid spacing in ticks
+- `--vol-threshold X`: Override volume candle threshold
+
+---
+
+## Data Flow Architecture
+
+### **Market Data Processing Pipeline**:
+```
+Thalex WebSocket → AvellanedaQuoter.handle_ticker_update() → SharedMarketData (ctypes)
+       ↓                           ↓                              ↓
+Object Pool Allocation → Message Buffer Processing → VolumeCandle.update_vamp()
+       ↓                           ↓                              ↓
+PerformanceTracer → Event Bus Notification → MarketMaker.update_quotes()
 ```
 
-#### **3. Predictive Inventory Cost with Time Decay**:
-```python
-inventory_cost = inventory_cost_factor × |position| × time_held × volatility_adjustment
-reservation_price_adjustment = inventory_cost × position_sign
+### **Quote Generation Flow**:
+```
+Market Data → VAMP Calculation → A-S Model + Volume Signals → Quote Generation → Order Placement
+     ↓              ↓                    ↓                         ↓                ↓
+Price Cache → Market Conditions → Predictive Adjustments → Risk Validation → Individual Limit Orders
+     ↓              ↓                    ↓                         ↓                ↓
+100ms Cache → Gamma/Kappa Updates → Position-Based Skew → Tick Alignment → Post-Only Orders
 ```
 
-#### **4. Volume-Enhanced Volatility Calculation**:
-```python
-base_volatility = calculated_volatility_from_returns
-volume_volatility = volume_candle_signals.get('volatility', 0.0)
-enhanced_volatility = base_volatility × (1.0 + volume_volatility * 0.2)  # Up to 20% increase
+### **Risk Monitoring Flow**:
 ```
-
-### **Risk Mathematical Framework**:
-
-#### **Multi-Instrument Risk Calculation**:
-```python
-# Perpetual risk
-perp_risk = position_perp × price_perp × volatility_perp
-# Futures risk  
-futures_risk = position_futures × price_futures × volatility_futures
-# Combined risk
-total_risk = sqrt(perp_risk² + futures_risk² + 2×correlation×perp_risk×futures_risk)
-```
-
-#### **UPNL-Based Take Profit**:
-```python
-current_upnl = position_size × (mark_price - average_entry_price)
-take_profit_triggered = current_upnl >= take_profit_threshold
+Fill Processing → PositionTracker.update_on_fill() → RiskManager.check_limits() → Recovery Assessment
+       ↓                    ↓                              ↓                        ↓
+Portfolio Update → Multi-Instrument P&L → Risk Breach Detection → Trading Halt/Resume
+       ↓                    ↓                              ↓                        ↓
+Event Bus → Take Profit Monitoring → Emergency Procedures → Gradual Recovery (80% threshold)
 ```
 
 ---
 
 ## Performance Optimizations
 
-### **Memory Management Optimizations**:
-```python
-# Slots-based class definition for minimal memory footprint
-class AvellanedaQuoter:
-    __slots__ = [
-        'thalex', 'logger', 'tasks', 'position_tracker', 
-        # ... 50+ optimized attributes
-    ]
+### **Memory Management**:
+- **Object Pools**: Pre-allocated Order, Quote, and Ticker objects with configurable pool sizes
+- **Shared Memory**: `SharedMarketData` ctypes structure for inter-process communication
+- **Message Buffers**: Expandable 32KB-1MB byte arrays with memory views
+- **Ring Buffers**: Fixed-size circular buffers for market data (100 candles)
 
-# Object pooling for high-frequency objects
-order_pool = ObjectPool(factory=_create_empty_order, size=max_total_orders * 2)
-quote_pool = ObjectPool(factory=_create_empty_quote, size=max_quotes_per_update * 3)
-```
+### **High-Frequency Optimizations**:
+- **Zero-Copy Processing**: Direct buffer manipulation without string copies
+- **Log Sampling**: 5% sampling rate for debug operations, 30s for major events
+- **Price Caching**: 100ms cache for market conditions to reduce computation
+- **Lock-Free Queues**: ThreadSafeQueue for high-frequency market data processing
 
-### **High-Frequency Trading Optimizations**:
-- **Zero-Copy Message Processing**: Direct buffer manipulation without string copies
-- **Vectorized Price Alignment**: Batch processing of quote price adjustments
-- **Lock-Free Data Structures**: Atomic operations for concurrent access
-- **Memory-Mapped IPC**: Direct memory sharing between processes
-
-### **Network and I/O Optimizations**:
-- **WebSocket Connection Pooling**: Efficient connection reuse and management
-- **Message Buffer Expansion**: Dynamic buffer sizing based on message volume
-- **Heartbeat Management**: Optimized connection health monitoring
-- **Circuit Breaker Logic**: Automatic failure recovery with exponential backoff
+### **Operational Optimizations**:
+- **Semaphore Control**: Maximum 6 pending order operations
+- **Tick Alignment**: Automatic price alignment to exchange tick size (1 USD)
+- **Post-Only Orders**: All orders use post-only to ensure maker rebates
+- **Emergency Cancellation**: Immediate order cancellation for risk events
 
 ---
 
-## Configuration Architecture
-
-### **Hierarchical Configuration System**:
-```python
-# Enhanced configuration structure
-BOT_CONFIG = {
-    "trading_strategy": {
-        "avellaneda": {
-            "gamma": 0.2,                    # Risk aversion parameter
-            "kappa": 0.5,                    # Inventory risk factor
-            "time_horizon": 3600,            # Strategy time horizon
-            "inventory_weight": 0.8,         # Position skew factor
-            "significant_fill_threshold": 0.1, # Fill size threshold
-        }
-    },
-    "risk_monitoring": {
-        "interval_seconds": 2.0,             # Risk check frequency
-        "recovery_cooldown_seconds": 300,    # Recovery wait time
-        "take_profit_threshold": 100.0,      # UPNL take profit trigger
-        "gradual_recovery_steps": 3,         # Recovery step count
-    },
-    "performance": {
-        "log_sampling_rate": 0.05,           # 5% debug logging
-        "major_event_log_interval": 30.0,    # Major event logging
-        "message_buffer_initial_size": 32768, # Initial buffer size
-    }
-}
-
-RISK_LIMITS = {
-    "max_position": 2.0,                     # Maximum position size
-    "max_notional": 50000.0,                 # Maximum notional exposure
-    "stop_loss_pct": 0.06,                   # 6% stop loss
-    "take_profit_enabled": True,             # Enable take profit
-    "risk_recovery_threshold": 0.8,          # Recovery threshold
-}
-```
-
----
-
-## Advanced Logging and Monitoring
-
-### **Multi-Level Logging System**:
-```python
-# Component-specific logging with performance optimization
-logger = LoggerFactory.configure_component_logger(
-    "avellaneda_quoter",
-    log_file="quoter.log", 
-    high_frequency=False  # Optimized for production
-)
-
-# Sampling-based logging for high-frequency operations
-if random.random() < LOG_SAMPLING_RATE:
-    logger.info(f"High-frequency operation: {details}")
-```
-
-### **Real-Time Performance Metrics**:
-- **HFT Performance**: Object pool utilization, message processing latency
-- **Trading Metrics**: Fill rates, spread capture, adverse selection
-- **Risk Metrics**: Position utilization, drawdown monitoring, recovery status
-- **System Health**: Memory usage, CPU utilization, connection status
-
-### **Advanced Alerting Integration**:
-- **Risk Breach Notifications**: Immediate alerts for limit violations
-- **Performance Degradation**: Latency and throughput monitoring
-- **System Health Alerts**: Connection failures and recovery events
-- **Trading Anomaly Detection**: Unusual market conditions or behavior patterns
-
----
-
-## Production Deployment Architecture
-
-### **High-Availability Deployment**:
-- **Docker Containerization**: Isolated runtime with health checks
-- **Graceful Shutdown**: Complete resource cleanup and position closure
-- **Hot Configuration**: Runtime parameter updates without restart
-- **Process Monitoring**: Automatic restart on failures
-
-### **Scalability Features**:
-- **Multi-Instrument Support**: Parallel quoters for different assets
-- **Shared Memory IPC**: External process integration for analytics
-- **Database Integration**: Historical data storage and analysis
-- **Geographic Distribution**: Low-latency deployment optimization
-
----
-
-## Security and Risk Controls
-
-### **API Security Enhancement**:
-- **Credential Management**: Secure key storage with quote stripping logic
-- **Rate Limiting Integration**: Exchange compliance with circuit breakers
-- **Connection Security**: WebSocket security with heartbeat monitoring
-- **Audit Trail**: Complete trading activity logging
-
-### **Advanced Risk Controls**:
-- **Multi-Layer Risk Checks**: Pre-trade, real-time, and post-trade validation
-- **Emergency Procedures**: Automatic position closure and trading halt
-- **Recovery Mechanisms**: Gradual trading resumption after risk events
-- **Inventory Management**: Position-based quote restriction
-
----
-
-## Future Enhancement Roadmap
-
-### **Planned Advanced Features**:
-- **Machine Learning Integration**: Enhanced prediction models with volume candle analysis
-- **Multi-Exchange Support**: Cross-exchange arbitrage and risk management
-- **FPGA Acceleration**: Hardware-accelerated mathematical calculations
-- **Advanced Options Strategies**: Complex derivative trading with Greeks management
-
-### **Performance Improvements**:
-- **Kernel Bypass Networking**: Ultra-low latency market data processing
-- **Custom Protocol Optimization**: Optimized exchange communication
-- **Real-Time Strategy Optimization**: Live parameter adjustment based on performance
-- **Advanced Memory Management**: NUMA-aware memory allocation
-
----
-
-This architecture represents a production-grade, high-performance trading system with advanced mathematical modeling, comprehensive risk management, and extensive performance optimizations designed for professional algorithmic trading in cryptocurrency markets. 
+This architecture represents the current state of a production-ready, high-performance cryptocurrency market making system with comprehensive risk management, volume-based predictive signals, and performance optimizations designed for professional algorithmic trading.

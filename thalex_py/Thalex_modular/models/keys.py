@@ -26,19 +26,26 @@ THALEX_PROD_PRIVATE_KEY_ENV = "THALEX_PROD_PRIVATE_KEY"
 # The application logic that uses these keys should handle cases where
 # environment variables are not set (os.getenv() will return None).
 
-# API Key IDs loaded from environment variables
-key_ids = {
-    Network.TEST: os.getenv(THALEX_TEST_API_KEY_ID_ENV),
-    Network.PROD: os.getenv(THALEX_PROD_API_KEY_ID_ENV)
-}
+# API Key IDs loaded from environment variables - using lazy loading functions
+def get_key_ids():
+    """Get API key IDs from environment variables at runtime"""
+    return {
+        Network.TEST: os.getenv(THALEX_TEST_API_KEY_ID_ENV),
+        Network.PROD: os.getenv(THALEX_PROD_API_KEY_ID_ENV)
+    }
 
-# Private Keys loaded from environment variables
+# Private Keys loaded from environment variables - using lazy loading functions
 # Ensure the private key environment variable includes the full multi-line string,
 # including -----BEGIN...----- and -----END...----- markers.
-private_keys = {
-    Network.TEST: os.getenv(THALEX_TEST_PRIVATE_KEY_ENV),
-    Network.PROD: os.getenv(THALEX_PROD_PRIVATE_KEY_ENV)
-}
+def get_private_keys():
+    """Get private keys from environment variables at runtime"""
+    return {
+        Network.TEST: os.getenv(THALEX_TEST_PRIVATE_KEY_ENV),
+        Network.PROD: os.getenv(THALEX_PROD_PRIVATE_KEY_ENV)
+    }
+
+# Use get_key_ids() and get_private_keys() functions instead of these variables
+# to ensure environment variables are loaded before accessing keys
 
 # Ensure you have a .env file or have set these environment variables
 # where your application runs. For example, using python-dotenv package to load .env file.

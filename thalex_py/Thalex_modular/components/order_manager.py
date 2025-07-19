@@ -70,13 +70,31 @@ class OrderManager:
         self.logger.info(f"Perpetual name set to {perp_name}")
         
     async def get_next_order_id(self) -> int:
-        """Get next available order ID"""
+        """Get next available order ID with collision detection"""
         async with self.order_id_lock:
-            order_id = self.next_order_id
-            self.next_order_id += 1
-            if self.next_order_id > 1000000:
-                self.next_order_id = 100
-            return order_id
+            # Find next available order ID, checking for collisions
+            max_attempts = 1000  # Prevent infinite loops
+            attempts = 0
+            
+            while attempts < max_attempts:
+                order_id = self.next_order_id
+                self.next_order_id += 1
+                
+                # Wrap around if we hit the limit
+                if self.next_order_id > 1000000:
+                    self.next_order_id = 100
+                
+                # Check for collision with existing orders
+                if order_id not in self.orders:
+                    return order_id
+                    
+                attempts += 1
+                
+            # If we can't find a free ID after max attempts, use timestamp-based fallback
+            import time
+            fallback_id = int(time.time() * 1000) % 1000000 + 100
+            self.logger.warning(f"Order ID collision detection failed, using timestamp-based fallback: {fallback_id}")
+            return fallback_id
             
     def round_to_tick(self, price: float) -> float:
         """Round price to nearest tick size"""
@@ -611,4 +629,80 @@ class OrderManager:
         except Exception as e:
             self.logger.error(f"Error determining quote priority: {str(e)}")
             # On error, allow the quote to go through
-            return True 
+            return True
+
+    async def cancel_orders_by_label(self, label: str) -> None:
+        """Cancel all active orders with a specific label"""
+        import random
+        orders_to_cancel = []
+        
+        # Find orders with matching label
+        for order_id, order_data in self.orders.items():
+            if hasattr(order_data, 'label') and order_data.label == label:
+                orders_to_cancel.append((order_id, order_data))
+            elif isinstance(order_data, dict) and order_data.get("label") == label:
+                orders_to_cancel.append((order_id, order_data))
+        
+        self.logger.info(f"Attempting to cancel {len(orders_to_cancel)} orders with label '{label}'")
+        
+        for order_id, order_data in orders_to_cancel:
+            try:
+                # Extract instrument name from order data
+                if hasattr(order_data, 'instrument_id'):
+                    instrument_name = order_data.instrument_id
+                elif isinstance(order_data, dict):
+                    instrument_name = order_data.get("instrument_name", self.perp_name)
+                else:
+                    instrument_name = self.perp_name
+                
+                # Cancel the order
+                await self.thalex.cancel(
+                    order_id=order_id,
+                    instrument_name=instrument_name,
+                    id=random.randint(20000, 30000)
+                )
+                self.logger.debug(f"Cancelled order {order_id} with label '{label}'")
+                
+            except Exception as e:
+                self.logger.error(f"Error cancelling order {order_id} with label '{label}': {str(e)}")
+
+    async def cancel_all_but_labels(self, exclude_labels: List[str]) -> None:
+        """Cancel all active orders except those with specified labels"""
+        import random
+        orders_to_cancel = []
+        
+        # Find orders that don't have excluded labels
+        for order_id, order_data in self.orders.items():
+            order_label = None
+            
+            if hasattr(order_data, 'label'):
+                order_label = order_data.label
+            elif isinstance(order_data, dict):
+                order_label = order_data.get("label")
+            
+            # If order has no label or label is not in exclude list, cancel it
+            if order_label is None or order_label not in exclude_labels:
+                orders_to_cancel.append((order_id, order_data))
+        
+        self.logger.info(f"Attempting to cancel {len(orders_to_cancel)} orders, excluding labels: {exclude_labels}")
+        
+        for order_id, order_data in orders_to_cancel:
+            try:
+                # Extract instrument name from order data
+                if hasattr(order_data, 'instrument_id'):
+                    instrument_name = order_data.instrument_id
+                elif isinstance(order_data, dict):
+                    instrument_name = order_data.get("instrument_name", self.perp_name)
+                else:
+                    instrument_name = self.perp_name
+                
+                # Cancel the order
+                await self.thalex.cancel(
+                    order_id=order_id,
+                    instrument_name=instrument_name,
+                    id=random.randint(20000, 30000)
+                )
+                self.logger.debug(f"Cancelled order {order_id} (label: {order_label or 'None'})")
+                
+            except Exception as e:
+                self.logger.error(f"Error cancelling order {order_id}: {str(e)}") 

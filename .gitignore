@@ -24,15 +24,15 @@ wheels/
 # Environment variables
 .env
 .env.*
-#CLAUDE MD
-CLAUDE.md
+
+
 # Logs
 *.log
 logs/
 log/
 metrics
 # Local state
-hedge_state.json
+
 
 # IDE
 .idea/
