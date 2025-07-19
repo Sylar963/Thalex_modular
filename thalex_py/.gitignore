@@ -3,6 +3,8 @@ fnd.csv
 trades.log
 trades_options.log
 trades_rolls.log
+GEMINI.md 
+CLAUDE.md
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

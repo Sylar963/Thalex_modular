@@ -18,7 +18,7 @@ class LoggerFactory:
         'market_maker': 'market',
         'order_manager': 'orders',
         'risk_manager': 'risk',
-        'hedge': 'hedge',
+        
         'performance': 'performance',
         'exchange': 'exchange',
         'position_tracker': 'positions',

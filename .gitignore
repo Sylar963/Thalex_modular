@@ -25,14 +25,15 @@ wheels/
 .env
 .env.*
 
-
+GEMINI.md
+CLAUDE.md
 # Logs
 *.log
 logs/
 log/
 
 # Local state
-hedge_state.json
+
 
 # IDE
 .idea/
