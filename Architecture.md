@@ -33,8 +33,7 @@ Thalex_SimpleQuoter/
 │       │   ├── position_tracker.py   # Dual position/portfolio tracking
 │       │   └── keys.py              # API credentials management
 │       ├── config/                   # Configuration system
-│       │   ├── market_config.py      # Single source of truth (274 lines)
-│       │   └── hedge/hedge_config.json # Hedging parameters
+│       │   └── market_config.py      # Single source of truth (274 lines)
 │       ├── ringbuffer/              # High-performance data structures
 │       │   ├── market_data_buffer.py # Market data buffering
 │       │   ├── volume_candle_buffer.py # Volume-based candles
@@ -53,7 +52,6 @@ Thalex_SimpleQuoter/
     ├── market/                    # Market maker decisions
     ├── orders/                    # Order execution
     ├── risk/                      # Risk events
-    ├── hedge/                     # Hedging operations
     ├── performance/               # Performance data
     ├── exchange/                  # Exchange communications
     └── positions/                 # Position tracking
@@ -213,16 +211,6 @@ reservation_price_adjustment = vamp * inventory_factor
 - **Exit Orders**: Market orders with "RescueExit" label for guaranteed fills
 - **Position Limits**: Maximum 2.0x base position limit for rescue positions
 - **Cooldown**: 30 seconds after rescue exit before system re-entry
-
-### 8. **Hedging System** (`components/hedge/`)
-**Role**: Cross-asset hedging between BTC perpetuals and futures
-
-**Current Configuration** (from hedge_config.json):
-- **Hedge Pairs**: BTC-PERPETUAL ↔ BTC futures correlation tracking
-- **Correlation Factors**: 0.85 for perpetual, 1.18 for futures
-- **Rebalance Frequency**: 300 seconds (5 minutes)
-- **Deviation Threshold**: 5% before rebalancing triggers
-- **Execution**: Market orders with 30-second timeout
 
 ---
 
