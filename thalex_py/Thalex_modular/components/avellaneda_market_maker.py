@@ -2227,9 +2227,7 @@ class AvellanedaMarketMaker:
             self.logger.info(f"Cleaning up {len(self.active_trigger_orders)} active trigger orders")
             self._cancel_all_trigger_orders("System shutdown cleanup")
         
-        # Clean up hedge manager if active
-        if self.use_hedging and self.hedge_manager:
-            self.hedge_manager.stop()
+        
             
         # Clean up volume candle buffer
         if hasattr(self, 'volume_buffer') and self.volume_buffer:
@@ -2238,29 +2236,7 @@ class AvellanedaMarketMaker:
                 
         self.logger.info("Cleanup complete")
 
-    def report_hedge_status(self):
-        """Report on monetary position and hedge status"""
-        if not self.use_hedging or self.hedge_manager is None:
-            return
-        
-        # Calculate and log monetary position
-        monetary_position = self.position_tracker.current_position * self.last_mid_price
-        
-        # Get hedge position
-        hedge_position = self.hedge_manager.get_hedged_position(self.instrument)
-        if hedge_position:
-            hedge_monetary = hedge_position.hedge_position * hedge_position.hedge_price
-            net_monetary = monetary_position + hedge_monetary
-            
-            self.logger.info(f"=== HEDGE STATUS ===")
-            self.logger.info(f"Primary: {self.position_tracker.current_position} {self.instrument} @ {self.last_mid_price:.2f} = ${monetary_position:.2f}")
-            self.logger.info(f"Hedge: {hedge_position.hedge_position} {hedge_position.hedge_asset} @ {hedge_position.hedge_price:.2f} = ${hedge_monetary:.2f}")
-            self.logger.info(f"Net monetary exposure: ${net_monetary:.2f}")
-            if monetary_position != 0:
-                self.logger.info(f"Hedge ratio: {abs(hedge_monetary/monetary_position):.2f} (target: {hedge_position.hedge_ratio:.2f})")
-            self.logger.info(f"Current P&L: ${hedge_position.pnl:.2f}")
-        else:
-            self.logger.info(f"No active hedge for {self.instrument} position (${monetary_position:.2f})")
+    
 
     def set_instrument_config(self, perp_instrument: str = None, futures_instrument: str = None, 
                              perp_tick_size: float = 1.0, futures_tick_size: float = 1.0):

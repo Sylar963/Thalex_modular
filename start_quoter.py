@@ -42,7 +42,7 @@ def create_log_directories():
     
     # Create subdirectories based on the LoggerFactory structure
     subdirs = [
-        "market", "orders", "risk", "hedge", 
+        "market", "orders", "risk", 
         "performance", "exchange", "positions"
     ]
     for subdir in subdirs:

@@ -1,6 +1,5 @@
 """
 ThalexClient implementation for the Thalex exchange.
-This client adapts the native thalex API to work with the hedge execution system.
 """
 
 import asyncio
@@ -296,11 +295,15 @@ class ThalexClient:
                 
             logger.info(f"Market order response: {response}")
             
-            # Format the response for hedge execution
+            # Return standard order response
             return {
                 "status": "filled",
-                "filled_size": size,
-                "filled_price": self.get_price(symbol) or response.get("price", 0.0)
+                "order_id": response.get("order_id", ""),
+                "instrument_name": symbol,
+                "side": side,
+                "amount": size,
+                "price": self.get_price(symbol) or response.get("price", 0.0),
+                "raw_response": response
             }
             
         except Exception as e:
@@ -350,12 +353,15 @@ class ThalexClient:
                 
             logger.info(f"Limit order response: {response}")
             
-            # Format the response for hedge execution
+            # Return standard order response
             return {
                 "status": "open",
-                "filled_size": 0.0,
-                "filled_price": 0.0,
-                "order_id": response.get("order_id", "")
+                "order_id": response.get("order_id", ""),
+                "instrument_name": symbol,
+                "side": side,
+                "amount": size,
+                "price": price,
+                "raw_response": response
             }
             
         except Exception as e:

@@ -62,7 +62,6 @@ from thalex_py.Thalex_modular.components.risk_manager import RiskManager
 from thalex_py.Thalex_modular.components.order_manager import OrderManager
 from thalex_py.Thalex_modular.components.avellaneda_market_maker import AvellanedaMarketMaker
 from thalex_py.Thalex_modular.models.keys import get_key_ids, get_private_keys
-from thalex_py.Thalex_modular.performance_monitor import PerformanceMonitor
 from thalex_py.Thalex_modular.thalex_logging import LoggerFactory
 from thalex_py.Thalex_modular.ringbuffer.market_data_buffer import MarketDataBuffer
 from thalex_py.Thalex_modular.ringbuffer.volume_candle_buffer import VolumeBasedCandleBuffer
@@ -149,7 +148,7 @@ class AvellanedaQuoter:
     __slots__ = [
         # Core dependencies
         'thalex', 'logger', 'tasks', 'position_tracker', 'portfolio_tracker', 'market_maker', 
-        'order_manager', 'risk_manager', 'performance_monitor',
+        'order_manager', 'risk_manager',
         
         # Risk and recovery state
         'active_trading', 'risk_recovery_mode', 'risk_breach_time',
@@ -290,7 +289,6 @@ class AvellanedaQuoter:
         self.market_maker.portfolio_tracker = self.portfolio_tracker
         self.order_manager = OrderManager(self.thalex)
         self.risk_manager = RiskManager(self.position_tracker) # Then pass it to RiskManager
-        self.performance_monitor = PerformanceMonitor(record_interval=1, buffer_size=1)  # Record every 1 second, immediate write
         
         # Initialize shared volume buffer to avoid duplication
         self.volume_buffer = None  # Will be initialized after instrument setup
@@ -1262,7 +1260,6 @@ class AvellanedaQuoter:
                 'profile': asyncio.create_task(self.profile_optimization_task()),
                 'quote': asyncio.create_task(self.quote_task()),
                 'risk_monitor': asyncio.create_task(self._risk_monitoring_task()), # Add new task
-                'performance_monitor': asyncio.create_task(self.performance_monitor.start_recording(self)) # Start performance monitoring
             })
             
             # Tasks created successfully (reduced logging)
