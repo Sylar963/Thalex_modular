@@ -68,7 +68,7 @@ class Product(enum.Enum):
 # Circuit breaker states for rate limiting
 class CircuitState(enum.Enum):
     CLOSED = 0  # Normal operation
-    OPEN = 1    # Tripped - not allowing requests
+    OPEN = 1  # Tripped - not allowing requests
     HALF_OPEN = 2  # Testing if system has recovered
 
 
@@ -82,8 +82,8 @@ class RfqLeg:
 
 
 class SideQuote:
-    __slots__ = ['p', 'a']  # Memory optimization
-    
+    __slots__ = ["p", "a"]  # Memory optimization
+
     def __init__(
         self,
         price: float,
@@ -100,10 +100,13 @@ class SideQuote:
 
 
 class Quote:
-    __slots__ = ['i', 'b', 'a']  # Memory optimization
-    
+    __slots__ = ["i", "b", "a"]  # Memory optimization
+
     def __init__(
-        self, instrument_name: str, bid: Optional[SideQuote], ask: Optional[SideQuote]
+        self,
+        instrument_name: str = "",
+        bid: Optional[SideQuote] = None,
+        ask: Optional[SideQuote] = None,
     ):
         self.i = instrument_name
         self.b = bid
@@ -122,8 +125,8 @@ class Quote:
 
 
 class Asset:
-    __slots__ = ['asset_name', 'amount']  # Memory optimization
-    
+    __slots__ = ["asset_name", "amount"]  # Memory optimization
+
     def __init__(
         self,
         asset_name: float,
@@ -137,8 +140,8 @@ class Asset:
 
 
 class Position:
-    __slots__ = ['instrument_name', 'amount']  # Memory optimization
-    
+    __slots__ = ["instrument_name", "amount"]  # Memory optimization
+
     def __init__(
         self,
         instrument_name: float,
@@ -156,17 +159,17 @@ class ObjectPool:
     def __init__(self, factory, initial_size=100):
         self.factory = factory
         self.pool = Queue(maxsize=1000)
-        
+
         # Initialize the pool
         for _ in range(initial_size):
             self.pool.put_nowait(factory())
-            
+
     async def get(self):
         try:
             return self.pool.get_nowait()
         except asyncio.QueueEmpty:
             return self.factory()
-            
+
     async def put(self, obj):
         try:
             self.pool.put_nowait(obj)
@@ -176,7 +179,7 @@ class ObjectPool:
 
 class RequestBatcher:
     """Batches requests to improve throughput"""
-    
+
     def __init__(self, thalex, batch_size=10, batch_interval=0.05):
         self.thalex = thalex
         self.batch_size = batch_size
@@ -184,12 +187,12 @@ class RequestBatcher:
         self.batch_queue = asyncio.Queue()
         self.running = False
         self.batch_task = None
-        
+
     async def start(self):
         """Start the batch processor"""
         self.running = True
         self.batch_task = asyncio.create_task(self._process_batches())
-        
+
     async def stop(self):
         """Stop the batch processor"""
         self.running = False
@@ -199,31 +202,34 @@ class RequestBatcher:
                 await self.batch_task
             except asyncio.CancelledError:
                 pass
-            
+
     async def _process_batches(self):
         """Process batches of requests"""
         batch = []
         last_send_time = time.time()
-        
+
         while self.running:
             try:
                 # Get a request with timeout
                 try:
-                    request = await asyncio.wait_for(self.batch_queue.get(), timeout=self.batch_interval)
+                    request = await asyncio.wait_for(
+                        self.batch_queue.get(), timeout=self.batch_interval
+                    )
                     batch.append(request)
                 except asyncio.TimeoutError:
                     # Interval elapsed, check if we need to send batch
                     pass
-                    
+
                 # Send if batch is full or interval elapsed
                 current_time = time.time()
-                if (len(batch) >= self.batch_size or 
-                    (batch and current_time - last_send_time >= self.batch_interval)):
+                if len(batch) >= self.batch_size or (
+                    batch and current_time - last_send_time >= self.batch_interval
+                ):
                     if batch:
                         # Mass quote batching - special handling for quotes
                         quotes = []
                         other_requests = []
-                        
+
                         for req in batch:
                             method, params, future = req
                             if method == "private/mass_quote":
@@ -232,7 +238,7 @@ class RequestBatcher:
                                 quote_future = future
                             else:
                                 other_requests.append(req)
-                                
+
                         # If we have quotes, batch them into a single request
                         if quotes:
                             quote_params = {"quotes": quotes}
@@ -240,14 +246,16 @@ class RequestBatcher:
                             for param in ["label", "post_only"]:
                                 if param in params:
                                     quote_params[param] = params[param]
-                            await self.thalex._send_raw("private/mass_quote", quote_params)
+                            await self.thalex._send_raw(
+                                "private/mass_quote", quote_params
+                            )
                             quote_future.set_result(True)
-                            
+
                         # Send other requests normally
                         for method, params, future in other_requests:
                             await self.thalex._send_raw(method, params)
                             future.set_result(True)
-                            
+
                         batch = []
                         last_send_time = current_time
             except Exception as e:
@@ -256,7 +264,7 @@ class RequestBatcher:
                 for _, _, future in batch:
                     future.set_exception(e)
                 batch = []
-                
+
     async def add(self, method, params):
         """Add a request to the batch queue"""
         future = asyncio.Future()
@@ -266,17 +274,17 @@ class RequestBatcher:
 
 class CircuitBreaker:
     """Implements the circuit breaker pattern for API rate limiting"""
-    
+
     def __init__(self, failure_threshold=10, recovery_time=30, test_calls=3):
         self.failure_threshold = failure_threshold
         self.recovery_time = recovery_time
         self.test_calls = test_calls
-        
+
         self.state = CircuitState.CLOSED
         self.failures = 0
         self.last_failure_time = 0
         self.test_counter = 0
-        
+
     def record_success(self):
         """Record a successful API call"""
         if self.state == CircuitState.HALF_OPEN:
@@ -286,22 +294,24 @@ class CircuitBreaker:
                 self.failures = 0
                 self.test_counter = 0
                 logging.info("Circuit breaker reset to CLOSED state")
-        
+
     def record_failure(self):
         """Record a failed API call"""
         current_time = time.time()
         self.last_failure_time = current_time
-        
+
         if self.state == CircuitState.CLOSED:
             self.failures += 1
             if self.failures >= self.failure_threshold:
                 self.state = CircuitState.OPEN
-                logging.warning(f"Circuit breaker tripped to OPEN state. Will retry in {self.recovery_time} seconds.")
-        
+                logging.warning(
+                    f"Circuit breaker tripped to OPEN state. Will retry in {self.recovery_time} seconds."
+                )
+
     def allow_request(self):
         """Check if a request should be allowed"""
         current_time = time.time()
-        
+
         if self.state == CircuitState.OPEN:
             # Check if recovery time has elapsed
             if current_time - self.last_failure_time >= self.recovery_time:
@@ -310,7 +320,7 @@ class CircuitBreaker:
                 logging.info("Circuit breaker state changed to HALF_OPEN for testing")
                 return True
             return False
-        
+
         return True
 
 
@@ -318,38 +328,38 @@ class Thalex:
     def __init__(self, network: Network):
         self.net: Network = network
         self.ws: websockets.client = None
-        
+
         # Connection management
         self.max_reconnect_attempts = 5
         self.reconnect_delay = 1.0  # Initial delay in seconds
         self.max_reconnect_delay = 30.0
         self.connection_pool = []
         self.pool_size = 1  # Number of connections to maintain
-        
+
         # Message processing
         self.request_batcher = RequestBatcher(self)
         self.message_queue = asyncio.Queue()
         self.processing_task = None
-        
+
         # Rate limiting
         self.circuit_breaker = CircuitBreaker()
         self.rate_limit = 60  # Default - 60 requests per minute
         self.request_timestamps = deque(maxlen=100)
-        
+
         # Request prioritization
         self.high_priority_queue = asyncio.PriorityQueue()  # For order operations
         self.low_priority_queue = asyncio.Queue()  # For market data operations
-        
+
         # Object pools for memory optimization
         self.quote_pool = ObjectPool(Quote)
-        
+
         # Caching
         self.instrument_cache = {}  # Cache for instrument data
         self._cache_lock = asyncio.Lock()
-        
+
         # For streaming parsing
         self._partial_data = bytearray()
-        
+
         # Async event for connection status
         self.connected_event = asyncio.Event()
 
@@ -357,10 +367,10 @@ class Thalex:
         """Initialize the client with all optimizations"""
         # Start the message batcher
         await self.request_batcher.start()
-        
+
         # Start the message processing task
         self.processing_task = asyncio.create_task(self._process_messages())
-        
+
         # Connect with initial pool
         await self.connect()
 
@@ -371,13 +381,16 @@ class Thalex:
 
     def connected(self):
         """Check if WebSocket is connected"""
-        return self.ws is not None and self.ws.state in [WsState.CONNECTING, WsState.OPEN]
+        return self.ws is not None and self.ws.state in [
+            WsState.CONNECTING,
+            WsState.OPEN,
+        ]
 
     async def connect(self):
         """Connect with exponential backoff retry"""
         attempt = 0
         delay = self.reconnect_delay
-        
+
         while attempt < self.max_reconnect_attempts:
             try:
                 self.ws = await websockets.connect(self.net.value, ping_interval=5)
@@ -387,11 +400,13 @@ class Thalex:
             except Exception as e:
                 attempt += 1
                 logging.error(f"Connection attempt {attempt} failed: {str(e)}")
-                
+
                 if attempt < self.max_reconnect_attempts:
                     logging.info(f"Retrying in {delay} seconds...")
                     await asyncio.sleep(delay)
-                    delay = min(delay * 2, self.max_reconnect_delay)  # Exponential backoff
+                    delay = min(
+                        delay * 2, self.max_reconnect_delay
+                    )  # Exponential backoff
                 else:
                     logging.error("Max reconnection attempts reached")
                     self.connected_event.clear()
@@ -401,7 +416,7 @@ class Thalex:
         """Disconnect and cleanup resources"""
         # Stop the batcher
         await self.request_batcher.stop()
-        
+
         # Stop message processing
         if self.processing_task:
             self.processing_task.cancel()
@@ -409,12 +424,12 @@ class Thalex:
                 await self.processing_task
             except asyncio.CancelledError:
                 pass
-        
+
         # Close websocket
         if self.ws:
             await self.ws.close()
             self.ws = None
-            
+
         self.connected_event.clear()
 
     async def ping(self):
@@ -437,14 +452,14 @@ class Thalex:
                 if not self.connected():
                     await asyncio.sleep(0.1)
                     continue
-                
+
                 # Receive and process message
                 raw_message = await self.ws.recv()
-                
+
                 # Use faster JSON parser
                 try:
                     message = orjson.loads(raw_message)
-                    
+
                     # Add to queue for processing by application
                     await self.message_queue.put(ujson.dumps(message))
                 except Exception as e:
@@ -465,20 +480,21 @@ class Thalex:
     async def reconnect(self):
         """Reconnect the WebSocket with exponential backoff"""
         await self.connect()
-        
+
         # Resubscribe to any active subscriptions
-        # (This would require tracking active subscriptions, 
+        # (This would require tracking active subscriptions,
         # which could be added in a future enhancement)
 
     async def _check_rate_limit(self):
         """Check if we're under rate limit"""
         current_time = time.time()
-        
+
         # Clean old timestamps
-        while (self.request_timestamps and 
-               current_time - self.request_timestamps[0] > 60):
+        while (
+            self.request_timestamps and current_time - self.request_timestamps[0] > 60
+        ):
             self.request_timestamps.popleft()
-            
+
         # Check if we're at the limit
         return len(self.request_timestamps) < self.rate_limit
 
@@ -490,10 +506,20 @@ class Thalex:
         """Low-level send without batching or circuit breaking"""
         if not params:
             params = {}
-            
+
+        # Fix: Extract 'id' from params if present and put it at top level
+        # This fixes the issue where ID was being sent inside params{} instead of root
+        req_id = params.pop("id", None)
+
         request = {"method": method, "params": params}
-        request_str = ujson.dumps(request)  # Faster JSON serialization
-        
+        if req_id is not None:
+            request["id"] = req_id
+
+        request_str = json.dumps(request)  # Use standard json to avoid escaping issues
+
+        # DEBUG LOG
+        # logging.info(f"TX RAW: {request_str}")
+
         if self.ws and self.ws.state == WsState.OPEN:
             await self.ws.send(request_str)
             return True
@@ -505,23 +531,23 @@ class Thalex:
         params = {}
         if id is not None:
             params["id"] = id
-            
+
         # Build parameters
         for key, value in kwargs.items():
             if value is not None:
                 params[key] = value
-                
+
         # Check if circuit breaker allows this request
         if not self.circuit_breaker.allow_request():
             logging.warning(f"Circuit breaker prevents sending {method}")
             raise Exception("Rate limit circuit breaker is open")
-            
+
         # Check if we're under rate limit
         if not await self._check_rate_limit():
             self.circuit_breaker.record_failure()
             logging.warning("Rate limit exceeded")
             raise Exception("Rate limit exceeded")
-            
+
         try:
             # Attempt to send via batcher for most requests
             # Critical order operations bypass batching
@@ -531,13 +557,13 @@ class Thalex:
             else:
                 # Use batching for other operations
                 result = await self.request_batcher.add(method, params)
-                
+
             # Update rate limit counter
             self._update_rate_limit()
-            
+
             # Record success with circuit breaker
             self.circuit_breaker.record_success()
-            
+
             return result
         except Exception as e:
             # Record failure with circuit breaker
@@ -577,7 +603,9 @@ class Thalex:
             account=account,
         )
 
-    async def set_cancel_on_disconnect(self, timeout_secs: int, id: Optional[int] = None):
+    async def set_cancel_on_disconnect(
+        self, timeout_secs: int, id: Optional[int] = None
+    ):
         """Set cancel on disconnect
 
         :timeout_secs:  Heartbeat interval
@@ -1389,7 +1417,9 @@ class Thalex:
         """
         if isinstance(product, Product):
             product = product.value
-        await self._send("private/set_mm_protection", id, product=product, amount=amount)
+        await self._send(
+            "private/set_mm_protection", id, product=product, amount=amount
+        )
 
     async def verify_withdrawal(
         self,
