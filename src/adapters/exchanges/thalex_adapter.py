@@ -11,7 +11,24 @@ try:
 except ImportError:
     # Creating a mock if library is missing during development/refactor
     class Thalex:
-        pass
+        def __init__(self, network=None):
+            pass
+
+        async def connect(self):
+            pass
+
+        async def receive(self):
+            await asyncio.sleep(1)
+            return None
+
+        def connected(self):
+            return True
+
+        async def login(self, k, s):
+            pass
+
+        async def public_subscribe(self, channels):
+            pass
 
     class Network:
         TESTNET = "testnet"

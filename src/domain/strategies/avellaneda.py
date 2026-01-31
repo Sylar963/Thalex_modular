@@ -5,6 +5,10 @@ import logging
 from typing import List, Dict, Tuple, Any, Optional
 from ..interfaces import Strategy
 from ..entities import MarketState, Position, Order, OrderSide, OrderType, Ticker
+from ...infrastructure.speed.math_kernels import (
+    calculate_optimal_spread_kernel,
+    calculate_reservation_price_kernel,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -138,8 +142,7 @@ class AvellanedaStoikovStrategy(Strategy):
         self, market_state: MarketState, position: Position
     ) -> float:
         """
-        Avellaneda-Stoikov spread formula:
-        s = gamma * sigma^2 * (T - t) + (2 / gamma) * ln(1 + (gamma / kappa))
+        Avellaneda-Stoikov spread formula using Numba kernel.
         """
         # Extract signals if available
         volatility_adj = market_state.signals.get("volatility_adjustment", 0.0)
@@ -148,39 +151,31 @@ class AvellanedaStoikovStrategy(Strategy):
         effective_sigma = self.volatility * (1 + volatility_adj)
         effective_gamma = self.gamma * (1 + gamma_adj)
 
-        # Simplified time factor (T-t normalized to 1 for infinite horizon approximation or fixed window)
-        time_factor = 1.0
-
-        spread = (effective_gamma * (effective_sigma**2) * time_factor) + (
-            (2 * np.log(1 + (effective_gamma / self.kappa))) / effective_gamma
+        # Call Numba kernel
+        return calculate_optimal_spread_kernel(
+            effective_gamma,
+            effective_sigma,
+            1.0,  # time_factor
+            self.kappa,
+            self.min_spread,
         )
-
-        return max(self.min_spread, spread)
 
     def _calculate_reservation_price(
         self, mid_price: float, position: Position, signals: Dict[str, float]
     ) -> float:
         """
-        Reservation price r = s - q * gamma * sigma^2 * (T - t)
-
-        Where:
-        s = mid price
-        q = current inventory (position size)
+        Reservation price using Numba kernel.
         """
-        # Inventory skew
-        inventory_skew = (
-            position.size * self.gamma * (self.volatility**2) * self.time_horizon
-        )
-
         # Predictive Adjustments
         reservation_offset = signals.get("reservation_price_offset", 0.0)
-
-        # VAMP Adjustment (if passed in signals)
         vamp_offset = signals.get("vamp_offset", 0.0)
 
-        return (
-            mid_price - inventory_skew + (mid_price * reservation_offset) + vamp_offset
+        # Call Numba kernel
+        base_r = calculate_reservation_price_kernel(
+            mid_price, position.size, self.gamma, self.volatility, self.time_horizon
         )
+
+        return base_r + (mid_price * reservation_offset) + vamp_offset
 
     def _round_to_tick(self, price: float) -> float:
         return round(price / self.tick_size) * self.tick_size
