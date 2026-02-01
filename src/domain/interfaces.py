@@ -27,6 +27,16 @@ class ExchangeGateway(ABC):
         pass
 
     @abstractmethod
+    async def place_orders_batch(self, orders: List[Order]) -> List[Order]:
+        """Place multiple orders in a single batch request."""
+        pass
+
+    @abstractmethod
+    async def cancel_orders_batch(self, order_ids: List[str]) -> List[bool]:
+        """Cancel multiple orders in a single batch."""
+        pass
+
+    @abstractmethod
     async def subscribe_ticker(self, symbol: str):
         """Subscribe to ticker updates for a symbol."""
         pass

@@ -3,7 +3,7 @@ import logging
 import json
 import time
 import os
-from typing import Dict, Optional, Callable
+from typing import Dict, Optional, Callable, List, Any
 from dataclasses import replace
 
 # Native Thalex client
@@ -329,24 +329,36 @@ class ThalexAdapter(ExchangeGateway):
                         continue
 
                 if not isinstance(msg, dict):
+                    # Handle Batch Responses (List of Dicts)
+                    if isinstance(msg, list):
+                        for m in msg:
+                            if isinstance(m, dict):
+                                # recursive process? or just inline
+                                await self._handle_single_msg(m)
+                        continue
+
                     logger.warning(f"Received non-dict msg: {msg}")
                     continue
 
-                # Check for RPC response
-                msg_id = msg.get("id")
-                if msg_id is not None and msg_id in self.pending_requests:
-                    self.pending_requests[msg_id].set_result(msg)
-                    del self.pending_requests[msg_id]
-                    continue
-
-                # Delegate processing in background task to avoid blocking the loop (and RPC responses)
-                asyncio.create_task(self._process_message(msg))
+                await self._handle_single_msg(msg)
 
             except asyncio.TimeoutError:
                 continue
             except Exception as e:
                 logger.error(f"Error in msg loop: {e}")
                 await asyncio.sleep(1)
+
+    async def _handle_single_msg(self, msg: Dict):
+        # Check for RPC response
+        msg_id = msg.get("id")
+        if msg_id is not None and msg_id in self.pending_requests:
+            self.pending_requests[msg_id].set_result(msg)
+            if msg_id in self.pending_requests:  # check again just in case
+                del self.pending_requests[msg_id]
+            return
+
+        # Delegate processing
+        asyncio.create_task(self._process_message(msg))
 
     async def _process_message(self, msg: Dict):
         # Handle new format: {'channel_name': ..., 'notification': ...}
