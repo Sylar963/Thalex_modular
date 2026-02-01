@@ -2,7 +2,13 @@ import asyncio
 import logging
 import time
 from typing import List, Optional, Dict
-from ..domain.interfaces import ExchangeGateway, Strategy, SignalEngine, RiskManager
+from ..domain.interfaces import (
+    ExchangeGateway,
+    Strategy,
+    SignalEngine,
+    RiskManager,
+    StorageGateway,
+)
 from ..domain.entities import (
     MarketState,
     Position,
@@ -27,11 +33,13 @@ class QuotingService:
         strategy: Strategy,
         signal_engine: SignalEngine,
         risk_manager: RiskManager,
+        storage_gateway: Optional[StorageGateway] = None,
     ):
         self.gateway = gateway
         self.strategy = strategy
         self.signal_engine = signal_engine
         self.risk_manager = risk_manager
+        self.storage = storage_gateway
 
         self.symbol: str = ""
         self.market_state = MarketState()
@@ -90,6 +98,11 @@ class QuotingService:
         self.signal_engine.update(ticker)
         self.market_state.signals = self.signal_engine.get_signals()
 
+        # Persist Data
+        if self.storage:
+            # Fire and forget (create task) to avoid blocking main loop
+            asyncio.create_task(self.storage.save_ticker(ticker))
+
         # 2. Risk Check (Global)
         if not self.risk_manager.can_trade():
             await self._cancel_all()
@@ -114,6 +127,8 @@ class QuotingService:
         if not self.running:
             return
         self.signal_engine.update_trade(trade)
+        if self.storage:
+            asyncio.create_task(self.storage.save_trade(trade))
 
     async def _reconcile_orders(self, desired_orders: List[Order]):
         """

@@ -99,3 +99,27 @@ class RiskManager(ABC):
     def can_trade(self) -> bool:
         """Global switch to check if trading is allowed."""
         pass
+
+
+class StorageGateway(ABC):
+    """Abstract interface for data persistence."""
+
+    @abstractmethod
+    async def save_ticker(self, ticker: Ticker):
+        """Save ticker data to storage."""
+        pass
+
+    @abstractmethod
+    async def save_trade(self, trade: Trade):
+        """Save trade data to storage."""
+        pass
+
+    @abstractmethod
+    async def save_position(self, position: Position):
+        """Save current position snapshot."""
+        pass
+
+    @abstractmethod
+    async def get_recent_tickers(self, symbol: str, limit: int = 100) -> List[Ticker]:
+        """Retrieve recent ticker history."""
+        pass

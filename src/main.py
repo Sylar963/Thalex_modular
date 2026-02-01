@@ -46,7 +46,30 @@ async def main():
         # In production this should likely exit or ask for input
 
     # 2. Dependency Injection
+    # 2. Dependency Injection
     gateway = ThalexAdapter(api_key, api_secret, testnet=testnet)
+
+    # 2.1 Database (Optional)
+    db_user = os.getenv("DATABASE_USER", "postgres")
+    db_pass = os.getenv("DATABASE_PASSWORD", "password")
+    db_host = os.getenv("DATABASE_HOST", "localhost")
+    db_port = os.getenv("DATABASE_PORT", "5432")
+    db_name = os.getenv("DATABASE_NAME", "thalex_trading")
+    # Build DSN: postgresql://user:pass@host:port/dbname
+    db_dsn = f"postgresql://{db_user}:{db_pass}@{db_host}:{db_port}/{db_name}"
+
+    storage = None
+    try:
+        from src.adapters.storage.timescale_adapter import TimescaleDBAdapter
+
+        # Only initialize if explicitly configured or we want to try connection
+        # For robust production, we might want to fail fast, but for this hybrid approach:
+        storage = TimescaleDBAdapter(db_dsn)
+        logger.info(
+            f"Initialized TimescaleDB Adapter (DSN: ...@{db_host}:{db_port}/...)"
+        )
+    except ImportError:
+        logger.warning("asyncpg not installed, skipping DB storage.")
 
     strategy = AvellanedaStoikovStrategy()
     strategy.setup(
@@ -64,7 +87,9 @@ async def main():
     risk_manager = BasicRiskManager(max_position=10.0, max_order_size=1.0)
 
     # 3. Service Assembly
-    service = QuotingService(gateway, strategy, signal_engine, risk_manager)
+    service = QuotingService(
+        gateway, strategy, signal_engine, risk_manager, storage_gateway=storage
+    )
 
     # 4. Graceful Shutdown Handler
     loop = asyncio.get_running_loop()
@@ -79,6 +104,9 @@ async def main():
 
     # 5. Start Application
     try:
+        if storage:
+            await storage.connect()
+
         await service.start(symbol)
 
         # Keep running until stop signal
@@ -88,6 +116,8 @@ async def main():
         logger.error(f"Fatal error: {e}", exc_info=True)
     finally:
         await service.stop()
+        if storage:
+            await storage.disconnect()
 
 
 if __name__ == "__main__":
