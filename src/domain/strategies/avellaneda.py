@@ -269,6 +269,7 @@ class AvellanedaStoikovStrategy(Strategy):
                         price=p_bid,
                         size=self.order_size,
                         timestamp=timestamp,
+                        post_only=True,
                     )
                 )
 
@@ -290,6 +291,7 @@ class AvellanedaStoikovStrategy(Strategy):
                         price=p_ask,
                         size=self.order_size,
                         timestamp=timestamp,
+                        post_only=True,
                     )
                 )
 

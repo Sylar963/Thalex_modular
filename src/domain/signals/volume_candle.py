@@ -85,7 +85,11 @@ class VolumeCandleSignalEngine(SignalEngine):
         else:
             self.current_candle.sell_volume += trade.size
 
-        # 2. Check for completion
+        # 2. IMMEDIATE Signal Calculation (Floating VAMP)
+        # We don't wait for candle completion to detect toxic flow
+        self._calculate_floating_signals()
+
+        # 3. Check for completion
         if self.current_candle.volume >= self.volume_threshold:
             self._complete_candle()
 
@@ -197,3 +201,38 @@ class VolumeCandleSignalEngine(SignalEngine):
             self.signals["volatility_adjustment"] = 0.0
 
         self.signals["vamp_value"] = vamp_value
+
+    def _calculate_floating_signals(self):
+        """
+        Calculate signals based on the current incomplete candle + recent history.
+        This provides zero-latency feedback for "Toxic Flow" detection.
+        """
+        # Mix current candle with recent history
+        # We need a temporary snapshot of 'recent' that includes current_candle
+
+        # Calculate immediate flow pressure from current candle alone (short-term)
+        current = self.current_candle
+        if current.volume > 0:
+            current_impact = (current.buy_volume - current.sell_volume) / current.volume
+            # Normalize by volume? A small candle with 100% buy is less significant than a large one
+            # We weight it by volume_threshold progress
+            significance = min(1.0, current.volume / self.volume_threshold)
+
+            # This is the "Tick Imbalance" or "Immediate Pressure"
+            self.signals["immediate_flow"] = current_impact * significance
+        else:
+            self.signals["immediate_flow"] = 0.0
+
+        # Also calculate the aggregate VAMP impact including this developing candle
+        # similar to _calculate_signals but lighter weight
+        recent = list(self.candles)[-5:] + [self.current_candle]
+
+        agg_buy = sum(c.buy_volume for c in recent)
+        agg_sell = sum(c.sell_volume for c in recent)
+        total = agg_buy + agg_sell
+
+        if total > 0:
+            vamp_impact = (agg_buy - agg_sell) / total
+            self.signals["market_impact"] = vamp_impact
+            # Update offset immediately
+            self.signals["reservation_price_offset"] = vamp_impact * 0.0005

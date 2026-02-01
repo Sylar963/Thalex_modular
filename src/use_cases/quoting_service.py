@@ -166,9 +166,103 @@ class QuotingService:
     async def on_trade_update(self, trade):
         if not self.running:
             return
+
+        # 1. Update Signals
         self.signal_engine.update_trade(trade)
+        signals = self.signal_engine.get_signals()
+
+        # 2. TOXIC FLOW DEFENSE
+        # Check for immediate adverse selection (Strong flow against us)
+        # immediate_flow is -1.0 (Sell pressure) to 1.0 (Buy pressure)
+        immediate_flow = signals.get("immediate_flow", 0.0)
+
+        # Threshold: > 0.7 means 70% of recent volume is one-sided
+        TOXIC_THRESHOLD = 0.7
+
+        if abs(immediate_flow) > TOXIC_THRESHOLD:
+            # If heavy BUY pressure (flow > 0), we are at risk of selling too cheap.
+            # Cancel ASKS.
+            if immediate_flow > 0:
+                logger.warning(
+                    f"Toxic BUY flow detected ({immediate_flow:.2f}). Pulling ASKS."
+                )
+                await self._cancel_side(OrderSide.SELL)
+
+            # If heavy SELL pressure (flow < 0), we are at risk of buying too high.
+            # Cancel BIDS.
+            elif immediate_flow < 0:
+                logger.warning(
+                    f"Toxic SELL flow detected ({immediate_flow:.2f}). Pulling BIDS."
+                )
+                await self._cancel_side(OrderSide.BUY)
+
+            # Force immediate strategy recalculation?
+            # Ideally yes, but after cancels settle.
+            # For now, just pulling the quotes protects us.
+            return
+
+        # 3. Trade-Driven Reconciliation
+        # If the trade was large enough to shift VAMP significantly, we should reconcile
+        if abs(immediate_flow) > 0.3:
+            # Fast track: Update state and reconcile without waiting for ticker
+            # Note: Tickers come fast too, so we rate limit this?
+            # For now, let's just trigger it if not locked
+            if not self._reconcile_lock.locked():
+                # We need updated market state... mainly signals.
+                # Ticker price might be stale but signals are fresh.
+                self.market_state.signals = signals
+
+                # Create task to reconcile (fire and forget to not block trade processing)
+                # But valid checks need fresh ticker?
+                # Assuming Strategy can handle stale ticker with new signals (skew changes)
+                asyncio.create_task(self._fast_reconcile())
+
         if self.storage:
             asyncio.create_task(self.storage.save_trade(trade))
+
+    async def _cancel_side(self, side: OrderSide):
+        """Emergency cancel for a specific side."""
+        orders_to_cancel = self.active_orders.get(side, [])
+        if not orders_to_cancel:
+            return
+
+        tasks = [
+            self.gateway.cancel_order(o.exchange_id)
+            for o in orders_to_cancel
+            if o.exchange_id
+        ]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+            # Optimistically clear
+            self.active_orders[side] = []
+
+    async def _fast_reconcile(self):
+        """Wrapper to run reconciliation logic triggered by trades."""
+        # Need to ensure we have a valid position/ticker
+        if not self.market_state.ticker:
+            return
+
+        async with self._reconcile_lock:
+            # Re-run strategy
+            # Note: This duplicates logic from on_ticker_update.
+            # Refactoring to a centralized _run_strategy() would be cleaner.
+            # For now, keeping it inline for minimizing diffs.
+
+            tick_size = getattr(self.gateway, "tick_size", 0.5)
+            desired_orders = self.strategy.calculate_quotes(
+                self.market_state, self.position, tick_size=tick_size
+            )
+            # Tick align
+            for i in range(len(desired_orders)):
+                o = desired_orders[i]
+                if o.price:
+                    rounded_price = round(o.price / self.tick_size) * self.tick_size
+                    desired_orders[i] = replace(o, price=rounded_price)
+
+            active = []
+            # Risk validate against current active orders (simplified)
+            # Ideally we full diff. _reconcile_orders handles the diff.
+            await self._reconcile_orders(desired_orders)
 
     async def _reconcile_orders(self, desired_orders: List[Order]):
         """

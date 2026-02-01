@@ -222,6 +222,7 @@ class ThalexAdapter(ExchangeGateway):
                 price=order.price,
                 order_type=th_type,
                 label=label,
+                post_only=order.post_only,
             )
 
             if "error" in response:

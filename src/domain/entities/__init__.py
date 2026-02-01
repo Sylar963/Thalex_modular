@@ -64,6 +64,7 @@ class Order:
     status: OrderStatus = OrderStatus.PENDING
     exchange_id: Optional[str] = None
     filled_size: float = 0.0
+    post_only: bool = False
     timestamp: float = field(default_factory=time.time)
 
 
