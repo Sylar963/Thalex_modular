@@ -42,22 +42,53 @@ Thalex_modular/
 - (Optional) TimescaleDB/PostgreSQL instance
 
 ### Installation
-1. `git clone <repository-url>`
-2. `pip install -r requirements.txt`
-3. `cp .example.env .env`
-4. Configure `.env` with your API keys and trading preferences.
 
-### Running the Bot
+1. **Clone & Setup Environment**:
+   ```bash
+   git clone <repository-url>
+   cd Thalex_modular
+   python -m venv venv
+   source venv/bin/activate  # Linux/macOS
+   pip install -r requirements.txt
+   ```
 
-**Modern Modular Mode (Recommended):**
+2. **Configure Environment Variables**:
+   ```bash
+   cp .example.env .env
+   ```
+   Edit `.env` and fill in your Thalex API keys and database credentials.
+
+3. **Start the Database (Required for API & Storage)**:
+   The project uses TimescaleDB for data persistence. Start it using Docker Compose:
+   ```bash
+   docker-compose up -d
+   ```
+   *Note: This will start TimescaleDB on port 5433 (mapping 5432 internal).*
+
+---
+
+### Running the System
+
+To have a fully functional frontend experience, you need both the Trading Bot and the Backend API running.
+
+#### 1. Start the Trading Bot
+The bot fetches market data, executes strategy logic, and persists data to the database.
 ```bash
+# Recommended: Modular Architecture
 python src/main.py
 ```
 
-**Legacy High-Performance Mode:**
+#### 2. Start the Backend API (For Frontend)
+The API serves simulation and live data to the Svelte dashboard.
 ```bash
-python start_quoter.py
+# The API runs on http://localhost:8000
+python -m uvicorn src.api.main:app --reload
 ```
+
+#### 3. Frontend Development
+Ensure your `vite.config.ts` in the frontend project is routing `/api` traffic to `localhost:8000`.
+
+---
 
 ---
 

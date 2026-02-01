@@ -95,7 +95,7 @@ class QuotingService:
         # tick_size remains 1.0 for now, could be dynamic later
 
         # Refresh position from local cache of adapter (fast)
-        self.position = await self.gateway.get_position(self.symbol)
+        new_position = await self.gateway.get_position(self.symbol)
 
         # Update Signals
         self.signal_engine.update(ticker)
@@ -112,6 +112,10 @@ class QuotingService:
         if self.storage:
             # Fire and forget (create task) to avoid blocking main loop
             asyncio.create_task(self.storage.save_ticker(ticker))
+            # Save position snapshot
+            asyncio.create_task(self.storage.save_position(new_position))
+
+        self.position = new_position
 
         # 2. Risk Check (Global)
         if not self.risk_manager.can_trade():
