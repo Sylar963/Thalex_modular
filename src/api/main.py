@@ -1,11 +1,25 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from .v1.endpoints import router as api_router
+from contextlib import asynccontextmanager
+from .dependencies import init_dependencies, close_dependencies
+
+from .v1.endpoints import market, portfolio, simulation, config
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    await init_dependencies()
+    yield
+    # Shutdown
+    await close_dependencies()
+
 
 app = FastAPI(
     title="Thalex Modular API",
     description="API for PNL Simulation and Market Metrics",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 # CORS Configuration
@@ -22,8 +36,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Include Router
-app.include_router(api_router, prefix="/api/v1")
+# Include Routers
+app.include_router(market.router, prefix="/api/v1/market", tags=["Market"])
+app.include_router(portfolio.router, prefix="/api/v1/portfolio", tags=["Portfolio"])
+app.include_router(simulation.router, prefix="/api/v1/simulation", tags=["Simulation"])
+app.include_router(config.router, prefix="/api/v1/config", tags=["Configuration"])
 
 
 @app.get("/health")
