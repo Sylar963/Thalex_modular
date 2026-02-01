@@ -26,6 +26,31 @@ from ...domain.entities import (
 logger = logging.getLogger(__name__)
 
 
+class TokenBucket:
+    """
+    Token Bucket algorithm for rate limiting.
+    Replenishes tokens at a fixed rate up to a maximum capacity.
+    """
+
+    def __init__(self, capacity: int, fill_rate: float):
+        self.capacity = float(capacity)
+        self._tokens = float(capacity)
+        self.fill_rate = fill_rate  # tokens per second
+        self.last_update = time.time()
+
+    def consume(self, tokens: int = 1) -> bool:
+        now = time.time()
+        # Replenish
+        delta = now - self.last_update
+        self._tokens = min(self.capacity, self._tokens + delta * self.fill_rate)
+        self.last_update = now
+
+        if self._tokens >= tokens:
+            self._tokens -= tokens
+            return True
+        return False
+
+
 class ThalexAdapter(ExchangeGateway):
     """
     Adapter for the Thalex exchange using the official python library.
@@ -54,6 +79,13 @@ class ThalexAdapter(ExchangeGateway):
         self.heartbeat_task: Optional[asyncio.Task] = None
         self.last_msg_time = time.time()
         self.tick_size: float = 1.0  # Default, will be updated from API
+
+        # Rate Limiters
+        # Matching Engine: 50 req/s (enabled via Cancel on Disconnect). Target 45 (90%)
+        self.me_rate_limiter = TokenBucket(capacity=50, fill_rate=45.0)
+
+        # Cancel Requests: 1000 req/s. Target 900 (90%)
+        self.cancel_rate_limiter = TokenBucket(capacity=1000, fill_rate=900.0)
 
     def _get_next_id(self) -> int:
         self.request_id_counter += 1
@@ -110,10 +142,21 @@ class ThalexAdapter(ExchangeGateway):
             await asyncio.wait_for(future, timeout=10.0)
             logger.info("Logged in successfully.")
 
+            # Enable Cancel On Disconnect to get higher rate limits (50 req/s vs 10 req/s)
+            cod_id = self._get_next_id()
+            future_cod = asyncio.Future()
+            self.pending_requests[cod_id] = future_cod
+
+            # Note: The library expects 'timeout_secs' to enable cancel on disconnect
+            await self._rpc_request(
+                self.client.set_cancel_on_disconnect, timeout_secs=15
+            )
+            logger.info("Enabled Cancel On Disconnect (Rate Limit boosted).")
+
             # Fetch instrument details (tick size)
             await self._fetch_instrument_details()
         except Exception as e:
-            logger.error(f"Login timeout or error: {e}")
+            logger.error(f"Login/Setup failed: {e}")
             # Cleanup
             self.connected = False
             if self.msg_loop_task:
@@ -121,7 +164,7 @@ class ThalexAdapter(ExchangeGateway):
             if self.heartbeat_task:
                 self.heartbeat_task.cancel()
             await self.client.disconnect()
-            raise ConnectionError("Failed to login to Thalex")
+            raise ConnectionError("Failed to login/setup Thalex")
 
         logger.info("Thalex Adapter connected and listening.")
 
@@ -154,6 +197,11 @@ class ThalexAdapter(ExchangeGateway):
     async def place_order(self, order: Order) -> Order:
         if not self.connected:
             raise ConnectionError("Not connected to exchange")
+
+        # Rate Limit Check (Matching Engine)
+        if not self.me_rate_limiter.consume(1):
+            logger.warning("Rate limit hit (ME). Dropping order.")
+            return replace(order, status=OrderStatus.REJECTED)
 
         th_type = (
             ThOrderType.LIMIT if order.type == OrderType.LIMIT else ThOrderType.MARKET
@@ -198,6 +246,12 @@ class ThalexAdapter(ExchangeGateway):
     async def cancel_order(self, order_id: str) -> bool:
         if not self.connected:
             return False
+
+        # Rate Limit Check (Cancel)
+        if not self.cancel_rate_limiter.consume(1):
+            logger.warning("Rate limit hit (Cancel). Dropping cancel request.")
+            return False
+
         try:
             # Try to convert to int if possible
             oid = int(order_id) if str(order_id).isdigit() else order_id

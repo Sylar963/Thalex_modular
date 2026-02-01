@@ -27,6 +27,8 @@
 - [x] Hedge logic removal and verification.
 - [x] Transition to TimescaleDB for high-res data.
 - [x] Initial FastAPI boilerplate implementation.
+- [x] Portfolio data persistence & API integration.
+- [x] API Rate Limiting (Token Bucket + Cancel On Disconnect).
 - [/] Scaling simulation engine for high-resolution data.
 
 ### Scaling & Data Strategy
@@ -54,6 +56,23 @@ Used for high-resolution (1m) market data storage and historical backfills.
 ### Data Architecture (Real-time & Dashboard)
 The system leverages TimescaleDB as a "Single Source of Truth":
 - **Access**: Python `asyncpg` adapter (backend) or FastAPI endpoints (dashboard).
+- **Portfolio Snapshots**: Current positions are snapshotted to `portfolio_positions` table on every ticker update to ensure low-latency API serving.
+
+## V. Critical Technical Knowledge & Lessons Learned
+
+### API & Modular Architecture
+- **Environment Loading**: In a modular FastAPI project, `load_dotenv()` MUST be called in the entry point (`src/api/main.py`) BEFORE importing any dependencies that utilize environment variables.
+- **Relative Imports**: Ensure consistent relative import depth in `dependencies.py` (e.g., `..adapters` vs `.repositories`) to avoid `ImportError` when running as a module.
+
+### Thalex API Rate Limiting
+- **Message Rates**: Matching engine limit is 10/s by default, boosted to **50/s** if `private/set_cancel_on_disconnect` is enabled.
+- **Implementation**: Use a **Token Bucket** algorithm targeting 90% (45/s for ME, 900/s for cancels) to avoid hard lockouts.
+- **COD Safety**: Enabling `set_cancel_on_disconnect` ensures all orders are cleared if the bot loses connection, providing a critical safety net for high-frequency quoting.
+
+### System Operations
+- **Background Execution**: Use `screen` for production deployments to keep sessions active without an open terminal.
+  - Trading Bot: `screen -S thalex-bot`
+  - API: `screen -S thalex-api`
 
 ---
 *This document is a living record of project directives and should be updated as the roadmap evolves.*
