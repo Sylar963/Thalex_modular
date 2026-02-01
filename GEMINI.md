@@ -29,6 +29,13 @@
 - [x] Initial FastAPI boilerplate implementation.
 - [/] Scaling simulation engine for high-resolution data.
 
+### Scaling & Data Strategy
+To support 1-minute resolution simulations:
+- **Historical Data**: Fetched from Thalex `public/mark_price_historical_data` in 24-hour chunks.
+- **Instrument Discovery**: Dynamically filters for active `BTCUSD` options to match valid expirations.
+- **Resolution**: `1m` candles used for both Index and Options to minimize alignment errors.
+- **Persistence**: Stored in TimescaleDB `options_live_metrics` (hypertable).
+
 ## IV. Data Infrastructure & Access
 
 ### TimescaleDB (Historical Data)

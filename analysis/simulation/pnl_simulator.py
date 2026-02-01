@@ -31,11 +31,12 @@ class PNLSimulator:
         dbname="thalex_trading",
         user="postgres",
         password="password",
+        port="5433",
     ):
         import psycopg2
 
         self.db_conn = psycopg2.connect(
-            host=host, database=dbname, user=user, password=password
+            host=host, database=dbname, user=user, password=password, port=port
         )
 
     def load_data(self, start_date: str, end_date: str) -> pd.DataFrame:

@@ -14,6 +14,7 @@ DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_NAME = os.getenv("DB_NAME", "thalex_trading")
 DB_USER = os.getenv("DB_USER", "postgres")
 DB_PASS = os.getenv("DB_PASS", "password")
+DB_PORT = os.getenv("DB_PORT", "5433")
 
 THALEX_API_URL = "https://thalex.com/api/v2"  # Verify base URL
 
@@ -31,8 +32,15 @@ class HistoricalOptionsLoader:
 
     def connect_db(self):
         try:
+            logger.info(
+                f"Connecting to DB: host={DB_HOST} port={DB_PORT} user={DB_USER} db={DB_NAME}"
+            )
             self.conn = psycopg2.connect(
-                host=DB_HOST, database=DB_NAME, user=DB_USER, password=DB_PASS
+                host=DB_HOST,
+                database=DB_NAME,
+                user=DB_USER,
+                password="password",
+                port=DB_PORT,
             )
             logger.info("Connected to TimescaleDB")
         except Exception as e:
@@ -63,7 +71,7 @@ class HistoricalOptionsLoader:
             "index_name": index_name,
             "from": start_ts,
             "to": end_ts,
-            "resolution": "1h",
+            "resolution": "1m",
         }
         return await self._fetch_list("public/index_price_historical_data", params)
 
@@ -75,7 +83,7 @@ class HistoricalOptionsLoader:
             "instrument_name": instrument_name,
             "from": start_ts,
             "to": end_ts,
-            "resolution": "1h",
+            "resolution": "1m",
         }
         return await self._fetch_list("public/mark_price_historical_data", params)
 
@@ -103,116 +111,125 @@ class HistoricalOptionsLoader:
         """Formats date as DDMMMYY (e.g. 29MAR24)"""
         return date.strftime("%d%b%y").upper()
 
-    async def run(self, days_back: int = 7):
+    def batch_insert_metrics(self, metrics: List[Tuple]):
+        if not metrics:
+            return
+        cursor = self.conn.cursor()
+        execute_batch(
+            cursor,
+            """
+            INSERT INTO options_live_metrics 
+            (time, underlying, strike, expiry_date, days_to_expiry, call_mark_price, put_mark_price, straddle_price, implied_vol, expected_move_pct)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT DO NOTHING
+            """,
+            metrics,
+        )
+        self.conn.commit()
+
+    def batch_insert_tickers(self, tickers: List[Tuple]):
+        if not tickers:
+            return
+        cursor = self.conn.cursor()
+        execute_batch(
+            cursor,
+            """
+            INSERT INTO market_tickers (time, symbol, bid, ask, last, volume)
+            VALUES (%s, %s, %s, %s, %s, 0)
+            ON CONFLICT DO NOTHING
+            """,
+            tickers,
+        )
+        self.conn.commit()
+
+    async def run(self, days_back: int = 30):
         self.connect_db()
         self.session = aiohttp.ClientSession()
 
         try:
-            end_dt = datetime.now(timezone.utc)
-            start_dt = end_dt - timedelta(days=days_back)
+            now = datetime.now(timezone.utc)
+            start_history = now - timedelta(days=days_back)
 
-            start_ts = int(start_dt.timestamp())
-            end_ts = int(end_dt.timestamp())
+            # Chunking loop: process 1 day at a time
+            chunk_size = timedelta(days=1)
+            current_start = start_history
 
-            logger.info(f"Fetching data from {start_dt} to {end_dt}")
+            while current_start < now:
+                current_end = min(current_start + chunk_size, now)
 
-            # 1. Fetch Index History
-            index_history = await self.get_index_history("BTCUSD", start_ts, end_ts)
-            if not index_history:
-                logger.warning("No index history found. Exiting.")
-                return
+                start_ts = int(current_start.timestamp())
+                end_ts = int(current_end.timestamp())
 
-            logger.info(f"Processing {len(index_history)} index points.")
+                logger.info(f"Processing chunk: {current_start} to {current_end}")
 
-            likely_expiries = self._generate_expirations(
-                start_dt, end_dt + timedelta(days=60)
-            )  # Look ahead for expiries
-
-            metrics_batch = []
-
-            for point in index_history:
-                # Handle list [ts, o, h, l, c, v] or dict
-                if isinstance(point, list):
-                    ts = point[0]
-                    price = float(point[4])
-                else:
-                    ts = point.get("time")
-                    price = float(point.get("close", 0))
-
-                if not ts:
-                    continue
-                if price <= 0:
+                # 1. Fetch Index History for chunk
+                index_history = await self.get_index_history("BTCUSD", start_ts, end_ts)
+                if not index_history:
+                    logger.warning(
+                        f"No index history for chunk {current_start}. Skipping."
+                    )
+                    current_start += chunk_size
                     continue
 
-                # Check timeframe logic: We need an expiry ~30 days out
-                current_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-                target_dte = 30
-
-                # Find closest expiry to 30 days
-                target_date = current_dt + timedelta(days=target_dte)
-                valid_expiries = [e for e in likely_expiries if e > current_dt]
-                if not valid_expiries:
-                    continue
-
-                best_expiry = min(
-                    valid_expiries, key=lambda x: abs((x - target_date).days)
+                likely_expiries = self._generate_expirations(
+                    current_start, current_end + timedelta(days=60)
                 )
 
-                # Identify ATM Strike (Round to nearest 1000 for BTC)
-                strike = round(price / 1000) * 1000
+                # 2. Identify unique pairs needed for this chunk
+                unique_pairs = set()
+                index_map = {}  # ts -> price
 
-                # Construct Instrument Names
-                # Spec Format: BTC-{DDMMMYY}-{STRIKE}-{C/P}
-                exp_str = self._format_date_thalex(best_expiry)
-                call_name = f"BTC-{exp_str}-{strike}-C"
-                put_name = f"BTC-{exp_str}-{strike}-P"
+                for point in index_history:
+                    if isinstance(point, list):
+                        ts = point[0]
+                        price = float(point[4])
+                    else:
+                        ts = point.get("time")
+                        price = float(point.get("close", 0))
 
-                # Note: This is request-heavy (N * 2 requests per hour).
-                # Optimization: Fetch full history for likely ATM candidates once and cache?
-                # For this script, we'll do naive loop but limit concurrency or batching if needed.
-                # To avoid spamming, let's gather all unique instrument names first?
-                # No, we need time-point alignment.
-                # Actually, fetching history for one instrument returns array.
-                # So we can fetch history for likely instruments ONCE.
-                pass  # Logic refined below
+                    if not ts or price <= 0:
+                        continue
 
-            # OPTIMIZED APPROACH:
-            # 1. Identify all (Expiry, Strike) pairs needed across the timeframe.
-            unique_pairs = set()
-            for point in index_history:
-                if isinstance(point, list):
-                    ts = point[0]
-                    price = float(point[4])
-                else:
-                    ts = point.get("time")
-                    price = float(point.get("close", 0))
+                    index_map[ts] = price
 
-                if not ts:
-                    continue
-                current_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-                target_date = current_dt + timedelta(days=30)
-                valid_expiries = [e for e in likely_expiries if e > current_dt]
-                if not valid_expiries:
-                    continue
-                best_expiry = min(
-                    valid_expiries, key=lambda x: abs((x - target_date).days)
-                )
-                strike = round(price / 1000) * 1000
-                unique_pairs.add((best_expiry, strike))
+                    current_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+                    target_date = current_dt + timedelta(days=30)
+                    valid_expiries = [e for e in likely_expiries if e > current_dt]
+                    if not valid_expiries:
+                        continue
+                    best_expiry = min(
+                        valid_expiries, key=lambda x: abs((x - target_date).days)
+                    )
+                    strike = round(price / 1000) * 1000
+                    unique_pairs.add((best_expiry, strike))
 
-            logger.info(f"identified {len(unique_pairs)} unique option pairs to fetch.")
+                logger.info(f"Chunk needs {len(unique_pairs)} instrument pairs.")
 
-            # 2. Fetch History for each pair
-            instrument_data = {}  # Map name -> history_dict_by_ts
+                # 3. Fetch Instrument History concurrently
+                instrument_data = {}
 
-            for expiry, strike in unique_pairs:
-                exp_str = self._format_date_thalex(expiry)
-                for kind in ["C", "P"]:
-                    # Name format check: OBTCUSD vs BTC
-                    # User spec says OBTCUSD.
-                    instr_name = f"BTC-{exp_str}-{strike}-{kind}"
+                tasks = []
+                for expiry, strike in unique_pairs:
+                    exp_str = self._format_date_thalex(expiry)
+                    for kind in ["C", "P"]:
+                        instr_name = f"BTC-{exp_str}-{strike}-{kind}"
+                        tasks.append(
+                            (
+                                instr_name,
+                                self.get_mark_history(instr_name, start_ts, end_ts),
+                            )
+                        )
 
-                    hist = await self.get_mark_history(instr_name, start_ts, end_ts)
+                # Limit concurrency
+                semaphore = asyncio.Semaphore(10)
+
+                async def fetch_safe(name, coro):
+                    async with semaphore:
+                        return name, await coro
+
+                results = await asyncio.gather(*(fetch_safe(n, c) for n, c in tasks))
+
+                for name, hist in results:
                     if hist:
                         # Convert to dict for fast lookup: ts -> list data
                         data_map = (
@@ -220,114 +237,88 @@ class HistoricalOptionsLoader:
                             if isinstance(hist[0], list)
                             else {h["time"]: h for h in hist}
                         )
-                        instrument_data[instr_name] = data_map
-                    else:
-                        logger.warning(f"No history for {instr_name}")
+                        instrument_data[name] = data_map
 
-            # 3. Join Data
-            count = 0
-            for point in index_history:
-                if isinstance(point, list):
-                    ts = point[0]
-                    price = float(point[4])
-                else:
-                    ts = point.get("time")
-                    price = float(point.get("close", 0))
+                # 4. Correlate and Prepare Batch Inserts
+                metrics_to_insert = []
+                tickers_to_insert = []
 
-                if not ts:
-                    continue
+                for ts, price in index_map.items():
+                    current_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
 
-                current_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-                valid_expiries = [e for e in likely_expiries if e > current_dt]
-                if not valid_expiries:
-                    continue
-                best_expiry = min(
-                    valid_expiries,
-                    key=lambda x: abs((x - (current_dt + timedelta(days=30))).days),
-                )
-                strike = round(price / 1000) * 1000
-
-                exp_str = self._format_date_thalex(best_expiry)
-                call_name = f"BTC-{exp_str}-{strike}-C"
-                put_name = f"BTC-{exp_str}-{strike}-P"
-
-                c_data = instrument_data.get(call_name, {}).get(ts)
-                p_data = instrument_data.get(put_name, {}).get(ts)
-
-                if c_data and p_data:
-                    c_mark = (
-                        float(c_data[4])
-                        if isinstance(c_data, list)
-                        else float(c_data.get("close", 0))
+                    # Logic match
+                    valid_expiries = [e for e in likely_expiries if e > current_dt]
+                    if not valid_expiries:
+                        continue
+                    best_expiry = min(
+                        valid_expiries,
+                        key=lambda x: abs((x - (current_dt + timedelta(days=30))).days),
                     )
-                    p_mark = (
-                        float(p_data[4])
-                        if isinstance(p_data, list)
-                        else float(p_data.get("close", 0))
-                    )
-                    straddle = c_mark + p_mark
-                    days_to_expiry = (best_expiry - current_dt).days
+                    strike = round(price / 1000) * 1000
 
-                    # Store metrics
-                    # time, underlying, strike, expiry_date, days_to_expiry, call_mark, put_mark, straddle, iv, em
-                    self.save_metric(
-                        ts=datetime.fromtimestamp(ts, tz=timezone.utc),
-                        underlying="BTC",
-                        strike=strike,
-                        expiry=best_expiry.date(),
-                        dte=days_to_expiry,
-                        c_mark=c_mark,
-                        p_mark=p_mark,
-                        straddle=straddle,
-                        # IV might not be in OHLCV, assumes approx or missing
-                        iv=0.0,
-                        em_pct=straddle / price if price > 0 else 0,
-                    )
-                    # Also save to market_tickers for simulation baseline
-                    self.save_ticker_metric(
-                        ts=datetime.fromtimestamp(ts, tz=timezone.utc),
-                        symbol="BTC-PERP",
-                        bid=price - 0.5,  # Mock tight spread
-                        ask=price + 0.5,
-                        last=price,
-                    )
-                    count += 1
+                    exp_str = self._format_date_thalex(best_expiry)
+                    call_name = f"BTC-{exp_str}-{strike}-C"
+                    put_name = f"BTC-{exp_str}-{strike}-P"
 
-            logger.info(f"Successfully processed {count} records.")
+                    c_data = instrument_data.get(call_name, {}).get(ts)
+                    p_data = instrument_data.get(put_name, {}).get(ts)
+
+                    if c_data and p_data:
+                        c_mark = (
+                            float(c_data[4])
+                            if isinstance(c_data, list)
+                            else float(c_data.get("close", 0))
+                        )
+                        p_mark = (
+                            float(p_data[4])
+                            if isinstance(p_data, list)
+                            else float(p_data.get("close", 0))
+                        )
+                        straddle = c_mark + p_mark
+                        days_to_expiry = (best_expiry - current_dt).days
+                        em_pct = straddle / price if price > 0 else 0
+
+                        metrics_to_insert.append(
+                            (
+                                datetime.fromtimestamp(ts, tz=timezone.utc),
+                                "BTC",
+                                strike,
+                                best_expiry.date(),
+                                days_to_expiry,
+                                c_mark,
+                                p_mark,
+                                straddle,
+                                0.0,  # IV
+                                em_pct,
+                            )
+                        )
+
+                        tickers_to_insert.append(
+                            (
+                                datetime.fromtimestamp(ts, tz=timezone.utc),
+                                "BTC-PERP",
+                                price - 0.5,
+                                price + 0.5,
+                                price,
+                            )
+                        )
+
+                # Batch Insert
+                self.batch_insert_metrics(metrics_to_insert)
+                self.batch_insert_tickers(tickers_to_insert)
+
+                logger.info(f"Inserted {len(metrics_to_insert)} records for chunk.")
+                current_start += chunk_size
+                # Be nice to API
+                await asyncio.sleep(0.5)
 
         except Exception as e:
             logger.error(f"Loader failed: {e}", exc_info=True)
         finally:
             await self.session.close()
 
-    def save_metric(
-        self, ts, underlying, strike, expiry, dte, c_mark, p_mark, straddle, iv, em_pct
-    ):
-        cursor = self.conn.cursor()
-        cursor.execute(
-            """
-            INSERT INTO options_live_metrics 
-            (time, underlying, strike, expiry_date, days_to_expiry, call_mark_price, put_mark_price, straddle_price, implied_vol, expected_move_pct)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT DO NOTHING
-            """,
-            (ts, underlying, strike, expiry, dte, c_mark, p_mark, straddle, iv, em_pct),
-        )
-        self.conn.commit()
-
-    def save_ticker_metric(self, ts, symbol, bid, ask, last):
-        cursor = self.conn.cursor()
-        cursor.execute(
-            """
-            INSERT INTO market_tickers (time, symbol, bid, ask, last, volume)
-            VALUES (%s, %s, %s, %s, %s, 0)
-            ON CONFLICT DO NOTHING
-            """,
-            (ts, symbol, bid, ask, last),
-        )
-        self.conn.commit()
-
 
 if __name__ == "__main__":
     loader = HistoricalOptionsLoader()
-    asyncio.run(loader.run(days_back=7))
+    # Run for 30 days backfill
+    asyncio.run(loader.run(days_back=30))
