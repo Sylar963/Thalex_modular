@@ -57,3 +57,4 @@ Used for real-time market data caching, discovery spreads, and serving the Svelt
 
 ---
 *This document is a living record of project directives and should be updated as the roadmap evolves.*
+DONT COMMENT WHILE WRITING CODE*
