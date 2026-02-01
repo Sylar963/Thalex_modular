@@ -86,7 +86,12 @@ class RiskManager(ABC):
     """Abstract interface for risk management."""
 
     @abstractmethod
-    def validate_order(self, order: Order, position: Position) -> bool:
+    def validate_order(
+        self,
+        order: Order,
+        position: Position,
+        active_orders: Optional[List[Order]] = None,
+    ) -> bool:
         """Check if an order is safe to place."""
         pass
 

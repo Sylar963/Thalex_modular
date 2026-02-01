@@ -69,6 +69,10 @@ class AvellanedaStoikovStrategy(Strategy):
         self.recalc_interval = 0.1
         self.last_recalc_time = 0
 
+        # Multi-level params
+        self.quote_levels = 2
+        self.level_spacing_factor = 0.5  # Fraction of spread to add for next level
+
     def setup(self, config: Dict[str, Any]):
         """Initialize strategy parameters from configuration dictionary."""
         # Extract Avellaneda specific config
@@ -79,6 +83,9 @@ class AvellanedaStoikovStrategy(Strategy):
         self.position_limit = config.get("position_limit", 1.0)
         self.order_size = config.get("order_size", 0.001)
         self.min_spread_ticks = config.get("min_spread", 20)
+
+        self.quote_levels = config.get("quote_levels", 2)
+        self.level_spacing_factor = config.get("level_spacing_factor", 0.5)
 
         # Heuristic Params
         self.base_spread_factor = av_config.get("base_spread_factor", 1.0)
@@ -220,36 +227,65 @@ class AvellanedaStoikovStrategy(Strategy):
             bid_price = self._round_to_tick(center - hard_min / 2)
             ask_price = self._round_to_tick(center + hard_min / 2)
 
-        # --- 5. Order Generation ---
+        # --- 5. Order Generation (Multi-Level) ---
         orders = []
 
-        # Bid
-        if current_pos < self.position_limit:
-            orders.append(
-                Order(
-                    id=f"bid_{int(timestamp * 1000)}",
-                    symbol=ticker.symbol,
-                    side=OrderSide.BUY,
-                    type=OrderType.LIMIT,
-                    price=bid_price,
-                    size=self.order_size,
-                    timestamp=timestamp,
-                )
-            )
+        half_fee_cover = fee_coverage_spread / 2.0
 
-        # Ask
-        if current_pos > -self.position_limit:
-            orders.append(
-                Order(
-                    id=f"ask_{int(timestamp * 1000)}",
-                    symbol=ticker.symbol,
-                    side=OrderSide.SELL,
-                    type=OrderType.LIMIT,
-                    price=ask_price,
-                    size=self.order_size,
-                    timestamp=timestamp,
+        # Calculate levels
+        # Base Prices (Level 0)
+        bid_l0 = bid_price
+        ask_l0 = ask_price
+
+        # Spacing logic: Add fraction of FINAL spread
+        level_step = final_spread * self.level_spacing_factor
+
+        for i in range(self.quote_levels):
+            # Bid Logic
+            if current_pos < self.position_limit:
+                # Level i
+                p_bid = bid_l0 - (i * level_step)
+                p_bid = self._round_to_tick(p_bid)
+
+                # Check minimal profitability (distance from mid)
+                # If skew is extreme, we might bid above mid? (Not with our skew logic)
+                # But just in case:
+                if mid_price - p_bid < half_fee_cover:
+                    # Too close to mid (or crossed), clamp it
+                    p_bid = self._round_to_tick(mid_price - half_fee_cover)
+
+                orders.append(
+                    Order(
+                        id=f"bid_{i}_{int(timestamp * 1000)}",
+                        symbol=ticker.symbol,
+                        side=OrderSide.BUY,
+                        type=OrderType.LIMIT,
+                        price=p_bid,
+                        size=self.order_size,
+                        timestamp=timestamp,
+                    )
                 )
-            )
+
+            # Ask Logic
+            if current_pos > -self.position_limit:
+                # Level i
+                p_ask = ask_l0 + (i * level_step)
+                p_ask = self._round_to_tick(p_ask)
+
+                if p_ask - mid_price < half_fee_cover:
+                    p_ask = self._round_to_tick(mid_price + half_fee_cover)
+
+                orders.append(
+                    Order(
+                        id=f"ask_{i}_{int(timestamp * 1000)}",
+                        symbol=ticker.symbol,
+                        side=OrderSide.SELL,
+                        type=OrderType.LIMIT,
+                        price=p_ask,
+                        size=self.order_size,
+                        timestamp=timestamp,
+                    )
+                )
 
         return orders
 

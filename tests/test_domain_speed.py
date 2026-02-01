@@ -22,7 +22,7 @@ class TestAvellaneda(unittest.TestCase):
         end = time.time()
         print(f"Checking JIT compilation lag: {(end - start) * 1000:.2f}ms")
 
-        self.assertEqual(len(orders), 2)
+        self.assertEqual(len(orders), 4)
         bid = orders[0]
         ask = orders[1]
 

@@ -46,8 +46,11 @@ class QuotingService:
         self.market_state = MarketState()
         self.position = Position("", 0.0, 0.0)
         self.active_orders: Dict[
-            OrderSide, Order
-        ] = {}  # Side -> Order (Assuming simple 1-level quoting)
+            OrderSide, List[Order]
+        ] = {
+            OrderSide.BUY: [],
+            OrderSide.SELL: [],
+        }  # Side -> List[Order]
         self.running = False
         self.tick_size = 1.0  # From logs, tick for BTC-PERPETUAL is 1
         self._reconcile_lock = asyncio.Lock()
@@ -130,11 +133,20 @@ class QuotingService:
                 desired_orders[i] = replace(o, price=rounded_price)
 
         # 4. Risk Validation
-        valid_orders = [
-            o
-            for o in desired_orders
-            if self.risk_manager.validate_order(o, self.position)
-        ]
+        valid_orders = []
+        for o in desired_orders:
+            # We validate against the orders we have already accepted for this cycle
+            # This ensures the TOTAL set of orders + position is within limits
+            if self.risk_manager.validate_order(o, self.position, active_orders=valid_orders):
+                valid_orders.append(o)
+            else:
+                logger.warning(f"Risk Manager rejected order: {o}")
+
+        # Observability Log
+        if self.running:
+             # Just a periodic summary or if things change?
+             # For now, log the target vs active count
+             pass
 
         # 5. Execution (Diff against active orders)
         # Use a lock to prevent concurrent reconciliation on fast tickers
@@ -154,62 +166,111 @@ class QuotingService:
     async def _reconcile_orders(self, desired_orders: List[Order]):
         """
         Diff desired orders against active orders and execute changes.
-        Optimized for margin: cancel all necessary sides in parallel FIRST, then place new ones.
+        Optimized for margin: cancel all unnecessary/moved orders FIRST, then place new ones.
         """
-        desired_by_side = {o.side: o for o in desired_orders}
+        desired_by_side = {OrderSide.BUY: [], OrderSide.SELL: []}
+        for o in desired_orders:
+            desired_by_side[o.side].append(o)
+
         to_cancel = []
         to_place = []
 
-        # 1. Identify what needs to be cancelled vs placed
+        # 1. Identify diff per side
         for side in [OrderSide.BUY, OrderSide.SELL]:
-            desired = desired_by_side.get(side)
-            active = self.active_orders.get(side)
+            desired_list = desired_by_side.get(side, [])
+            active_list = self.active_orders.get(side, [])
 
-            if desired and active:
-                if (
-                    abs(desired.price - active.price) < 1e-9
-                    and abs(desired.size - active.size) < 1e-9
-                ):
-                    continue  # side is ok
+            # Simple diff strategy:
+            # Match strictly by price and size. 
+            # Anything in Active NOT in Desired -> Cancel
+            # Anything in Desired NOT in Active -> Place
+            
+            # We need to match objects. 
+            # Let's map active orders by "signature" (price, size)
+            # Warning: Float comparison needs tolerance
+            
+            active_map = [] # List of (order, is_matched)
+            for act in active_list:
+                active_map.append({"order": act, "matched": False})
+                
+            desired_to_place_indices = []
+            
+            for i, des in enumerate(desired_list):
+                found = False
+                for j, item in enumerate(active_map):
+                    if item["matched"]:
+                        continue
+                    act = item["order"]
+                    if (
+                        abs(des.price - act.price) < 1e-9
+                        and abs(des.size - act.size) < 1e-9
+                    ):
+                        # Match found, keep it
+                        active_map[j]["matched"] = True
+                        found = True
+                        break
+                
+                if not found:
+                    desired_to_place_indices.append(i)
+            
+            # Collect cancels
+            for item in active_map:
+                if not item["matched"]:
+                    to_cancel.append((side, item["order"].exchange_id))
+            
+            # Collect places
+            for i in desired_to_place_indices:
+                to_place.append((side, desired_list[i]))
 
-                # Update needed
-                to_cancel.append((side, active.exchange_id))
-                to_place.append((side, desired))
-
-            elif desired and not active:
-                to_place.append((side, desired))
-
-            elif not desired and active:
-                to_cancel.append((side, active.exchange_id))
+        # Logging for Observability
+        if to_cancel or to_place:
+            logger.info(f"Reconcile: Cancelling {len(to_cancel)}, Placing {len(to_place)} (Active: {sum(len(l) for l in self.active_orders.values())})")
 
         # 2. Cancel ALL required sides in parallel to free up margin fast
         if to_cancel:
-            cancel_tasks = [self.gateway.cancel_order(eid) for side, eid in to_cancel]
-            results = await asyncio.gather(*cancel_tasks, return_exceptions=True)
-            for (side, eid), res in zip(to_cancel, results):
-                if isinstance(res, Exception):
-                    logger.error(f"Error cancelling {side} order {eid}: {res}")
-                # Even if cancel failed (e.g. already filled), we remove from active
-                if side in self.active_orders:
-                    del self.active_orders[side]
+            cancel_tasks = [self.gateway.cancel_order(eid) for side, eid in to_cancel if eid]
+            if cancel_tasks:
+                results = await asyncio.gather(*cancel_tasks, return_exceptions=True)
+                for (side, eid), res in zip(to_cancel, results):
+                    if isinstance(res, Exception):
+                        logger.error(f"Error cancelling {side} order {eid}: {res}")
+            
+            # Remove from active_orders immediately (optimistic/authoritative)
+            # We need to rebuild the active lists without the cancelled ones
+            ids_to_remove = set(eid for side, eid in to_cancel)
+            for side in [OrderSide.BUY, OrderSide.SELL]:
+                self.active_orders[side] = [
+                    o for o in self.active_orders[side] 
+                    if o.exchange_id not in ids_to_remove
+                ]
 
         # 3. Place new orders
-        for side, desired in to_place:
-            new_order = await self.gateway.place_order(desired)
-            if new_order.status != OrderStatus.REJECTED:
-                self.active_orders[side] = new_order
-            else:
-                # If placement failed, ensure we don't think it's still active
-                if side in self.active_orders:
-                    del self.active_orders[side]
+        # We can also do this in parallel per side or globally? Globally is faster.
+        if to_place:
+            place_tasks = [self.gateway.place_order(desired) for side, desired in to_place]
+            results = await asyncio.gather(*place_tasks, return_exceptions=True)
+            
+            for (side, desired), res in zip(to_place, results):
+                if isinstance(res, Exception):
+                     logger.error(f"Error placing {side} order {desired}: {res}")
+                elif isinstance(res, Order):
+                     # Update status
+                     if res.status != OrderStatus.REJECTED:
+                         self.active_orders[side].append(res)
 
     async def _cancel_all(self):
-        sides = list(self.active_orders.keys())
-        for side in sides:
-            order = self.active_orders[side]
-            if order.exchange_id:
-                await self.gateway.cancel_order(order.exchange_id)
-            del self.active_orders[side]
+        all_active = []
+        for side, orders in self.active_orders.items():
+            all_active.extend(orders)
+        
+        if not all_active:
+            return
+
+        tasks = [self.gateway.cancel_order(o.exchange_id) for o in all_active if o.exchange_id]
+        await asyncio.gather(*tasks, return_exceptions=True)
+        
+        self.active_orders[OrderSide.BUY] = []
+        self.active_orders[OrderSide.SELL] = []
 
     async def _sync_active_orders(self):
         """Ensure active_orders only contains orders that still exist on exchange."""
@@ -220,15 +281,29 @@ class QuotingService:
                 continue
 
             # Check gateway's view
-            current = self.gateway.orders.get(order.exchange_id)
-            if current and current.status not in [
-                OrderStatus.OPEN,
-                OrderStatus.PENDING,
-            ]:
-                logger.info(
-                    f"Active order {order.exchange_id} ({side}) is now {current.status}. Removing."
-                )
-                del self.active_orders[side]
+            # Filter the list
+            valid_orders = []
+            for order in self.active_orders[side]:
+                if not order.exchange_id:
+                    continue
+                    
+                current = self.gateway.orders.get(order.exchange_id)
+                if current and current.status not in [
+                    OrderStatus.OPEN,
+                    OrderStatus.PENDING,
+                ]:
+                    logger.info(
+                        f"Active order {order.exchange_id} ({side}) is now {current.status}. Removing."
+                    )
+                elif not current:
+                     # e.g. reconnect
+                     # Keep it or assume lost? For robustness, if gateway completely lost it, we might want to cancel/forget.
+                     # But for now let's assume valid.
+                     valid_orders.append(order)
+                else:
+                    valid_orders.append(order)
+            
+            self.active_orders[side] = valid_orders
             elif not current:
                 # This could happen if we reconnected and lost local cache.
                 pass

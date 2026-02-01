@@ -77,14 +77,17 @@ async def main():
             "gamma": 0.5,
             "kappa": 2.0,
             "volatility": 0.05,
-            "position_limit": 5.0,
+            "position_limit": 0.01,  # Reduced for safety
             "base_spread": 0.001,
+            "quote_levels": 2,  # 2 levels per side = 4 orders
+            "level_spacing_factor": 0.5,
+            "order_size": 0.001,
         }
     )
 
     signal_engine = VolumeCandleSignalEngine(volume_threshold=10.0, max_candles=50)
 
-    risk_manager = BasicRiskManager(max_position=10.0, max_order_size=1.0)
+    risk_manager = BasicRiskManager(max_position=0.01, max_order_size=0.001)
 
     # 3. Service Assembly
     service = QuotingService(
