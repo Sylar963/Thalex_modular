@@ -2,12 +2,13 @@ import asyncio
 import logging
 import json
 import time
-from typing import Dict, List, Optional, Callable
+import os
+from typing import Dict, Optional, Callable
 from dataclasses import replace
 
 # Native Thalex client
 try:
-    from thalex.thalex import Thalex, Network, Direction, OrderType as ThOrderType
+    from thalex.thalex import Thalex, Network, OrderType as ThOrderType
 except ImportError:
     # Fail fast if lib missing
     raise ImportError("Thalex package not found. Ensure 'thalex' is in PYTHONPATH.")

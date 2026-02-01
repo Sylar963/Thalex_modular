@@ -1,8 +1,6 @@
 import asyncpg
 import logging
-import json
-import time
-from typing import List, Optional
+from typing import List, Optional, Dict
 from ...domain.interfaces import StorageGateway
 from ...domain.entities import Ticker, Trade, Position
 
@@ -254,7 +252,7 @@ class TimescaleDBAdapter(StorageGateway):
                 # For this implementation, let's use market_trades for OHLCV.
 
                 rows = await conn.fetch(
-                    f"""
+                    """
                     SELECT
                         time_bucket($1, time) AS bucket,
                         FIRST(price, time) as open,
