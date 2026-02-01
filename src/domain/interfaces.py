@@ -123,3 +123,10 @@ class StorageGateway(ABC):
     async def get_recent_tickers(self, symbol: str, limit: int = 100) -> List[Ticker]:
         """Retrieve recent ticker history."""
         pass
+
+    @abstractmethod
+    async def get_history(
+        self, symbol: str, start: float, end: float, resolution: str
+    ) -> List[Dict]:
+        """Retrieve OHLCV history."""
+        pass
