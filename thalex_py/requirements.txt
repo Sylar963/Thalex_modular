@@ -1,7 +1,0 @@
-cffi==1.17.1
-cryptography==44.0.1
-numpy==2.2.2
-pycparser==2.22
-PyJWT==2.10.1
-thalex==1.0.1
-websockets==14.2
