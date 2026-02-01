@@ -161,3 +161,46 @@ python start_quoter.py --gamma 0.15 --levels 5
 # Launch dashboard
 python dashboard/monitor.py
 ```
+
+## Version Control & Release Workflow
+
+**CRITICAL MANDATE: Every push to main MUST be tagged.**
+
+This project follows a strict versioning discipline:
+
+### Branch Workflow
+1. **Development happens on `MFT-dev` branch** - all feature work, bug fixes, and refactors
+2. **`main` branch is the release branch** - only fast-forward merges from `MFT-dev` are allowed
+3. **Never commit directly to `main`** - always go through `MFT-dev` first
+
+### Tagging Requirements (MANDATORY)
+After any merge to `main`, you MUST create and push a version tag:
+
+```bash
+# After merging MFT-dev to main
+git checkout main
+git merge MFT-dev --ff-only
+
+# Create annotated tag (REQUIRED)
+git tag -a v0.X.Y -m "Release v0.X.Y: Brief description of changes"
+
+# Push both branch and tag
+git push origin main
+git push origin v0.X.Y
+```
+
+### Version Format
+- **Alpha releases:** `v0.1.0-alpha`, `v0.1.0-alpha.2`
+- **Beta releases:** `v0.2.0-beta`
+- **Stable releases:** `v0.3.0`, `v1.0.0`
+- **Hotfixes:** `v0.3.1`, `v0.3.2`
+
+### Tag Checklist (Enforced)
+Before completing any task involving main branch updates:
+- [ ] Changes committed to `MFT-dev`
+- [ ] `MFT-dev` pushed to origin
+- [ ] Fast-forward merge to `main` completed
+- [ ] Version tag created with descriptive message
+- [ ] Tag pushed to origin
+
+**WARNING: Untagged commits on main are considered incomplete and violate project standards.**
