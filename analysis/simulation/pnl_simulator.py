@@ -21,7 +21,7 @@ class PNLSimulator:
     ):
         self.strategy = strategy
         self.regime_detector = regime_detector
-        self.tracker = PositionTracker("SIM", "BTC-PERP")
+        self.tracker = PositionTracker()
         self.history: List[Dict] = []
         self.db_conn = None
 
@@ -83,22 +83,29 @@ class PNLSimulator:
             regime = self.regime_detector.update(market_state)
 
             # 3. Get Quotes
-            position = self.tracker.get_position()
+            position = self.tracker.current_position
             orders = self.strategy.calculate_quotes(
                 market_state, position, regime=regime
             )
 
             # 5. Simulate Fills (Simple assumption: if price crosses quote)
-            # This is a simplification; a real backtest needs more complex matching
             self._simulate_execution(orders, ticker)
 
             # 6. Record State
+            unrealized = 0.0
+            if (
+                self.tracker.average_entry_price
+                and abs(self.tracker.current_position) > 1e-6
+            ):
+                unrealized = (
+                    ticker.mid_price - self.tracker.average_entry_price
+                ) * self.tracker.current_position
+
             self.history.append(
                 {
-                    "timestamp": row["timestamp"],
+                    "timestamp": row["time"],
                     "mid_price": ticker.mid_price,
-                    "pnl": self.tracker.realized_pnl
-                    + self.tracker.unrealized_pnl(ticker.mid_price),
+                    "pnl": self.tracker.realized_pnl + unrealized,
                     "position": self.tracker.current_position,
                     "regime": regime.name,
                     "expected_move": regime.expected_move,
@@ -124,16 +131,19 @@ class PNLSimulator:
 
             if filled:
                 fill = Fill(
-                    id="sim_fill",
                     order_id=order.id,
-                    symbol=order.symbol,
-                    side=order.side,
-                    price=fill_price,
-                    size=order.size,
-                    fee=0.0,  # Ignore fees for now
-                    timestamp=ticker.timestamp,
+                    fill_price=fill_price,
+                    fill_size=order.size,
+                    fill_time=ticker.timestamp,
+                    side=order.side.value
+                    if hasattr(order.side, "value")
+                    else order.side,
                 )
                 self.tracker.update_on_fill(fill)
+
+    def generate_report(self) -> pd.DataFrame:
+        """Returns a DataFrame of the simulation history."""
+        return pd.DataFrame(self.history)
 
     def analyze_patterns(self) -> Dict[str, Any]:
         """
