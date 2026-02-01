@@ -41,13 +41,13 @@ def main():
     try:
         sim.connect_db(password="password")
 
-        # Load last 1 hour of data for testing
-        end_date = datetime.utcnow()
-        start_date = end_date - timedelta(hours=1)
+        # Load Jan 25 - Jan 30 data for testing
+        start_date = "2026-01-25 08:00:00"
+        end_date = "2026-01-30 17:00:00"
 
         market_data = sim.load_data(
-            start_date=start_date.strftime("%Y-%m-%d %H:%M:%S"),
-            end_date=end_date.strftime("%Y-%m-%d %H:%M:%S"),
+            start_date=start_date,
+            end_date=end_date,
         )
 
         if market_data.empty:
@@ -74,8 +74,8 @@ def main():
         for em_bin, impact in report["expected_move_impact"].items():
             print(f"  {em_bin}: Total PNL={impact:.4f}")
 
-    except Exception as e:
-        logger.error(f"Simulation failed: {e}")
+    except Exception:
+        logger.exception("Simulation failed")
 
 
 if __name__ == "__main__":

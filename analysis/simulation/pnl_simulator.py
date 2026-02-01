@@ -5,7 +5,7 @@ import logging
 
 from src.domain.strategies.avellaneda import AvellanedaStoikovStrategy
 from src.domain.tracking.position_tracker import PositionTracker, Fill
-from src.domain.entities import MarketState, Ticker, Order, OrderSide
+from src.domain.entities import MarketState, Ticker, Order, OrderSide, Position
 from src.domain.market.regime_detector import RegimeDetector
 
 logger = logging.getLogger(__name__)
@@ -83,9 +83,14 @@ class PNLSimulator:
             regime = self.regime_detector.update(market_state)
 
             # 3. Get Quotes
-            position = self.tracker.current_position
+            pos_obj = Position(
+                symbol="BTC-PERP",
+                size=self.tracker.current_position,
+                entry_price=self.tracker.average_entry_price or 0.0,
+                timestamp=row["time"].timestamp(),
+            )
             orders = self.strategy.calculate_quotes(
-                market_state, position, regime=regime
+                market_state, pos_obj, regime=regime
             )
 
             # 5. Simulate Fills (Simple assumption: if price crosses quote)
@@ -119,6 +124,9 @@ class PNLSimulator:
         Checks if orders would be filled against the current ticker.
         """
         for order in orders:
+            if not hasattr(order, "side"):
+                logger.error(f"Expected Order object, got {type(order)}: {order}")
+                continue
             filled = False
             fill_price = 0.0
 

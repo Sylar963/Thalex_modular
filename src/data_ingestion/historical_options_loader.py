@@ -283,6 +283,14 @@ class HistoricalOptionsLoader:
                         iv=0.0,
                         em_pct=straddle / price if price > 0 else 0,
                     )
+                    # Also save to market_tickers for simulation baseline
+                    self.save_ticker_metric(
+                        ts=datetime.fromtimestamp(ts, tz=timezone.utc),
+                        symbol="BTC-PERP",
+                        bid=price - 0.5,  # Mock tight spread
+                        ask=price + 0.5,
+                        last=price,
+                    )
                     count += 1
 
             logger.info(f"Successfully processed {count} records.")
@@ -304,6 +312,18 @@ class HistoricalOptionsLoader:
             ON CONFLICT DO NOTHING
             """,
             (ts, underlying, strike, expiry, dte, c_mark, p_mark, straddle, iv, em_pct),
+        )
+        self.conn.commit()
+
+    def save_ticker_metric(self, ts, symbol, bid, ask, last):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO market_tickers (time, symbol, bid, ask, last, volume)
+            VALUES (%s, %s, %s, %s, %s, 0)
+            ON CONFLICT DO NOTHING
+            """,
+            (ts, symbol, bid, ask, last),
         )
         self.conn.commit()
 
