@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+from dataclasses import replace
 from typing import List, Optional, Dict
 from ..domain.interfaces import (
     ExchangeGateway,
@@ -48,7 +49,8 @@ class QuotingService:
             OrderSide, Order
         ] = {}  # Side -> Order (Assuming simple 1-level quoting)
         self.running = False
-        self.tick_size = 0.5  # Default, should update from symbol info
+        self.tick_size = 1.0  # From logs, tick for BTC-PERPETUAL is 1
+        self._reconcile_lock = asyncio.Lock()
 
     async def start(self, symbol: str):
         self.symbol = symbol
@@ -89,7 +91,7 @@ class QuotingService:
         # 1. Update Internal State
         self.market_state.ticker = ticker
         self.market_state.timestamp = ticker.timestamp
-        self.tick_size = 0.5  # TODO: Fetch from config or instrument info
+        # tick_size remains 1.0 for now, could be dynamic later
 
         # Refresh position from local cache of adapter (fast)
         self.position = await self.gateway.get_position(self.symbol)
@@ -97,6 +99,13 @@ class QuotingService:
         # Update Signals
         self.signal_engine.update(ticker)
         self.market_state.signals = self.signal_engine.get_signals()
+
+        # Update order list from gateway periodically or on significant price move
+        # For now, let's just make sure we don't have stale orders
+        # If the user cancels manually, the exchange will eventually notify us or we'll find out here
+        # Actually, the adapter should update self.orders when it receives cancellations.
+        # But we need to sync self.active_orders.
+        await self._sync_active_orders()
 
         # Persist Data
         if self.storage:
@@ -113,6 +122,13 @@ class QuotingService:
             self.market_state, self.position
         )
 
+        # 3.1 Force Tick Alignment
+        for i in range(len(desired_orders)):
+            o = desired_orders[i]
+            if o.price:
+                rounded_price = round(o.price / self.tick_size) * self.tick_size
+                desired_orders[i] = replace(o, price=rounded_price)
+
         # 4. Risk Validation
         valid_orders = [
             o
@@ -121,7 +137,12 @@ class QuotingService:
         ]
 
         # 5. Execution (Diff against active orders)
-        await self._reconcile_orders(valid_orders)
+        # Use a lock to prevent concurrent reconciliation on fast tickers
+        if self._reconcile_lock.locked():
+            return
+
+        async with self._reconcile_lock:
+            await self._reconcile_orders(valid_orders)
 
     async def on_trade_update(self, trade):
         if not self.running:
@@ -133,44 +154,54 @@ class QuotingService:
     async def _reconcile_orders(self, desired_orders: List[Order]):
         """
         Diff desired orders against active orders and execute changes.
-        Assumes at most one order per side (simple MM).
+        Optimized for margin: cancel all necessary sides in parallel FIRST, then place new ones.
         """
         desired_by_side = {o.side: o for o in desired_orders}
+        to_cancel = []
+        to_place = []
 
-        # Sides to process: Buy and Sell
+        # 1. Identify what needs to be cancelled vs placed
         for side in [OrderSide.BUY, OrderSide.SELL]:
             desired = desired_by_side.get(side)
             active = self.active_orders.get(side)
 
             if desired and active:
-                # Compare functionality
-                # Tolerance check (avoid churn if price is close)
-                # But for MM, price exactness matters.
                 if (
                     abs(desired.price - active.price) < 1e-9
                     and abs(desired.size - active.size) < 1e-9
                 ):
-                    continue  # No change needed
+                    continue  # side is ok
 
-                # Update needed -> Cancel old, Place new
-                # (Ideally use 'amend_order' if supported)
-                await self.gateway.cancel_order(active.exchange_id)
-                new_order = await self.gateway.place_order(desired)
-                if new_order.status != OrderStatus.REJECTED:
-                    self.active_orders[side] = new_order
-                else:
-                    del self.active_orders[side]  # Failed to replace
+                # Update needed
+                to_cancel.append((side, active.exchange_id))
+                to_place.append((side, desired))
 
             elif desired and not active:
-                # Place new
-                new_order = await self.gateway.place_order(desired)
-                if new_order.status != OrderStatus.REJECTED:
-                    self.active_orders[side] = new_order
+                to_place.append((side, desired))
 
             elif not desired and active:
-                # Cancel existing
-                await self.gateway.cancel_order(active.exchange_id)
-                del self.active_orders[side]
+                to_cancel.append((side, active.exchange_id))
+
+        # 2. Cancel ALL required sides in parallel to free up margin fast
+        if to_cancel:
+            cancel_tasks = [self.gateway.cancel_order(eid) for side, eid in to_cancel]
+            results = await asyncio.gather(*cancel_tasks, return_exceptions=True)
+            for (side, eid), res in zip(to_cancel, results):
+                if isinstance(res, Exception):
+                    logger.error(f"Error cancelling {side} order {eid}: {res}")
+                # Even if cancel failed (e.g. already filled), we remove from active
+                if side in self.active_orders:
+                    del self.active_orders[side]
+
+        # 3. Place new orders
+        for side, desired in to_place:
+            new_order = await self.gateway.place_order(desired)
+            if new_order.status != OrderStatus.REJECTED:
+                self.active_orders[side] = new_order
+            else:
+                # If placement failed, ensure we don't think it's still active
+                if side in self.active_orders:
+                    del self.active_orders[side]
 
     async def _cancel_all(self):
         sides = list(self.active_orders.keys())
@@ -179,3 +210,25 @@ class QuotingService:
             if order.exchange_id:
                 await self.gateway.cancel_order(order.exchange_id)
             del self.active_orders[side]
+
+    async def _sync_active_orders(self):
+        """Ensure active_orders only contains orders that still exist on exchange."""
+        sides = list(self.active_orders.keys())
+        for side in sides:
+            order = self.active_orders[side]
+            if not order.exchange_id:
+                continue
+
+            # Check gateway's view
+            current = self.gateway.orders.get(order.exchange_id)
+            if current and current.status not in [
+                OrderStatus.OPEN,
+                OrderStatus.PENDING,
+            ]:
+                logger.info(
+                    f"Active order {order.exchange_id} ({side}) is now {current.status}. Removing."
+                )
+                del self.active_orders[side]
+            elif not current:
+                # This could happen if we reconnected and lost local cache.
+                pass

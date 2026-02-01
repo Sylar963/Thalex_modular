@@ -200,8 +200,23 @@ class ThalexAdapter(ExchangeGateway):
     async def subscribe_ticker(self, symbol: str):
         channel = f"ticker.{symbol}.raw"
         trade_channel = f"trades.{symbol}"
+        orders_channel = "orders"  # Account orders channel
 
-        logger.info(f"Subscribing to {channel} and {trade_channel}")
+        logger.info(f"Subscribing to {channel}, {trade_channel}, and {orders_channel}")
+        try:
+            # Note: orders is technically a private channel but 'public_subscribe' often handles both if session is auth'd on some exchanges.
+            # On Thalex, it's 'private/subscribe' for account-related things if following strict RPC.
+            # But the adapter has been using public_subscribe for ticker/trades.
+            # Let's check if we should use private/subscribe.
+            await self._rpc_request(
+                self.client.public_subscribe, channels=[channel, trade_channel]
+            )
+            # Try private subscribe for orders
+            await self._rpc_request(
+                self.client.private_subscribe, channels=[orders_channel]
+            )
+        except Exception as e:
+            logger.error(f"Subscription failed: {e}")
         try:
             # Verification for sub is nice too
             await self._rpc_request(
@@ -248,8 +263,8 @@ class ThalexAdapter(ExchangeGateway):
                     del self.pending_requests[msg_id]
                     continue
 
-                # Delegate processing
-                await self._process_message(msg)
+                # Delegate processing in background task to avoid blocking the loop (and RPC responses)
+                asyncio.create_task(self._process_message(msg))
 
             except asyncio.TimeoutError:
                 continue
@@ -258,8 +273,63 @@ class ThalexAdapter(ExchangeGateway):
                 await asyncio.sleep(1)
 
     async def _process_message(self, msg: Dict):
-        method = msg.get("method")
+        # Handle new format: {'channel_name': ..., 'notification': ...}
+        channel = msg.get("channel_name")
+        if channel:
+            data = msg.get("notification", {})
+            if channel.startswith("ticker."):
+                part = channel.split(".")
+                if len(part) >= 2:
+                    symbol = part[1]
+                    ticker = self._map_ticker(symbol, data)
+                    if self.ticker_callback:
+                        await self.ticker_callback(ticker)
 
+            elif channel.startswith("trades."):
+                part = channel.split(".")
+                if len(part) >= 2:
+                    symbol = part[1]
+                    # trades data is usually a list of trades
+                    trade_data_list = data if isinstance(data, list) else [data]
+                    for t_data in trade_data_list:
+                        trade = self._map_trade(symbol, t_data)
+                        if self.trade_callback:
+                            await self.trade_callback(trade)
+            elif channel == "orders":
+                # Handle order updates (fills/cancellations)
+                order_data_list = data if isinstance(data, list) else [data]
+                for o_data in order_data_list:
+                    exchange_id = str(o_data.get("order_id", o_data.get("id", "")))
+                    if not exchange_id:
+                        continue
+
+                    status_str = o_data.get("status", "").lower()
+                    status = OrderStatus.OPEN
+                    if status_str in ["cancelled", "canceled"]:
+                        status = OrderStatus.CANCELLED
+                    elif status_str in ["filled", "closed"]:
+                        status = OrderStatus.FILLED
+                    elif status_str in ["rejected"]:
+                        status = OrderStatus.REJECTED
+
+                    if exchange_id in self.orders:
+                        self.orders[exchange_id] = replace(
+                            self.orders[exchange_id],
+                            status=status,
+                            filled_size=float(
+                                o_data.get(
+                                    "amount_filled",
+                                    self.orders[exchange_id].filled_size,
+                                )
+                            ),
+                        )
+                        logger.info(
+                            f"Updated order {exchange_id} status to {status} from notification"
+                        )
+            return
+
+        # Fallback to old format (if any)
+        method = msg.get("method")
         if method == "subscription":
             params = msg.get("params", {})
             channel = params.get("channel", "")
@@ -278,7 +348,13 @@ class ThalexAdapter(ExchangeGateway):
                 if len(part) >= 2:
                     symbol = part[1]
                     # trades data is usually a list of trades
-                    trade_data_list = data if isinstance(data, list) else [data]
+                    trade_data_list = (
+                        data
+                        if isinstance(data, list)
+                        else (
+                            data.get("trades", []) if isinstance(data, dict) else [data]
+                        )
+                    )
                     for t_data in trade_data_list:
                         trade = self._map_trade(symbol, t_data)
                         if self.trade_callback:

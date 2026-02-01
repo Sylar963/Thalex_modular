@@ -342,9 +342,9 @@ class Thalex:
         self.processing_task = None
 
         # Rate limiting
-        self.circuit_breaker = CircuitBreaker()
-        self.rate_limit = 60  # Default - 60 requests per minute
-        self.request_timestamps = deque(maxlen=100)
+        self.circuit_breaker = CircuitBreaker(failure_threshold=50, recovery_time=10)
+        self.rate_limit = 300  # 300 requests per minute (5 req/sec)
+        self.request_timestamps = deque(maxlen=500)
 
         # Request prioritization
         self.high_priority_queue = asyncio.PriorityQueue()  # For order operations
@@ -518,7 +518,7 @@ class Thalex:
         request_str = json.dumps(request)  # Use standard json to avoid escaping issues
 
         # DEBUG LOG
-        # logging.info(f"TX RAW: {request_str}")
+        logging.info(f"TX RAW: {request_str}")
 
         if self.ws and self.ws.state == WsState.OPEN:
             await self.ws.send(request_str)
@@ -551,7 +551,15 @@ class Thalex:
         try:
             # Attempt to send via batcher for most requests
             # Critical order operations bypass batching
-            if method.startswith(("private/insert", "private/amend", "private/cancel")):
+            if method.startswith(
+                (
+                    "private/insert",
+                    "private/amend",
+                    "private/cancel",
+                    "private/buy",
+                    "private/sell",
+                )
+            ):
                 # Priority sending for order operations
                 result = await self._send_raw(method, params)
             else:
