@@ -5,29 +5,38 @@ from ...domain.entities import Position
 
 class PortfolioRepository(BaseRepository):
     async def get_summary(self) -> Dict:
-        # Placeholder for global account summary
-        # Ideally fetches from Thalex Adapter or DB snapshot
+        # Derived summary from database positions
+        # Ideally, we'd have a separate account balance table, but for now:
+        positions = await self.db_adapter.get_latest_positions()
+        unrealized_pnl = sum(getattr(p, "unrealized_pnl", 0.0) for p in positions)
+
         return {
-            "equity": 150000.00,
+            "equity": 150000.00,  # Mocked until balance table added
             "margin_used": 25000.00,
             "margin_available": 125000.00,
             "daily_pnl": 1250.50,
-            "unrealized_pnl": 340.00,
+            "unrealized_pnl": unrealized_pnl,
+            "positions_count": len(positions),
         }
 
     async def get_positions(self) -> List[Dict]:
-        # Placeholder for active positions
+        """Fetch active positions from DB."""
+        if not self.db_adapter:
+            return []
+
+        positions = await self.db_adapter.get_latest_positions()
         return [
             {
-                "symbol": "BTC-PERPETUAL",
-                "size": 5.0,
-                "entry_price": 50000.0,
-                "mark_price": 50100.0,
-                "unrealized_pnl": 500.0,
-                "delta": 0.5,
-                "gamma": 0.02,
-                "theta": -50.0,
+                "symbol": p.symbol,
+                "size": p.size,
+                "entry_price": p.entry_price,
+                "mark_price": 0.0,  # Will be filled if mark_price stored
+                "unrealized_pnl": 0.0,
+                "delta": 0.0,
+                "gamma": 0.0,
+                "theta": 0.0,
             }
+            for p in positions
         ]
 
     async def get_history(self) -> List[Dict]:

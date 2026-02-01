@@ -85,7 +85,33 @@ The API serves simulation and live data to the Svelte dashboard.
 python -m uvicorn src.api.main:app --reload
 ```
 
-#### 3. Frontend Development
+#### 3. Running in Background (Recommended)
+Use `screen` to keep sessions active without an open terminal.
+
+**Start Trading Bot:**
+```bash
+screen -S thalex-bot  # Create session
+# Inside screen:
+source venv/bin/activate
+python src/main.py
+# Press Ctrl+A, then D to detach
+```
+
+**Start Backend API:**
+```bash
+screen -S thalex-api  # Create session
+# Inside screen:
+source venv/bin/activate
+python -m uvicorn src.api.main:app --host 0.0.0.0 --port 8000
+# Press Ctrl+A, then D to detach
+```
+
+**Manage Sessions**:
+- List sessions: `screen -ls`
+- Reattach to bot: `screen -r thalex-bot`
+- Reattach to api: `screen -r thalex-api`
+
+#### 4. Frontend Development
 Ensure your `vite.config.ts` in the frontend project is routing `/api` traffic to `localhost:8000`.
 
 ---

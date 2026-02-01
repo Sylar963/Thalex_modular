@@ -1,13 +1,13 @@
 import os
 from typing import Optional
 from fastapi import Request
-from ..repositories import (
+from .repositories import (
     MarketRepository,
     PortfolioRepository,
     SimulationRepository,
     ConfigRepository,
 )
-from ...adapters.storage.timescale_adapter import TimescaleDBAdapter
+from ..adapters.storage.timescale_adapter import TimescaleDBAdapter
 
 
 # Singleton instance holder

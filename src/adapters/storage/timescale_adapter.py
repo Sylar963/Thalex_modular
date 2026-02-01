@@ -39,48 +39,63 @@ class TimescaleDBAdapter(StorageGateway):
     async def _init_schema(self):
         """Create necessary tables and hypertables."""
         async with self.pool.acquire() as conn:
-            # 1. Tickers Table
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS market_tickers (
-                    time TIMESTAMPTZ NOT NULL,
-                    symbol TEXT NOT NULL,
-                    bid DOUBLE PRECISION,
-                    ask DOUBLE PRECISION,
-                    last DOUBLE PRECISION,
-                    volume DOUBLE PRECISION
-                );
-            """)
-            # Convert to hypertable (if not already)
-            # Try/Catch block in SQL usually needed if already exists, but "IF NOT EXISTS" in Timescale logic is separate.
-            # We'll assume standard Postgres for MVP, user can enable timescaledb extension manually or we run query
-            # asking 'SELECT create_hypertable' if desired. For now, simple tables.
-
             try:
-                await conn.execute(
-                    "SELECT create_hypertable('market_tickers', 'time', if_not_exists => TRUE);"
-                )
+                # 1. Tickers Table
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS market_tickers (
+                        time TIMESTAMPTZ NOT NULL,
+                        symbol TEXT NOT NULL,
+                        bid DOUBLE PRECISION,
+                        ask DOUBLE PRECISION,
+                        last DOUBLE PRECISION,
+                        volume DOUBLE PRECISION
+                    );
+                """)
+                # Convert to hypertable (if not already)
+                try:
+                    await conn.execute(
+                        "SELECT create_hypertable('market_tickers', 'time', if_not_exists => TRUE);"
+                    )
+                except Exception as e:
+                    logger.debug(
+                        f"Hypertable creation skipped (might be standard Postgres): {e}"
+                    )
+
+                # 2. Trades Table
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS market_trades (
+                        time TIMESTAMPTZ NOT NULL,
+                        symbol TEXT NOT NULL,
+                        price DOUBLE PRECISION,
+                        size DOUBLE PRECISION,
+                        side TEXT,
+                        trade_id TEXT
+                    );
+                """)
+                try:
+                    await conn.execute(
+                        "SELECT create_hypertable('market_trades', 'time', if_not_exists => TRUE);"
+                    )
+                except Exception:
+                    pass
+
+                # 3. Portfolio Positions Table (Snapshot)
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS portfolio_positions (
+                        symbol TEXT PRIMARY KEY,
+                        size DOUBLE PRECISION NOT NULL,
+                        entry_price DOUBLE PRECISION,
+                        mark_price DOUBLE PRECISION,
+                        unrealized_pnl DOUBLE PRECISION,
+                        delta DOUBLE PRECISION,
+                        gamma DOUBLE PRECISION,
+                        theta DOUBLE PRECISION,
+                        last_update TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
             except Exception as e:
-                logger.debug(
-                    f"Hypertable creation skipped (might be standard Postgres): {e}"
-                )
-
-            # 2. Trades Table
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS market_trades (
-                    time TIMESTAMPTZ NOT NULL,
-                    symbol TEXT NOT NULL,
-                    price DOUBLE PRECISION,
-                    size DOUBLE PRECISION,
-                    side TEXT,
-                    trade_id TEXT
-                );
-            """)
-            try:
-                await conn.execute(
-                    "SELECT create_hypertable('market_trades', 'time', if_not_exists => TRUE);"
-                )
-            except Exception:
-                pass
+                logger.error(f"Failed to initialize schema: {e}")
+                raise
 
     async def save_ticker(self, ticker: Ticker):
         if not self.pool:
@@ -123,8 +138,61 @@ class TimescaleDBAdapter(StorageGateway):
             logger.error(f"Failed to save trade: {e}")
 
     async def save_position(self, position: Position):
-        # We might store positions in a separate table
-        pass
+        """Upsert current position snapshot."""
+        if not self.pool:
+            return
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO portfolio_positions (symbol, size, entry_price, mark_price, unrealized_pnl, delta, gamma, theta, last_update)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP)
+                    ON CONFLICT (symbol) DO UPDATE SET
+                        size = EXCLUDED.size,
+                        entry_price = EXCLUDED.entry_price,
+                        mark_price = EXCLUDED.mark_price,
+                        unrealized_pnl = EXCLUDED.unrealized_pnl,
+                        delta = EXCLUDED.delta,
+                        gamma = EXCLUDED.gamma,
+                        theta = EXCLUDED.theta,
+                        last_update = CURRENT_TIMESTAMP
+                    """,
+                    position.symbol,
+                    position.size,
+                    position.entry_price,
+                    0.0,  # mark_price placeholder
+                    0.0,  # unrealized_pnl placeholder
+                    0.0,  # delta placeholder
+                    0.0,  # gamma placeholder
+                    0.0,  # theta placeholder
+                )
+        except Exception as e:
+            logger.error(f"Failed to save position: {e}")
+
+    async def get_latest_positions(self) -> List[Position]:
+        """Fetch all non-zero positions from the database."""
+        if not self.pool:
+            return []
+        try:
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT symbol, size, entry_price, mark_price, unrealized_pnl, delta, gamma, theta
+                    FROM portfolio_positions
+                    WHERE size != 0
+                """
+                )
+                return [
+                    Position(
+                        symbol=r["symbol"],
+                        size=r["size"],
+                        entry_price=r["entry_price"],
+                    )
+                    for r in rows
+                ]
+        except Exception as e:
+            logger.error(f"Failed to fetch latest positions: {e}")
+            return []
 
     async def get_recent_tickers(self, symbol: str, limit: int = 100) -> List[Ticker]:
         if not self.pool:
