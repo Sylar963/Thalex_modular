@@ -118,29 +118,82 @@ class VolumeCandleSignalEngine(SignalEngine):
         if len(self.candles) < 3:
             return
 
-        recent = list(self.candles)[-3:]
+        recent = list(self.candles)[-5:]
 
-        # 1. Momentum
-        price_momentum = (recent[-1].close / recent[0].open) - 1.0
-        delta_momentum = np.mean([c.delta_ratio for c in recent])
-        self.signals["momentum"] = np.clip(
-            price_momentum * 100 * np.sign(delta_momentum), -1, 1
+        # --- 1. Enhanced VAMP (Volume Adjusted Market Pressure) ---
+        # Legacy logic: VAMP = Weighted Avg of Buy/Sell VWAP based on Volume Ratio
+
+        # Calculate Aggressive Volume Sums
+        agg_buy_vol = sum(c.buy_volume for c in recent)
+        agg_sell_vol = sum(c.sell_volume for c in recent)
+        total_vol = agg_buy_vol + agg_sell_vol
+
+        # Calculate VWAPs
+        buy_vwap = (
+            sum(c.close * c.buy_volume for c in recent) / agg_buy_vol
+            if agg_buy_vol > 0
+            else 0
+        )
+        sell_vwap = (
+            sum(c.close * c.sell_volume for c in recent) / agg_sell_vol
+            if agg_sell_vol > 0
+            else 0
         )
 
-        # 2. Reversal (Simple divergence)
-        price_dir = np.sign(recent[-1].close - recent[0].open)
-        delta_dir = np.sign(self.delta_ema["fast"] - self.delta_ema["slow"])
-        self.signals["reversal"] = (
-            1.0
-            if (price_dir != 0 and delta_dir != 0 and price_dir != delta_dir)
-            else 0.0
-        )
+        vamp_value = 0.0
+        vamp_impact = 0.0
 
-        # 3. Volatility
+        if total_vol > 0:
+            buy_ratio = agg_buy_vol / total_vol
+            sell_ratio = 1.0 - buy_ratio
+
+            # Weighted VAMP
+            if buy_vwap > 0 and sell_vwap > 0:
+                vamp_value = (buy_vwap * buy_ratio) + (sell_vwap * sell_ratio)
+            elif buy_vwap > 0:
+                vamp_value = buy_vwap
+            elif sell_vwap > 0:
+                vamp_value = sell_vwap
+
+            # Impact
+            vamp_impact = (agg_buy_vol - agg_sell_vol) / total_vol  # -1 to 1
+
+        # --- 2. Market Regime Detection ---
+        # Volatility
         price_range = np.mean([c.high / c.low - 1.0 for c in recent])
-        self.signals["volatility"] = min(1.0, price_range * 50)
+        volatility = min(1.0, price_range * 50)
 
-        # 4. Parameter Adjustments (Simple Logic)
-        self.signals["gamma_adjustment"] = self.signals["volatility"] * 0.4
-        self.signals["volatility_adjustment"] = self.signals["volatility"] * 0.4
-        self.signals["reservation_price_offset"] = self.signals["momentum"] * 0.0003
+        # Trend / Regime
+        price_change = (recent[-1].close - recent[0].open) / recent[0].open
+        trend_strength = abs(price_change) * 100
+
+        market_regime = "ranging"
+        if trend_strength > 0.1:  # Threshold
+            market_regime = "trending"
+
+        if volatility > 0.005:  # High vol
+            market_regime = "volatile"
+
+        # --- 3. Signal Generation (Parity with Legacy) ---
+
+        self.signals["volatility"] = volatility
+        self.signals["market_impact"] = vamp_impact
+        # Pass VAMP impact as reservation offset helper
+        # Logic: If high buy pressure (impact > 0), skew prices up (higher res price)
+        self.signals["reservation_price_offset"] = vamp_impact * 0.0005  # Sensitivity
+
+        # Gamma/Vol adjustments based on Regime
+        if market_regime == "volatile":
+            self.signals["gamma_adjustment"] = 0.5
+            self.signals["volatility_adjustment"] = 0.5
+        elif market_regime == "trending":
+            self.signals[
+                "gamma_adjustment"
+            ] = -0.2  # Looser spread to capture trend? Or tighter?
+            # Legacy usually widened spread in trend to avoid adverse selection
+            self.signals["gamma_adjustment"] = 0.2
+        else:
+            self.signals["gamma_adjustment"] = 0.0
+            self.signals["volatility_adjustment"] = 0.0
+
+        self.signals["vamp_value"] = vamp_value
