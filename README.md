@@ -1,17 +1,17 @@
-# Thalex SimpleQuoter: Modular Avellaneda Market Maker
+# Thalex Modular: PNL Simulation Framework & Trading Bot
 
-A high-performance, production-ready cryptocurrency market making bot implementing the Avellaneda-Stoikov strategy, now featuring a modular "Clean Architecture" design and optimized for the [Thalex](https://www.thalex.com) derivatives exchange.
+A high-performance **PNL Simulation Framework** and **Trading Bot** for the [Thalex](https://www.thalex.com) derivatives exchange. This project has evolved from a simple quoter into a robust system for simulating trading strategies with **1-minute resolution** precision and persistent data analysis using **TimescaleDB**.
 
 ![Thalex](https://thalex.com/images/thalex-logo-white.svg)
 
-## 🚀 Recent Updates & Current State
+## 🚀 Key Features & Updates
 
-The project has transitioned to a modular **Ports and Adapters (Clean Architecture)** structure while maintaining the robust performance of the legacy system.
-
-- **Modular Architecture**: New Core logic in `src/` for better testability and scalability.
-- **Hedging Removed**: Hedging functionality has been completely removed to prioritize core quoting efficiency and reduce complexity.
-- **Database Integration**: Added native support for **TimescaleDB** for high-performance trade and market data persistence.
-- **Enhanced Signal Engine**: Refined Volume Adjusted Market Pressure (VAMP) calculations.
+- **High-Resolution Simulation**: Simulates PnL and strategy performance using **1-minute resolution data**.
+- **Historical Backfills**: Capable of fetching and processing **30-day historical data chunks** for extensive strategy verification.
+- **TimescaleDB Persistence**: Native integration with **TimescaleDB** for high-performance storage of market data (ticks, trades) and portfolio snapshots.
+- **Visual Analytics**: Includes a modern **SvelteKit Dashboard** (served via FastAPI) for visualizing trading performance and market dynamics.
+- **Modular Architecture**: Built with **Clean Architecture** principles (adapters, domain, use cases) for testability and scalability.
+- **Latency Optimized**: Retains the legacy low-latency core for live trading while adding robust simulation capabilities.
 
 ---
 
@@ -19,17 +19,16 @@ The project has transitioned to a modular **Ports and Adapters (Clean Architectu
 
 ```text
 Thalex_modular/
-├── src/                        # NEW: Modular Architecture
-│   ├── adapters/               # External interfaces (Exchange, Storage)
+├── src/                        # Modular Core (Clean Architecture)
+│   ├── adapters/               # External interfaces (Thalex API, TimescaleDB)
 │   ├── domain/                 # Core logic (Strategies, Signals, Risk)
-│   ├── use_cases/              # Orchestration (Quoting Service)
-│   └── main.py                 # Primary entry point
+│   ├── use_cases/              # Orchestration (Quoting, Simulation)
+│   ├── api/                    # FastAPI Backend for Dashboard
+│   └── main.py                 # Trading Bot Entry Point
 ├── thalex_py/                  # Legacy Core & SDK
-│   └── Thalex_modular/         # Legacy high-performance implementation
-├── start_quoter.py             # Legacy entry point
-├── TASKS.md                    # Development roadmap
-├── GEMINI.md                   # Project management directives
-└── Architecture.md             # Detailed technical documentation
+├── GEMINI.md                   # Project Management & Directives
+├── TASKS.md                    # Roadmap & Todo
+└── Architecture.md             # Technical Documentation
 ```
 
 ---
@@ -37,135 +36,86 @@ Thalex_modular/
 ## 🛠️ Getting Started
 
 ### Prerequisites
-- Python 3.10+
-- Thalex API Keys (Testnet recommended initially)
-- (Optional) TimescaleDB/PostgreSQL instance
+- **Python 3.10+**
+- **TimescaleDB** (PostgreSQL extension)
+- **Thalex API Keys** (Testnet recommended for development)
 
 ### Installation
 
-1. **Clone & Setup Environment**:
-   ```bash
-   git clone <repository-url>
-   cd Thalex_modular
-   python -m venv venv
-   source venv/bin/activate  # Linux/macOS
-   pip install -r requirements.txt
-   ```
+1.  **Clone & Setup Environment**:
+    ```bash
+    git clone <repository-url>
+    cd Thalex_modular
+    python -m venv venv
+    source venv/bin/activate  # Linux/macOS
+    pip install -r requirements.txt
+    ```
 
-2. **Configure Environment Variables**:
-   ```bash
-   cp .example.env .env
-   ```
-   Edit `.env` and fill in your Thalex API keys and database credentials.
+2.  **Configure Environment Variables**:
+    ```bash
+    cp .example.env .env
+    ```
+    Edit `.env` with your API keys and database credentials.
 
-3. **Start the Database (Required for API & Storage)**:
-   The project uses TimescaleDB for data persistence. Start it using Docker Compose:
-   ```bash
-   docker-compose up -d
-   ```
-   *Note: This will start TimescaleDB on port 5433 (mapping 5432 internal).*
+3.  **Start Infrastructure**:
+    Use Docker Compose to start TimescaleDB:
+    ```bash
+    docker-compose up -d
+    ```
 
 ---
 
-### Running the System
+## 🏃 Running the System
 
-To have a fully functional frontend experience, you need both the Trading Bot and the Backend API running.
+ The system consists of two main components: the **Trading/Simulation Engine** and the **Dashboard API**.
 
-#### 1. Start the Trading Bot
-The bot fetches market data, executes strategy logic, and persists data to the database.
+### 1. Start the Simulation Engine / Trading Bot
+This runs the core logic, fetches market data, executes the strategy (or simulation), and persists data.
+
 ```bash
-# Recommended: Modular Architecture
+# Run the modular core
 python src/main.py
 ```
 
-#### 2. Start the Backend API (For Frontend)
-The API serves simulation and live data to the Svelte dashboard.
+### 2. Start the Reporting API
+The FastAPI backend serves data to the frontend dashboard.
+
 ```bash
-# The API runs on http://localhost:8000
-python -m uvicorn src.api.main:app --reload
+# Serve API on localhost:8000
+python -m uvicorn src.api.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-#### 3. Running in Background (Recommended)
-Use `screen` to keep sessions active without an open terminal.
+### 3. Production Deployment (Screen)
+For long-running sessions, use `screen`:
 
-**Start Trading Bot:**
 ```bash
-screen -S thalex-bot  # Create session
-# Inside screen:
+# Bot Session
+screen -S thalex-bot
 source venv/bin/activate
 python src/main.py
-# Press Ctrl+A, then D to detach
-```
 
-**Start Backend API:**
-```bash
-screen -S thalex-api  # Create session
-# Inside screen:
+# API Session
+screen -S thalex-api
 source venv/bin/activate
 python -m uvicorn src.api.main:app --host 0.0.0.0 --port 8000
-# Press Ctrl+A, then D to detach
 ```
 
-**Manage Sessions**:
-- List sessions: `screen -ls`
-- Reattach to bot: `screen -r thalex-bot`
-- Reattach to api: `screen -r thalex-api`
-
-#### 4. Frontend Development
-Ensure your `vite.config.ts` in the frontend project is routing `/api` traffic to `localhost:8000`.
-
 ---
 
----
+## 🏗️ Architecture & Data Flow
 
-## 🏗️ Architecture Deep Dive
-
-### Modular System (`src/`)
-Our new architecture separates business logic from infrastructure:
-
-- **Domain Layer**: Contains the "brain" of the bot.
-  - `AvellanedaStoikovStrategy`: The core mathematical pricing model.
-  - `VolumeCandleSignalEngine`: Generates VAMP signals from volume flow.
-  - `BasicRiskManager`: Enforces safety limits.
-- **Adapters Layer**: Handles communication with the outside world.
-  - `ThalexAdapter`: WebSocket/REST integration with Thalex.
-  - `TimescaleDBAdapter`: High-throughput time-series storage.
-- **Use Case Layer**:
-  - `QuotingService`: Orchestrates data flow between the exchange and strategy.
-
-### Legacy Core (`thalex_py/`)
-The legacy system remains available for established workflows, featuring:
-- **Object Pooling**: Extremely low latency by reusing message structures.
-- **Shared Memory**: Optimized data access for high-frequency updates.
-- **Direct Event Bus**: Low-overhead internal communication.
-
----
-
-## 📈 Technical Features
-
-### Avellaneda-Stoikov Model
-The bot calculates optimal bid/ask spreads based on:
-- **Gamma (γ)**: Risk aversion parameter.
-- **Kappa (κ)**: Market depth/liquidity factor.
-- **Inventory Risk**: Dynamic skewing of quotes based on current position.
-
-### VAMP (Volume Adjusted Market Pressure)
-Integrated into the `VolumeCandleSignalEngine`, VAMP analyzes aggressive order flow to detect:
-- Momentum and reversal likelihood.
-- Potential exhaustion points.
-- Volatility predictions for spread adjustment.
-
-### Risk Management
-- **Position Limits**: Max BTC exposure per instrument.
-- **Drawdown Protection**: Automatic halting on significant losses.
-- **Take Profit**: Built-in triggers for unrealized PnL.
+### Simulation to Dashboard Pipeline
+1.  **Ingestion**: `ThalexAdapter` fetches real-time or historical data.
+2.  **Processing**: `VolumeCandleSignalEngine` and `AvellanedaStoikovStrategy` calculate metrics (VAMP, spreads).
+3.  **Persistence**: `TimescaleDBAdapter` stores 1m candles, trades, and portfolio snapshots into **Hypertables**.
+4.  **Serving**: `src/api` queries TimescaleDB to serve aggregated JSON data to the Frontend.
 
 ---
 
 ## ⚠️ Risk Warning
 
-Trading cryptocurrencies involves substantial risk of loss. This software is provided "as-is" with no guarantees. Always test thoroughly on testnet before deploying real capital.
+**Trading derivatives involves substantial risk.** This software is for educational and research purposes. The "Simulation Framework" allows for risk-free strategy testing, but live trading should always be approached with caution.
 
 ## 📄 License
 
-This project is licensed under the MIT License.
+MIT License.

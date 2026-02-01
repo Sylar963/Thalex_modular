@@ -301,6 +301,149 @@ class ThalexAdapter(ExchangeGateway):
         except Exception as e:
             logger.error(f"Subscription failed: {e}")
 
+    async def _send_batch(self, requests: List[Dict]) -> List[Any]:
+        """
+        Send a batch of JSON-RPC requests in a single WebSocket frame.
+        """
+        if not requests:
+            return []
+
+        futures = []
+        batch_payload = []
+
+        for req in requests:
+            method = req.get("method")
+            params = req.get("params", {})
+
+            req_id = self._get_next_id()
+            future = asyncio.Future()
+            self.pending_requests[req_id] = future
+            futures.append(future)
+
+            # Construct JSON-RPC 2.0 request object
+            payload = {
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": params,
+                "id": req_id,
+            }
+            batch_payload.append(payload)
+
+        try:
+            # Bypass thalex library's wrapper and use websocket directly
+            if not self.client.connected():
+                raise ConnectionError("Not connected")
+
+            # Send requests individually (Pipelining)
+            # Thalex might not support JSON-RPC Batch Arrays. Pipelining achieves similar throughput.
+            for payload in batch_payload:
+                req_str = json.dumps(payload)
+                logger.debug(f"TX PIPE: {req_str}")
+                await self.client.ws.send(req_str)
+
+            # Wait with Timeout
+            results = await asyncio.wait_for(
+                asyncio.gather(*futures, return_exceptions=True), timeout=5.0
+            )
+            return results
+
+        except asyncio.TimeoutError:
+            logger.error("Batch send timed out")
+            for f in futures:
+                if not f.done():
+                    f.cancel()
+            return [TimeoutError("Batch Timeout")] * len(requests)
+
+        except Exception as e:
+            logger.error(f"Batch send failed: {e}")
+            # Fail all futures
+            for f in futures:
+                if not f.done():
+                    f.set_exception(e)
+            return [e] * len(requests)
+
+    async def place_orders_batch(self, orders: List[Order]) -> List[Order]:
+        """Place multiple orders in a single batch request."""
+        if not self.connected:
+            return [replace(o, status=OrderStatus.REJECTED) for o in orders]
+
+        # Rate Limit Check
+        if not self.me_rate_limiter.consume(len(orders)):
+            logger.warning(f"Rate limit hit (ME). Dropping batch of {len(orders)}.")
+            return [replace(o, status=OrderStatus.REJECTED) for o in orders]
+
+        requests = []
+        for o in orders:
+            th_type = (
+                ThOrderType.LIMIT if o.type == OrderType.LIMIT else ThOrderType.MARKET
+            )
+            label = str(o.id)
+            method = "private/buy" if o.side == OrderSide.BUY else "private/sell"
+
+            params = {
+                "instrument_name": o.symbol,
+                "amount": o.size,
+                "price": o.price,
+                "order_type": th_type.value,
+                "label": label,
+                "post_only": o.post_only,
+            }
+            requests.append({"method": method, "params": params})
+
+        results = await self._send_batch(requests)
+
+        updated_orders = []
+        for order, res in zip(orders, results):
+            if isinstance(res, Exception) or "error" in res:
+                # Log error if needed
+                updated_orders.append(replace(order, status=OrderStatus.REJECTED))
+            else:
+                # Parse result
+                result_data = res.get("result", {})
+                exchange_id = str(
+                    result_data.get("order_id", result_data.get("id", ""))
+                )
+                updated_orders.append(
+                    replace(order, exchange_id=exchange_id, status=OrderStatus.OPEN)
+                )
+                # Cache
+                if exchange_id:
+                    self.orders[exchange_id] = updated_orders[-1]
+
+        return updated_orders
+
+    async def cancel_orders_batch(self, order_ids: List[str]) -> List[bool]:
+        """Cancel multiple orders in a single batch."""
+        if not self.connected or not order_ids:
+            return [False] * len(order_ids)
+
+        # Rate Limit
+        if not self.cancel_rate_limiter.consume(len(order_ids)):
+            logger.warning("Rate limit hit (Cancel Batch).")
+            return [False] * len(order_ids)
+
+        requests = []
+        for oid in order_ids:
+            # clean oid
+            final_oid = int(oid) if str(oid).isdigit() else oid
+            requests.append(
+                {"method": "private/cancel", "params": {"order_id": final_oid}}
+            )
+
+        results = await self._send_batch(requests)
+
+        outcomes = []
+        for oid_str, res in zip(order_ids, results):
+            success = False
+            if not isinstance(res, Exception) and "error" not in res:
+                success = True
+                if oid_str in self.orders:
+                    self.orders[oid_str] = replace(
+                        self.orders[oid_str], status=OrderStatus.CANCELLED
+                    )
+            outcomes.append(success)
+        return outcomes
+
     async def get_position(self, symbol: str) -> Position:
         return self.positions.get(symbol, Position(symbol, 0.0, 0.0))
 
@@ -311,10 +454,11 @@ class ThalexAdapter(ExchangeGateway):
         self.trade_callback = callback
 
     async def _msg_loop(self):
-        logger.debug("Starting adapter message loop...")  # Debug level
+        logger.debug("Starting adapter message loop...")
         while self.connected:
             try:
                 # Add timeout to loop to allow heartbeat check
+                # Use client.receive() as library's _process_messages IS running
                 msg = await asyncio.wait_for(self.client.receive(), timeout=1.0)
                 self.last_msg_time = time.time()
 
@@ -328,15 +472,16 @@ class ThalexAdapter(ExchangeGateway):
                         logger.warning(f"Received invalid JSON: {msg}")
                         continue
 
-                if not isinstance(msg, dict):
-                    # Handle Batch Responses (List of Dicts)
-                    if isinstance(msg, list):
-                        for m in msg:
-                            if isinstance(m, dict):
-                                # recursive process? or just inline
-                                await self._handle_single_msg(m)
-                        continue
+                # logger.debug(f"RX: {str(msg)[:500]}") # Debug incoming
 
+                # Handle Batch Responses (List of Dicts)
+                if isinstance(msg, list):
+                    for m in msg:
+                        if isinstance(m, dict):
+                            await self._handle_single_msg(m)
+                    continue
+
+                if not isinstance(msg, dict):
                     logger.warning(f"Received non-dict msg: {msg}")
                     continue
 
@@ -347,6 +492,17 @@ class ThalexAdapter(ExchangeGateway):
             except Exception as e:
                 logger.error(f"Error in msg loop: {e}")
                 await asyncio.sleep(1)
+
+        # Disconnected
+        logger.warning("Message loop ended (Disconnected). Failing pending requests.")
+        self._fail_pending_requests(ConnectionError("Disconnected"))
+
+    def _fail_pending_requests(self, exc: Exception):
+        """Cancel all pending requests with exception"""
+        for req_id, future in list(self.pending_requests.items()):
+            if not future.done():
+                future.set_exception(exc)
+        self.pending_requests.clear()
 
     async def _handle_single_msg(self, msg: Dict):
         # Check for RPC response
