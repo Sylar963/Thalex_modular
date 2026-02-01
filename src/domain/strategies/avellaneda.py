@@ -2,11 +2,18 @@ import numpy as np
 import time
 import math
 import logging
-from typing import List, Dict, Tuple, Any, Optional
+from typing import Optional, List, Dict, Any
+from enum import Enum
+import numpy as nptional
 from ..interfaces import Strategy
 from ..entities import MarketState, Position, Order, OrderSide, OrderType, Ticker
 
 logger = logging.getLogger(__name__)
+
+
+class TradingMode(str, Enum):
+    MARKET_MAKING = "market_making"
+    RESCUE = "rescue"
 
 
 class AvellanedaStoikovStrategy(Strategy):
@@ -15,7 +22,8 @@ class AvellanedaStoikovStrategy(Strategy):
 
     This implementation ports the robust heuristic logic from the legacy
     'avellaneda_market_maker.py' component to ensure behavioral parity
-    while fitting into the new clean architecture.
+    while fitting into the new clean architecture. It also includes
+    regime-aware parameter adjustments.
     """
 
     __slots__ = [
@@ -84,7 +92,7 @@ class AvellanedaStoikovStrategy(Strategy):
         )
 
     def calculate_quotes(
-        self, market_state: MarketState, position: Position
+        self, market_state: MarketState, position: Position, regime: Any = None
     ) -> List[Order]:
         """
         Calculate optimal bid and ask orders using legacy heuristic logic.
@@ -99,6 +107,36 @@ class AvellanedaStoikovStrategy(Strategy):
         # Determine tick size from ticker if possible, else default
         if ticker.symbol and "BTC" in ticker.symbol:
             self.tick_size = 0.5
+
+        # --- 0. Regime & Mode Adjustment ---
+        gamma = self.gamma
+        volatility_mult = self.volatility_multiplier
+        inventory_factor = self.inventory_factor
+
+        # Mode Adjustment
+        mode = (
+            regime.trading_mode
+            if regime and hasattr(regime, "trading_mode")
+            else TradingMode.MARKET_MAKING
+        )
+
+        if mode == TradingMode.RESCUE:
+            # In rescue mode, be extremely aggressive with skew to reduce exposure
+            inventory_factor *= 5.0
+            # Narrow spreads to get filled faster
+            gamma *= 0.5
+
+        if regime:
+            if regime.name == "Volatile":
+                # Widen spreads in high vol
+                gamma *= 1.5
+                volatility_mult *= 1.5
+            elif regime.name == "Trending":
+                # Skew heavily against inventory in trends
+                inventory_factor *= 2.0
+            elif regime.name == "Illiquid":
+                # Be more conservative
+                gamma *= 1.2
 
         # --- 1. Spread Calculation (Heuristic) ---
 
@@ -115,8 +153,8 @@ class AvellanedaStoikovStrategy(Strategy):
         base_spread = self.base_spread_factor * fee_coverage_spread
 
         # B. Components
-        gamma_component = 1.0 + self.gamma
-        volatility_term = self.volatility * self.volatility_multiplier
+        gamma_component = 1.0 + gamma
+        volatility_term = self.volatility * volatility_mult
         volatility_component = volatility_term * math.sqrt(self.position_fade_time)
 
         # Inventory Risk Component
@@ -125,7 +163,7 @@ class AvellanedaStoikovStrategy(Strategy):
         inventory_risk = abs(current_pos) / safe_pos_limit
         inventory_risk = min(inventory_risk, 10.0)  # Cap risk
 
-        inventory_component = self.inventory_factor * inventory_risk * volatility_term
+        inventory_component = inventory_factor * inventory_risk * volatility_term
 
         # Market Impact (Placeholder from signals)
         impact_signal = market_state.signals.get("market_impact", 0.0)
