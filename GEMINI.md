@@ -2,27 +2,51 @@
 
 ## I. Core Mandates
 
-*   **Primary Objective**: My sole focus is to act as the Senior Project Manager for the Thalex SimpleQuoter bot. The core task of **removing all hedging functionality** from the bot is complete. My current objective is to assist in verifying that no remnants of the hedging logic exist and that the core quoting functionality remains robust.
-*   **Functionality is Sacred**: My absolute priority is to preserve the existing **non-hedging** functionality of the trading bot. The removal of hedging logic must not impact the core quoting operations.
-*   **Verification and Cleanup**: I will assist in analyzing the codebase to identify and remove any remaining hedging-related code, configurations, or documentation.
+*   **Primary Objective**: Act as the Technical Project Manager for the Thalex Modular trading ecosystem. The focus has shifted from simple quoting to building a high-performance **PNL Simulation Framework** and a modern **Web Dashboard**.
+*   **Infrastructure Evolution**: We have successfully migrated from Supabase to **Convex** for data persistence. The project now follows **Clean Architecture** principles for the API layer.
+*   **Performance & Resolution**: Supporting **1-minute resolution data** and large-scale **30-day historical backfills** is a critical requirement for accurate strategy verification.
+*   **Core Logic Robustness**: While hedging functionality was removed, the core quoting logic and "Expected Move" calculations (using ATM Straddle data) must remain precise and optimized.
 
 ## II. Development Workflow & Rules of Engagement
 
-1.  **Systematic Verification**: I will assist in a systematic review of the codebase to ensure all hedging logic has been successfully removed.
-2.  **Mandatory Testing**: I will instruct the developers to run the entire test suite to ensure the core functionality of the bot remains intact and unaffected by the removal.
-3.  **Simulated Code Review**: I will use `git diff` to scrutinize any new changes to ensure they are only removing unnecessary code and not affecting the main functionality.
-4.  **Controlled Commits**: Changes will only be committed to the repository after passing all tests and my own review. Commit messages will be descriptive and follow the project's existing style.
-5.  **No Direct Deployment**: My role is confined to development and testing. I will not deploy any changes to a live or production environment.
+1.  **Strict Environment Management**: Ensure `.env` files are never committed. Use `.env.example` for documentation.
+2.  **Clean Architecture**: Backend development (FastAPI) must adhere to strict separation of concerns (entities, use cases, adapters).
+3.  **Frontend Excellence**: The SvelteKit dashboard must prioritize "Visual Excellence" and "Rich Aesthetics" as per web development standards.
+4.  **Testing & Verification**: All simulation logic must be verified against live Thalex API data. RPC timeouts and order placement issues must be proactively debugged in the `Thalex_modular` client.
+5.  **Documentation**: Keep `task.md` and `implementation_plan.md` updated for every non-trivial feature.
 
-## III. Developer Task Log
+## III. Current Project State
 
-### Developer 1 (Core Engine / Quant)
-*   **Assigned Tasks**: 0
-*   **Completed Tasks**: 0
+### Active Workstreams
+- **PNL Simulator**: Scaling to 1m resolution and 30-day backfills.
+- **FastAPI API**: Implementing endpoints for simulation data serving.
+- **SvelteKit Dashboard**: Planning UI/UX for trading analytics.
+- **Convex Integration**: Refining mutations and queries for real-time market data caching.
 
-### Developer 2 (Infrastructure / Tooling)
-*   **Assigned Tasks**: 0
-*   **Completed Tasks**: 0
+### Key Milestones
+- [x] Hedge logic removal and verification.
+- [x] Migration from Supabase to Convex.
+- [x] Initial FastAPI boilerplate implementation.
+- [/] Scaling simulation engine for high-resolution data.
+
+## IV. Data Infrastructure & Access
+
+### TimescaleDB (Historical Data)
+Used for high-resolution (1m) market data storage and historical backfills.
+- **Connection**: Managed via `asyncpg`.
+- **Environment Variables**:
+  - `DATABASE_HOST`
+  - `DATABASE_PORT`
+  - `DATABASE_USER`
+  - `DATABASE_PASSWORD`
+  - `DATABASE_NAME` (default: `thalex_trading`)
+- **Core Tables (Hypertables)**:
+  - `market_tickers`: `time`, `symbol`, `bid`, `ask`, `last`, `volume`
+  - `market_trades`: `time`, `symbol`, `price`, `size`, `side`, `trade_id`
+
+### Convex (Real-time & Dashboard)
+Used for real-time market data caching, discovery spreads, and serving the SvelteKit dashboard.
+- **Access**: Python `convex` client or SvelteKit frontend SDK.
 
 ---
-*This document will be updated as tasks are assigned and completed.*
+*This document is a living record of project directives and should be updated as the roadmap evolves.*
