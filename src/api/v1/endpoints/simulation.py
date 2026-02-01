@@ -8,9 +8,11 @@ router = APIRouter()
 
 
 class SimulationConfig(BaseModel):
-    start_date: str
-    end_date: str
-    strategy_config: Dict
+    symbol: str = "BTC-PERPETUAL"
+    start_date: float  # Timestamp
+    end_date: float  # Timestamp
+    strategy_config: Dict = {}
+    risk_config: Dict = {}
 
 
 @router.get("/runs", response_model=List[Dict])
@@ -25,3 +27,11 @@ async def start_simulation(
 ):
     """Trigger a new run."""
     return await repo.start_simulation(config.dict())
+
+
+@router.get("/{run_id}/equity", response_model=List[Dict])
+async def get_equity_curve(
+    run_id: str, repo: SimulationRepository = Depends(get_simulation_repo)
+):
+    """Fetch equity curve for a specific run."""
+    return await repo.get_equity_curve(run_id)
