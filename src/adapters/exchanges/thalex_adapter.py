@@ -53,6 +53,7 @@ class ThalexAdapter(ExchangeGateway):
         self.msg_loop_task: Optional[asyncio.Task] = None
         self.heartbeat_task: Optional[asyncio.Task] = None
         self.last_msg_time = time.time()
+        self.tick_size: float = 1.0  # Default, will be updated from API
 
     def _get_next_id(self) -> int:
         self.request_id_counter += 1
@@ -108,6 +109,9 @@ class ThalexAdapter(ExchangeGateway):
             # This should now work with the thalex.py library fix!
             await asyncio.wait_for(future, timeout=10.0)
             logger.info("Logged in successfully.")
+
+            # Fetch instrument details (tick size)
+            await self._fetch_instrument_details()
         except Exception as e:
             logger.error(f"Login timeout or error: {e}")
             # Cleanup
@@ -130,6 +134,22 @@ class ThalexAdapter(ExchangeGateway):
         self.connected = False
         await self.client.disconnect()
         logger.info("Thalex Adapter disconnected.")
+
+    async def _fetch_instrument_details(self):
+        """Fetch instrument details like tick_size from the API"""
+        try:
+            # We use a dummy symbol or the primary instrument from env
+            symbol = os.getenv("PRIMARY_INSTRUMENT", "BTC-PERPETUAL")
+            response = await self._rpc_request(
+                self.client.instrument, instrument_name=symbol
+            )
+            if "result" in response:
+                res = response["result"]
+                # Assuming 'tick_size' exists in the instrument result
+                self.tick_size = float(res.get("tick_size", 0.5))
+                logger.info(f"Fetched tick size for {symbol}: {self.tick_size}")
+        except Exception as e:
+            logger.error(f"Failed to fetch instrument details: {e}")
 
     async def place_order(self, order: Order) -> Order:
         if not self.connected:
@@ -211,9 +231,9 @@ class ThalexAdapter(ExchangeGateway):
             await self._rpc_request(
                 self.client.public_subscribe, channels=[channel, trade_channel]
             )
-            # Try private subscribe for orders
+            # Try private subscribe for orders and portfolio
             await self._rpc_request(
-                self.client.private_subscribe, channels=[orders_channel]
+                self.client.private_subscribe, channels=[orders_channel, "portfolio"]
             )
         except Exception as e:
             logger.error(f"Subscription failed: {e}")
@@ -326,6 +346,16 @@ class ThalexAdapter(ExchangeGateway):
                         logger.info(
                             f"Updated order {exchange_id} status to {status} from notification"
                         )
+            elif channel == "portfolio":
+                # Handle portfolio/position updates
+                positions_data = data if isinstance(data, list) else [data]
+                for p_data in positions_data:
+                    symbol = p_data.get("instrument_name")
+                    if symbol:
+                        amount = float(p_data.get("amount", 0.0))
+                        entry_price = float(p_data.get("average_price", 0.0))
+                        self.positions[symbol] = Position(symbol, amount, entry_price)
+                        logger.debug(f"Position update for {symbol}: {amount}")
             return
 
         # Fallback to old format (if any)

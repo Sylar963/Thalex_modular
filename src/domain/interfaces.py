@@ -52,7 +52,7 @@ class Strategy(ABC):
 
     @abstractmethod
     def calculate_quotes(
-        self, market_state: MarketState, position: Position
+        self, market_state: MarketState, position: Position, tick_size: float = 0.5
     ) -> List[Order]:
         """Calculates the list of orders to place based on market state."""
         pass

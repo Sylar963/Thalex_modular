@@ -99,7 +99,11 @@ class AvellanedaStoikovStrategy(Strategy):
         )
 
     def calculate_quotes(
-        self, market_state: MarketState, position: Position, regime: Any = None
+        self,
+        market_state: MarketState,
+        position: Position,
+        regime: Any = None,
+        tick_size: Optional[float] = None,
     ) -> List[Order]:
         """
         Calculate optimal bid and ask orders using legacy heuristic logic.
@@ -111,8 +115,10 @@ class AvellanedaStoikovStrategy(Strategy):
         mid_price = ticker.mid_price
         timestamp = market_state.timestamp or time.time()
 
-        # Determine tick size from ticker if possible, else default
-        if ticker.symbol and "BTC" in ticker.symbol:
+        # Determine tick size
+        if tick_size:
+            self.tick_size = tick_size
+        elif ticker.symbol and "BTC" in ticker.symbol:
             self.tick_size = 0.5
 
         # --- 0. Regime & Mode Adjustment ---

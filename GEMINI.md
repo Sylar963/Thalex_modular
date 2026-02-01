@@ -3,7 +3,7 @@
 ## I. Core Mandates
 
 *   **Primary Objective**: Act as the Technical Project Manager for the Thalex Modular trading ecosystem. The focus has shifted from simple quoting to building a high-performance **PNL Simulation Framework** and a modern **Web Dashboard**.
-*   **Infrastructure Evolution**: We have successfully migrated from Supabase to **Convex** for data persistence. The project now follows **Clean Architecture** principles for the API layer.
+*   **Infrastructure Evolution**: We are utilizing **TimescaleDB** (PostgreSQL) for high-performance data persistence, supporting the scale required for 1-minute resolution trading data.
 *   **Performance & Resolution**: Supporting **1-minute resolution data** and large-scale **30-day historical backfills** is a critical requirement for accurate strategy verification.
 *   **Core Logic Robustness**: While hedging functionality was removed, the core quoting logic and "Expected Move" calculations (using ATM Straddle data) must remain precise and optimized.
 
@@ -21,11 +21,11 @@
 - **PNL Simulator**: Scaling to 1m resolution and 30-day backfills.
 - **FastAPI API**: Implementing endpoints for simulation data serving.
 - **SvelteKit Dashboard**: Planning UI/UX for trading analytics.
-- **Convex Integration**: Refining mutations and queries for real-time market data caching.
+- **Market Data Storage**: Refining TimescaleDB hypertables for real-time market data caching and historical Serving.
 
 ### Key Milestones
 - [x] Hedge logic removal and verification.
-- [x] Migration from Supabase to Convex.
+- [x] Transition to TimescaleDB for high-res data.
 - [x] Initial FastAPI boilerplate implementation.
 - [/] Scaling simulation engine for high-resolution data.
 
@@ -51,9 +51,9 @@ Used for high-resolution (1m) market data storage and historical backfills.
   - `market_tickers`: `time`, `symbol`, `bid`, `ask`, `last`, `volume`
   - `market_trades`: `time`, `symbol`, `price`, `size`, `side`, `trade_id`
 
-### Convex (Real-time & Dashboard)
-Used for real-time market data caching, discovery spreads, and serving the SvelteKit dashboard.
-- **Access**: Python `convex` client or SvelteKit frontend SDK.
+### Data Architecture (Real-time & Dashboard)
+The system leverages TimescaleDB as a "Single Source of Truth":
+- **Access**: Python `asyncpg` adapter (backend) or FastAPI endpoints (dashboard).
 
 ---
 *This document is a living record of project directives and should be updated as the roadmap evolves.*
