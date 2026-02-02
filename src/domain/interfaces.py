@@ -56,6 +56,14 @@ class ExchangeGateway(ABC):
         """Set callback for trade updates: async def cb(trade: Trade)."""
         pass
 
+    @abstractmethod
+    def set_order_callback(self, callback):
+        pass
+
+    @abstractmethod
+    def set_position_callback(self, callback):
+        pass
+
 
 class Strategy(ABC):
     """Abstract interface for trading strategies."""

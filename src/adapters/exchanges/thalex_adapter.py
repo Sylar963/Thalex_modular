@@ -552,7 +552,6 @@ class ThalexAdapter(ExchangeGateway):
                         if self.trade_callback:
                             await self.trade_callback(trade)
             elif channel == "orders":
-                # Handle order updates (fills/cancellations)
                 order_data_list = data if isinstance(data, list) else [data]
                 for o_data in order_data_list:
                     exchange_id = str(o_data.get("order_id", o_data.get("id", "")))
@@ -568,22 +567,26 @@ class ThalexAdapter(ExchangeGateway):
                     elif status_str in ["rejected"]:
                         status = OrderStatus.REJECTED
 
+                    filled_size = float(o_data.get("amount_filled", 0.0))
+                    avg_price = float(o_data.get("average_price", 0.0))
+
                     if exchange_id in self.orders:
                         self.orders[exchange_id] = replace(
                             self.orders[exchange_id],
                             status=status,
-                            filled_size=float(
-                                o_data.get(
-                                    "amount_filled",
-                                    self.orders[exchange_id].filled_size,
-                                )
-                            ),
+                            filled_size=filled_size,
                         )
+                        self._order_timestamps[exchange_id] = time.time()
                         logger.info(
                             f"Updated order {exchange_id} status to {status} from notification"
                         )
+
+                    if self.order_callback:
+                        await self.order_callback(
+                            exchange_id, status, filled_size, avg_price
+                        )
+
             elif channel == "portfolio":
-                # Handle portfolio/position updates
                 positions_data = data if isinstance(data, list) else [data]
                 for p_data in positions_data:
                     symbol = p_data.get("instrument_name")
@@ -592,6 +595,9 @@ class ThalexAdapter(ExchangeGateway):
                         entry_price = float(p_data.get("average_price", 0.0))
                         self.positions[symbol] = Position(symbol, amount, entry_price)
                         logger.debug(f"Position update for {symbol}: {amount}")
+
+                        if self.position_callback:
+                            await self.position_callback(symbol, amount, entry_price)
             return
 
         # Fallback to old format (if any)
