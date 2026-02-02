@@ -67,25 +67,26 @@ class ThalexAdapter(ExchangeGateway):
         self.connected = False
         self.ticker_callback: Optional[Callable] = None
         self.trade_callback: Optional[Callable] = None
+        self.order_callback: Optional[Callable] = None
+        self.position_callback: Optional[Callable] = None
 
-        # Local state cache
         self.positions: Dict[str, Position] = {}
         self.orders: Dict[str, Order] = {}
+        self._order_timestamps: Dict[str, float] = {}
 
-        # Async Request Management
         self.pending_requests: Dict[int, asyncio.Future] = {}
         self.request_id_counter = int(time.time() * 1000)
 
         self.msg_loop_task: Optional[asyncio.Task] = None
         self.heartbeat_task: Optional[asyncio.Task] = None
+        self._prune_task: Optional[asyncio.Task] = None
         self.last_msg_time = time.time()
-        self.tick_size: float = 1.0  # Default, will be updated from API
+        self.tick_size: float = 1.0
 
-        # Rate Limiters
-        # Matching Engine: 50 req/s (enabled via Cancel on Disconnect). Target 45 (90%)
+        self.last_sequence: int = 0
+        self.sequence_callback: Optional[Callable] = None
+
         self.me_rate_limiter = TokenBucket(capacity=50, fill_rate=45.0)
-
-        # Cancel Requests: 1000 req/s. Target 900 (90%)
         self.cancel_rate_limiter = TokenBucket(capacity=1000, fill_rate=900.0)
 
     def _get_next_id(self) -> int:
@@ -167,13 +168,25 @@ class ThalexAdapter(ExchangeGateway):
             await self.client.disconnect()
             raise ConnectionError("Failed to login/setup Thalex")
 
+        self._prune_task = asyncio.create_task(self._prune_order_cache())
         logger.info("Thalex Adapter connected and listening.")
+
+    def set_order_callback(self, callback: Callable):
+        self.order_callback = callback
+
+    def set_position_callback(self, callback: Callable):
+        self.position_callback = callback
+
+    def set_sequence_callback(self, callback: Callable):
+        self.sequence_callback = callback
 
     async def disconnect(self):
         if self.msg_loop_task:
             self.msg_loop_task.cancel()
         if self.heartbeat_task:
             self.heartbeat_task.cancel()
+        if self._prune_task:
+            self._prune_task.cancel()
 
         self.connected = False
         await self.client.disconnect()
@@ -234,11 +247,10 @@ class ThalexAdapter(ExchangeGateway):
             exchange_id = str(result.get("order_id", result.get("id", "")))
 
             status = OrderStatus.OPEN
-
             updated_order = replace(order, exchange_id=exchange_id, status=status)
 
-            # Cache order
             self.orders[exchange_id] = updated_order
+            self._order_timestamps[exchange_id] = time.time()
             return updated_order
 
         except Exception as e:
@@ -652,3 +664,22 @@ class ThalexAdapter(ExchangeGateway):
             size=float(data.get("amount", 0)),
             timestamp=ts,
         )
+
+    async def _prune_order_cache(self):
+        while self.connected:
+            await asyncio.sleep(60)
+            now = time.time()
+            cutoff = now - 600.0
+            stale_ids = [
+                oid
+                for oid, ts in self._order_timestamps.items()
+                if ts < cutoff
+                and oid in self.orders
+                and self.orders[oid].status
+                in [OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED]
+            ]
+            for oid in stale_ids:
+                del self.orders[oid]
+                del self._order_timestamps[oid]
+            if stale_ids:
+                logger.debug(f"Pruned {len(stale_ids)} stale orders from cache")
