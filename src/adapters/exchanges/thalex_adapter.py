@@ -469,8 +469,6 @@ class ThalexAdapter(ExchangeGateway):
         logger.debug("Starting adapter message loop...")
         while self.connected:
             try:
-                # Add timeout to loop to allow heartbeat check
-                # Use client.receive() as library's _process_messages IS running
                 msg = await asyncio.wait_for(self.client.receive(), timeout=1.0)
                 self.last_msg_time = time.time()
 
@@ -484,9 +482,6 @@ class ThalexAdapter(ExchangeGateway):
                         logger.warning(f"Received invalid JSON: {msg}")
                         continue
 
-                # logger.debug(f"RX: {str(msg)[:500]}") # Debug incoming
-
-                # Handle Batch Responses (List of Dicts)
                 if isinstance(msg, list):
                     for m in msg:
                         if isinstance(m, dict):
@@ -501,13 +496,54 @@ class ThalexAdapter(ExchangeGateway):
 
             except asyncio.TimeoutError:
                 continue
+            except asyncio.CancelledError:
+                break
             except Exception as e:
                 logger.error(f"Error in msg loop: {e}")
+                if self.connected:
+                    await self._attempt_reconnect()
                 await asyncio.sleep(1)
 
-        # Disconnected
         logger.warning("Message loop ended (Disconnected). Failing pending requests.")
         self._fail_pending_requests(ConnectionError("Disconnected"))
+
+    async def _attempt_reconnect(self):
+        max_retries = 10
+        base_delay = 1.0
+        for attempt in range(max_retries):
+            delay = min(base_delay * (2**attempt), 60.0)
+            logger.warning(
+                f"Reconnection attempt {attempt + 1}/{max_retries} in {delay:.1f}s..."
+            )
+            await asyncio.sleep(delay)
+
+            try:
+                await self.client.disconnect()
+                await self.client.initialize()
+
+                if not self.client.connected():
+                    continue
+
+                login_id = self._get_next_id()
+                future = asyncio.Future()
+                self.pending_requests[login_id] = future
+
+                await self.client.login(self.api_key, self.api_secret, id=login_id)
+                await asyncio.wait_for(future, timeout=10.0)
+
+                await self._rpc_request(
+                    self.client.set_cancel_on_disconnect, timeout_secs=15
+                )
+
+                logger.info("Reconnection successful.")
+                self.last_msg_time = time.time()
+                return
+
+            except Exception as e:
+                logger.error(f"Reconnection attempt {attempt + 1} failed: {e}")
+
+        logger.error("All reconnection attempts failed. Giving up.")
+        self.connected = False
 
     def _fail_pending_requests(self, exc: Exception):
         """Cancel all pending requests with exception"""

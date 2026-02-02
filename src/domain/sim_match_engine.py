@@ -28,12 +28,14 @@ class SimMatchEngine:
         tick_size: float = 0.5,
         maker_fee: float = -0.0001,
         taker_fee: float = 0.0003,
+        volume_fill_ratio: float = 0.3,
     ):
         self.latency_ms = latency_ms
         self.slippage_ticks = slippage_ticks
         self.tick_size = tick_size
         self.maker_fee = maker_fee
         self.taker_fee = taker_fee
+        self.volume_fill_ratio = volume_fill_ratio
 
         self.bid_book: List[SimOrder] = []
         self.ask_book: List[SimOrder] = []
@@ -96,11 +98,11 @@ class SimMatchEngine:
         self._match_asks(trade_price, trade_size, now)
 
     def _match_bids(self, trade_price: float, trade_size: float, now: float):
-        remaining = trade_size
+        available_fill = trade_size * self.volume_fill_ratio
         filled_orders = []
 
         for sim_order in self.bid_book:
-            if remaining <= 0:
+            if available_fill <= 0:
                 break
             if sim_order.active_time > now:
                 continue
@@ -111,25 +113,29 @@ class SimMatchEngine:
                 fill_price = sim_order.order.price - (
                     self.slippage_ticks * self.tick_size
                 )
-                fill_size = min(sim_order.order.size - sim_order.filled_size, remaining)
+                order_remaining = sim_order.order.size - sim_order.filled_size
+                fill_size = min(order_remaining, available_fill)
 
-                self._execute_fill(sim_order, fill_price, fill_size, now, is_maker=True)
-                remaining -= fill_size
+                if fill_size > 0:
+                    self._execute_fill(
+                        sim_order, fill_price, fill_size, now, is_maker=True
+                    )
+                    available_fill -= fill_size
 
-                if sim_order.filled_size >= sim_order.order.size:
-                    sim_order.status = "filled"
-                    filled_orders.append(sim_order)
+                    if sim_order.filled_size >= sim_order.order.size:
+                        sim_order.status = "filled"
+                        filled_orders.append(sim_order)
 
         for fo in filled_orders:
             if fo in self.bid_book:
                 self.bid_book.remove(fo)
 
     def _match_asks(self, trade_price: float, trade_size: float, now: float):
-        remaining = trade_size
+        available_fill = trade_size * self.volume_fill_ratio
         filled_orders = []
 
         for sim_order in self.ask_book:
-            if remaining <= 0:
+            if available_fill <= 0:
                 break
             if sim_order.active_time > now:
                 continue
@@ -140,14 +146,18 @@ class SimMatchEngine:
                 fill_price = sim_order.order.price + (
                     self.slippage_ticks * self.tick_size
                 )
-                fill_size = min(sim_order.order.size - sim_order.filled_size, remaining)
+                order_remaining = sim_order.order.size - sim_order.filled_size
+                fill_size = min(order_remaining, available_fill)
 
-                self._execute_fill(sim_order, fill_price, fill_size, now, is_maker=True)
-                remaining -= fill_size
+                if fill_size > 0:
+                    self._execute_fill(
+                        sim_order, fill_price, fill_size, now, is_maker=True
+                    )
+                    available_fill -= fill_size
 
-                if sim_order.filled_size >= sim_order.order.size:
-                    sim_order.status = "filled"
-                    filled_orders.append(sim_order)
+                    if sim_order.filled_size >= sim_order.order.size:
+                        sim_order.status = "filled"
+                        filled_orders.append(sim_order)
 
         for fo in filled_orders:
             if fo in self.ask_book:
