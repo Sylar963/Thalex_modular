@@ -1,6 +1,5 @@
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional
-from . import OrderSide
 
 
 @dataclass(slots=True)
@@ -32,9 +31,17 @@ class SimStats:
     win_rate: float
     total_pnl: float
     sharpe_ratio: float
+    sortino_ratio: float
+    calmar_ratio: float
     max_drawdown: float
     profit_factor: float
     avg_trade_pnl: float
+    avg_trade_duration: float
+    trades_per_day: float
+    total_fees_paid: float
+    total_slippage: float
+    gross_pnl: float
+    net_pnl: float
 
 
 @dataclass(slots=True)
