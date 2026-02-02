@@ -32,3 +32,14 @@ async def get_recent_ticker(
     """Live Top of Book (or recent history)."""
     tickers = await repo.get_recent_tickers(symbol, limit)
     return [asdict(t) for t in tickers]
+
+
+@router.get("/regime/history/{symbol}", response_model=List[Dict])
+async def get_regime_history(
+    symbol: str,
+    start: float,
+    end: float,
+    repo: MarketRepository = Depends(get_market_repo),
+):
+    """Get historical regime metrics (RV, Trend, EM, Vol Delta)."""
+    return await repo.get_regime_history(symbol, start, end)

@@ -19,6 +19,13 @@ class MarketRepository(BaseRepository):
             return await self.storage.get_history(symbol, start, end, resolution)
         return []
 
+    async def get_regime_history(
+        self, symbol: str, start: float, end: float
+    ) -> List[Dict]:
+        if not self.storage:
+            return []
+        return await self.storage.get_regime_history(symbol, start, end)
+
     async def get_instruments(self) -> List[Dict]:
         # Placeholder for instrument discovery.
         # Ideally fetches from Convex or Thalex Adapter cache.

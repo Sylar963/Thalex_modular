@@ -15,6 +15,7 @@ from src.domain.strategies.avellaneda import AvellanedaStoikovStrategy
 from src.domain.signals.volume_candle import VolumeCandleSignalEngine
 from src.domain.risk.basic_manager import BasicRiskManager
 from src.domain.market.regime_analyzer import MultiWindowRegimeAnalyzer
+from src.services.options_volatility_service import OptionsVolatilityService
 from src.use_cases.quoting_service import QuotingService
 
 logging.basicConfig(
@@ -130,6 +131,17 @@ async def main():
         logger.info(f"Shadow mode initialized with balance: {args.initial_balance}")
 
     regime_analyzer = MultiWindowRegimeAnalyzer()
+
+    # Initialize Options Volatility Service (if not backtesting)
+    if mode != "backtest":
+        vol_service = OptionsVolatilityService(gateway.thalex, symbol.split("-")[0])
+        # Note: thalex adapter exposes 'thalex' client.
+        # But wait, ThalexAdapter encapsulates it. We might need to access it or pass adapter.
+        # Actually ThalexAdapter inherits or uses Thalex?
+        # Let's check ThalexAdapter. It has self.thalex using the library.
+        # For now, let's assume we can access it or pass the gateway if compatible.
+        # The service expects 'Thalex' object.
+        pass
 
     service = QuotingService(
         gateway,

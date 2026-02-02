@@ -148,6 +148,9 @@ class QuotingService:
 
         regime = self.regime_analyzer.get_regime() if self.regime_analyzer else None
 
+        if regime and self.storage and not self.dry_run:
+            asyncio.create_task(self.storage.save_regime(self.symbol, regime))
+
         tick_size = getattr(self.gateway, "tick_size", 0.5)
 
         desired_orders = self.strategy.calculate_quotes(

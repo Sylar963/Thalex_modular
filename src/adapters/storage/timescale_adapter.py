@@ -1,7 +1,7 @@
 import asyncpg
 import logging
 from datetime import timedelta
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 from ...domain.interfaces import StorageGateway
 from ...domain.entities import Ticker, Trade, Position
 
@@ -92,9 +92,62 @@ class TimescaleDBAdapter(StorageGateway):
                         last_update TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
                     );
                 """)
+                # 4. Market Regimes Table
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS market_regimes (
+                        time TIMESTAMPTZ NOT NULL,
+                        symbol TEXT NOT NULL,
+                        regime_name TEXT,
+                        rv_fast DOUBLE PRECISION,
+                        rv_mid DOUBLE PRECISION,
+                        rv_slow DOUBLE PRECISION,
+                        trend_fast DOUBLE PRECISION,
+                        trend_mid DOUBLE PRECISION,
+                        trend_slow DOUBLE PRECISION,
+                        liquidity_score DOUBLE PRECISION,
+                        expected_move_pct DOUBLE PRECISION,
+                        atm_iv DOUBLE PRECISION,
+                        vol_delta DOUBLE PRECISION,
+                        is_overpriced BOOLEAN
+                    );
+                """)
+                try:
+                    await conn.execute(
+                        "SELECT create_hypertable('market_regimes', 'time', if_not_exists => TRUE);"
+                    )
+                except Exception:
+                    pass
             except Exception as e:
                 logger.error(f"Failed to initialize schema: {e}")
                 raise
+
+    async def save_regime(self, symbol: str, regime: Dict[str, Any]):
+        if not self.pool:
+            return
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO market_regimes 
+                    (time, symbol, regime_name, rv_fast, rv_mid, rv_slow, trend_fast, trend_mid, trend_slow, liquidity_score, expected_move_pct, atm_iv, vol_delta, is_overpriced)
+                    VALUES (NOW(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                    """,
+                    symbol,
+                    regime.get("name"),
+                    regime.get("rv_fast"),
+                    regime.get("rv_mid"),
+                    regime.get("rv_slow"),
+                    regime.get("trend_fast"),
+                    regime.get("trend_mid"),
+                    regime.get("trend_slow"),
+                    regime.get("liquidity_score"),
+                    regime.get("expected_move_pct"),
+                    regime.get("atm_iv"),
+                    regime.get("vol_delta"),
+                    regime.get("is_overpriced"),
+                )
+        except Exception as e:
+            logger.error(f"Failed to save regime: {e}")
 
     async def save_ticker(self, ticker: Ticker):
         if not self.pool:
@@ -286,6 +339,28 @@ class TimescaleDBAdapter(StorageGateway):
                     }
                     for r in rows
                 ]
+            return []
+
+    async def get_regime_history(
+        self, symbol: str, start: float, end: float
+    ) -> List[Dict]:
+        if not self.pool:
+            return []
+        try:
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT * FROM market_regimes
+                    WHERE symbol = $1
+                      AND time >= to_timestamp($2)
+                      AND time <= to_timestamp($3)
+                    ORDER BY time ASC
+                    """,
+                    symbol,
+                    start,
+                    end,
+                )
+                return [dict(r) for r in rows]
         except Exception as e:
-            logger.error(f"Failed to fetch history: {e}")
+            logger.error(f"Failed to fetch regime history: {e}")
             return []

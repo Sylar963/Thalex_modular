@@ -165,3 +165,15 @@ class StorageGateway(ABC):
     ) -> List[Dict]:
         """Retrieve OHLCV history."""
         pass
+
+    @abstractmethod
+    async def save_regime(self, symbol: str, regime: Dict[str, Any]):
+        """Save computed market regime metrics."""
+        pass
+
+    @abstractmethod
+    async def get_regime_history(
+        self, symbol: str, start: float, end: float
+    ) -> List[Dict]:
+        """Retrieve historical regime metrics."""
+        pass
