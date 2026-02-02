@@ -140,16 +140,39 @@ class AvellanedaStoikovStrategy(Strategy):
             gamma *= 0.5
 
         if regime:
-            if regime.name == "Volatile":
+            # Handle regime as a dictionary
+            regime_name = regime.get("name", "Quiet")
+            vol_delta = regime.get("vol_delta", 0.0)
+            is_overpriced = regime.get("is_overpriced", False)
+
+            if regime_name == "Volatile":
                 # Widen spreads in high vol
                 gamma *= 1.5
                 volatility_mult *= 1.5
-            elif regime.name == "Trending":
+            elif regime_name == "Trending":
                 # Skew heavily against inventory in trends
                 inventory_factor *= 2.0
-            elif regime.name == "Illiquid":
+            elif regime_name == "Illiquid":
                 # Be more conservative
                 gamma *= 1.2
+            elif regime_name == "OverpricedVol" or is_overpriced:
+                # IV >> RV: Market is paying up for options.
+                # Widen spreads to capture premium, but maybe trade more aggressive size?
+                # For now, just widen slightly to be safe and capture edge.
+                gamma *= 1.25
+
+            # Dynamic Volatility Scaling based on Option Market Implieds
+            # If IV is significantly higher than RV (positive vol_delta), we might want to
+            # increase our volatility estimate.
+            # However, if RV is spiking (Expansionary) and IV hasn't caught up, we are in danger.
+
+            # If vol_delta is negative (RV > EM), it means realized movement is EXCEEDING expected.
+            # This is dangerous. Widen significantly.
+            if vol_delta < -0.05:  # RV is 5% higher than EM
+                gamma *= 1.5
+                logger.warning(
+                    f"Expansionary Volatility Detected (Delta={vol_delta:.2f}). Widening spreads."
+                )
 
         # --- 1. Spread Calculation (Heuristic) ---
 

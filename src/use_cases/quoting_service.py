@@ -20,6 +20,7 @@ from ..domain.entities import (
     OrderSide,
 )
 from ..domain.entities.pnl import EquitySnapshot
+from ..domain.tracking.state_tracker import StateTracker
 
 if TYPE_CHECKING:
     from ..domain.sim_match_engine import SimMatchEngine
@@ -45,6 +46,7 @@ class QuotingService:
         sim_engine: Optional["SimMatchEngine"] = None,
         sim_state: Optional["SimStateManager"] = None,
         regime_analyzer: Optional[RegimeAnalyzer] = None,
+        state_tracker: Optional[StateTracker] = None,
     ):
         self.gateway = gateway
         self.strategy = strategy
@@ -55,14 +57,10 @@ class QuotingService:
         self.sim_engine = sim_engine
         self.sim_state = sim_state
         self.regime_analyzer = regime_analyzer
+        self.state_tracker = state_tracker or StateTracker()
 
         self.symbol: str = ""
         self.market_state = MarketState()
-        self.position = Position("", 0.0, 0.0)
-        self.active_orders: Dict[OrderSide, List[Order]] = {
-            OrderSide.BUY: [],
-            OrderSide.SELL: [],
-        }
         self.running = False
         self.tick_size = 1.0
         self._reconcile_lock = asyncio.Lock()
@@ -77,17 +75,28 @@ class QuotingService:
         # 1. Setup Callbacks
         self.gateway.set_ticker_callback(self.on_ticker_update)
         self.gateway.set_trade_callback(self.on_trade_update)
+        self.gateway.set_order_callback(self.state_tracker.on_order_update)
+        self.gateway.set_position_callback(self.state_tracker.update_position)
+
+        # Wire reactive events
+        self.state_tracker.set_fill_callback(self.on_fill_event)
+        self.state_tracker.set_state_gap_callback(self.on_sequence_gap)
+
+        # Start state tracker
+        await self.state_tracker.start()
 
         # 2. Connect
         await self.gateway.connect()
 
-        # 3. Initial State Fetch
+        # 3. Initial State Fetch & Sync
         try:
-            self.position = await self.gateway.get_position(symbol)
-            logger.info(f"Initial Position: {self.position}")
+            initial_pos = await self.gateway.get_position(symbol)
+            await self.state_tracker.update_position(
+                symbol, initial_pos.size, initial_pos.entry_price
+            )
+            logger.info(f"Initial Position: {initial_pos}")
         except Exception as e:
             logger.warning(f"Could not fetch initial position: {e}")
-            self.position = Position(symbol, 0.0, 0.0)
 
         # 4. Subscribe
         await self.gateway.subscribe_ticker(symbol)
@@ -153,8 +162,11 @@ class QuotingService:
 
         tick_size = getattr(self.gateway, "tick_size", 0.5)
 
+        # 2. Strategy Logic
+        position = self.state_tracker.get_position(self.symbol)
+
         desired_orders = self.strategy.calculate_quotes(
-            self.market_state, self.position, regime=regime, tick_size=tick_size
+            self.market_state, position, regime=regime, tick_size=tick_size
         )
 
         # 3.1 Force Tick Alignment
@@ -166,11 +178,12 @@ class QuotingService:
 
         # 4. Risk Validation
         valid_orders = []
+        position = self.state_tracker.get_position(self.symbol)
+        open_orders = [t.order for t in self.state_tracker.get_open_orders()]
+
         for o in desired_orders:
-            # We validate against the orders we have already accepted for this cycle
-            # This ensures the TOTAL set of orders + position is within limits
             if self.risk_manager.validate_order(
-                o, self.position, active_orders=valid_orders
+                o, position, active_orders=valid_orders
             ):
                 valid_orders.append(o)
             else:
@@ -233,19 +246,17 @@ class QuotingService:
 
     async def _cancel_side(self, side: OrderSide):
         """Emergency cancel for a specific side."""
-        orders_to_cancel = self.active_orders.get(side, [])
+        orders_to_cancel = self.state_tracker.get_open_orders(side=side)
         if not orders_to_cancel:
             return
 
         tasks = [
-            self.gateway.cancel_order(o.exchange_id)
-            for o in orders_to_cancel
-            if o.exchange_id
+            self.gateway.cancel_order(t.order.exchange_id)
+            for t in orders_to_cancel
+            if t.order.exchange_id
         ]
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-            # Optimistically clear
-            self.active_orders[side] = []
 
     async def _fast_reconcile(self):
         """Wrapper to run reconciliation logic triggered by trades."""
@@ -260,8 +271,9 @@ class QuotingService:
             # For now, keeping it inline for minimizing diffs.
 
             tick_size = getattr(self.gateway, "tick_size", 0.5)
+            position = self.state_tracker.get_position(self.symbol)
             desired_orders = self.strategy.calculate_quotes(
-                self.market_state, self.position, tick_size=tick_size
+                self.market_state, position, tick_size=tick_size
             )
             # Tick align
             for i in range(len(desired_orders)):
@@ -297,7 +309,9 @@ class QuotingService:
 
         for side in [OrderSide.BUY, OrderSide.SELL]:
             desired_list = desired_by_side.get(side, [])
-            active_list = self.active_orders.get(side, [])
+            active_list = [
+                t.order for t in self.state_tracker.get_open_orders(side=side)
+            ]
 
             # Smart Diff Strategy:
             # 1. Map active by ID
@@ -393,65 +407,56 @@ class QuotingService:
             else:
                 await self.gateway.cancel_orders_batch(to_cancel_ids)
 
-            cancelled_set = set(to_cancel_ids)
-            for side in [OrderSide.BUY, OrderSide.SELL]:
-                self.active_orders[side] = [
-                    o
-                    for o in self.active_orders[side]
-                    if o.exchange_id not in cancelled_set and o.id not in cancelled_set
-                ]
-
         if to_place_orders:
+            for o in to_place_orders:
+                await self.state_tracker.submit_order(o)
+
             if self.dry_run and self.sim_engine:
                 for o in to_place_orders:
                     self.sim_engine.submit_order(o)
-                    self.active_orders[o.side].append(
-                        replace(o, status=OrderStatus.OPEN)
-                    )
             else:
                 new_orders = await self.gateway.place_orders_batch(to_place_orders)
                 for o in new_orders:
-                    if o.status == OrderStatus.OPEN:
-                        self.active_orders[o.side].append(o)
+                    if o.status == OrderStatus.OPEN and o.exchange_id:
+                        await self.state_tracker.on_order_ack(o.id, o.exchange_id)
 
     async def _cancel_all(self):
-        all_active = []
-        for side, orders in self.active_orders.items():
-            all_active.extend(orders)
-
+        all_active = self.state_tracker.get_open_orders()
         if not all_active:
             return
 
         tasks = [
-            self.gateway.cancel_order(o.exchange_id)
-            for o in all_active
-            if o.exchange_id
+            self.gateway.cancel_order(t.order.exchange_id)
+            for t in all_active
+            if t.order.exchange_id
         ]
         await asyncio.gather(*tasks, return_exceptions=True)
 
-        self.active_orders[OrderSide.BUY] = []
-        self.active_orders[OrderSide.SELL] = []
-
     async def _sync_active_orders(self):
-        """Ensure active_orders only contains orders that still exist on exchange."""
-        for side in [OrderSide.BUY, OrderSide.SELL]:
-            active_list = self.active_orders.get(side, [])
-            valid_orders = []
+        """Force a snapshot sync if state is suspected to be drifted."""
+        try:
+            exchange_orders = await self.gateway.get_open_orders(self.symbol)
+            pos = await self.gateway.get_position(self.symbol)
 
-            for order in active_list:
-                if not order.exchange_id:
-                    continue
+            await self.state_tracker.force_snapshot_sync(
+                exchange_orders, {self.symbol: pos}
+            )
+            logger.info("Reactive State Sync Complete.")
+        except Exception as e:
+            logger.error(f"Failed to sync state: {e}")
 
-                current = self.gateway.orders.get(order.exchange_id)
+    async def on_fill_event(self, exchange_id: str, price: float, size: float):
+        """Reactive fill handler."""
+        logger.info(f"FILL RECEIVED: {exchange_id} at {price} ({size} units)")
+        # Trigger immediate re-quotes or signal updates if needed
+        # This allows the bot to react to fills faster than the next ticker
+        if not self._reconcile_lock.locked():
+            # Trigger a fast reconcile cycle
+            pass
 
-                if not current:
-                    # Assume valid if not found in local cache (transient)
-                    valid_orders.append(order)
-                elif current.status in [OrderStatus.OPEN, OrderStatus.PENDING]:
-                    valid_orders.append(order)
-                else:
-                    logger.info(
-                        f"Active order {order.exchange_id} ({side}) is now {current.status}. Removing."
-                    )
-
-            self.active_orders[side] = valid_orders
+    async def on_sequence_gap(self, gap_size: int):
+        """Reactive gap handler: force state sync."""
+        logger.warning(
+            f"CRITICAL: State Gap Detected ({gap_size} msgs). Forcing re-sync."
+        )
+        await self._sync_active_orders()

@@ -16,6 +16,7 @@ from src.domain.signals.volume_candle import VolumeCandleSignalEngine
 from src.domain.risk.basic_manager import BasicRiskManager
 from src.domain.market.regime_analyzer import MultiWindowRegimeAnalyzer
 from src.services.options_volatility_service import OptionsVolatilityService
+from src.domain.tracking.state_tracker import StateTracker
 from src.use_cases.quoting_service import QuotingService
 
 logging.basicConfig(
@@ -134,14 +135,26 @@ async def main():
 
     # Initialize Options Volatility Service (if not backtesting)
     if mode != "backtest":
-        vol_service = OptionsVolatilityService(gateway.thalex, symbol.split("-")[0])
-        # Note: thalex adapter exposes 'thalex' client.
-        # But wait, ThalexAdapter encapsulates it. We might need to access it or pass adapter.
-        # Actually ThalexAdapter inherits or uses Thalex?
-        # Let's check ThalexAdapter. It has self.thalex using the library.
-        # For now, let's assume we can access it or pass the gateway if compatible.
-        # The service expects 'Thalex' object.
-        pass
+        # Pass the underlying Thalex client to the service
+        vol_service = OptionsVolatilityService(gateway.client, symbol.split("-")[0])
+
+        async def _poll_vol_data():
+            while True:
+                try:
+                    em_pct, atm_iv = await vol_service.get_expected_move()
+                    if em_pct > 0:
+                        regime_analyzer.set_option_data(em_pct, atm_iv)
+                        logger.debug(
+                            f"Updated Regime with Options Data: EM={em_pct:.2%}, IV={atm_iv:.2%}"
+                        )
+                except Exception as e:
+                    logger.error(f"Failed to poll options data: {e}")
+                await asyncio.sleep(15)  # Poll every 15s
+
+        # Create background task
+        asyncio.create_task(_poll_vol_data())
+
+    state_tracker = StateTracker()
 
     service = QuotingService(
         gateway,
@@ -153,6 +166,7 @@ async def main():
         sim_engine=sim_engine,
         sim_state=sim_state,
         regime_analyzer=regime_analyzer,
+        state_tracker=state_tracker,
     )
 
     loop = asyncio.get_running_loop()

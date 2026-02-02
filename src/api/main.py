@@ -7,7 +7,7 @@ from .dependencies import init_dependencies, close_dependencies
 # Load environment variables
 load_dotenv()
 
-from .v1.endpoints import market, portfolio, simulation, config
+from .v1.endpoints import market, portfolio, simulation, config, aggregated
 
 
 @asynccontextmanager
@@ -45,6 +45,7 @@ app.include_router(market.router, prefix="/api/v1/market", tags=["Market"])
 app.include_router(portfolio.router, prefix="/api/v1/portfolio", tags=["Portfolio"])
 app.include_router(simulation.router, prefix="/api/v1/simulation", tags=["Simulation"])
 app.include_router(config.router, prefix="/api/v1/config", tags=["Configuration"])
+app.include_router(aggregated.router, prefix="/api/v1/aggregated", tags=["Aggregated"])
 
 
 @app.get("/health")

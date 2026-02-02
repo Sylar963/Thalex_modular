@@ -44,11 +44,13 @@ class TimescaleDBAdapter(StorageGateway):
                     CREATE TABLE IF NOT EXISTS market_tickers (
                         time TIMESTAMPTZ NOT NULL,
                         symbol TEXT NOT NULL,
+                        exchange TEXT NOT NULL DEFAULT 'thalex',
                         bid DOUBLE PRECISION,
                         ask DOUBLE PRECISION,
                         last DOUBLE PRECISION,
                         volume DOUBLE PRECISION
                     );
+                """)
                 """)
                 # Convert to hypertable (if not already)
                 try:
@@ -65,12 +67,14 @@ class TimescaleDBAdapter(StorageGateway):
                     CREATE TABLE IF NOT EXISTS market_trades (
                         time TIMESTAMPTZ NOT NULL,
                         symbol TEXT NOT NULL,
+                        exchange TEXT NOT NULL DEFAULT 'thalex',
                         price DOUBLE PRECISION,
                         size DOUBLE PRECISION,
                         side TEXT,
                         trade_id TEXT
                     );
                 """)
+
                 try:
                     await conn.execute(
                         "SELECT create_hypertable('market_trades', 'time', if_not_exists => TRUE);"
@@ -81,7 +85,8 @@ class TimescaleDBAdapter(StorageGateway):
                 # 3. Portfolio Positions Table (Snapshot)
                 await conn.execute("""
                     CREATE TABLE IF NOT EXISTS portfolio_positions (
-                        symbol TEXT PRIMARY KEY,
+                        symbol TEXT NOT NULL,
+                        exchange TEXT NOT NULL DEFAULT 'thalex',
                         size DOUBLE PRECISION NOT NULL,
                         entry_price DOUBLE PRECISION,
                         mark_price DOUBLE PRECISION,
@@ -89,9 +94,11 @@ class TimescaleDBAdapter(StorageGateway):
                         delta DOUBLE PRECISION,
                         gamma DOUBLE PRECISION,
                         theta DOUBLE PRECISION,
-                        last_update TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+                        last_update TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (symbol, exchange)
                     );
                 """)
+
                 # 4. Market Regimes Table
                 await conn.execute("""
                     CREATE TABLE IF NOT EXISTS market_regimes (
@@ -156,11 +163,12 @@ class TimescaleDBAdapter(StorageGateway):
             async with self.pool.acquire() as conn:
                 await conn.execute(
                     """
-                    INSERT INTO market_tickers (time, symbol, bid, ask, last, volume)
-                    VALUES (to_timestamp($1), $2, $3, $4, $5, $6)
+                    INSERT INTO market_tickers (time, symbol, exchange, bid, ask, last, volume)
+                    VALUES (to_timestamp($1), $2, $3, $4, $5, $6, $7)
                     """,
                     ticker.timestamp,
                     ticker.symbol,
+                    ticker.exchange,
                     ticker.bid,
                     ticker.ask,
                     ticker.last,
@@ -169,6 +177,7 @@ class TimescaleDBAdapter(StorageGateway):
         except Exception as e:
             logger.error(f"Failed to save ticker: {e}")
 
+
     async def save_trade(self, trade: Trade):
         if not self.pool:
             return
@@ -176,11 +185,12 @@ class TimescaleDBAdapter(StorageGateway):
             async with self.pool.acquire() as conn:
                 await conn.execute(
                     """
-                    INSERT INTO market_trades (time, symbol, price, size, side, trade_id)
-                    VALUES (to_timestamp($1), $2, $3, $4, $5, $6)
+                    INSERT INTO market_trades (time, symbol, exchange, price, size, side, trade_id)
+                    VALUES (to_timestamp($1), $2, $3, $4, $5, $6, $7)
                     """,
                     trade.timestamp,
                     trade.symbol,
+                    trade.exchange,
                     trade.price,
                     trade.size,
                     trade.side.value,
@@ -189,17 +199,17 @@ class TimescaleDBAdapter(StorageGateway):
         except Exception as e:
             logger.error(f"Failed to save trade: {e}")
 
+
     async def save_position(self, position: Position):
-        """Upsert current position snapshot."""
         if not self.pool:
             return
         try:
             async with self.pool.acquire() as conn:
                 await conn.execute(
                     """
-                    INSERT INTO portfolio_positions (symbol, size, entry_price, mark_price, unrealized_pnl, delta, gamma, theta, last_update)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP)
-                    ON CONFLICT (symbol) DO UPDATE SET
+                    INSERT INTO portfolio_positions (symbol, exchange, size, entry_price, mark_price, unrealized_pnl, delta, gamma, theta, last_update)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP)
+                    ON CONFLICT (symbol, exchange) DO UPDATE SET
                         size = EXCLUDED.size,
                         entry_price = EXCLUDED.entry_price,
                         mark_price = EXCLUDED.mark_price,
@@ -210,16 +220,18 @@ class TimescaleDBAdapter(StorageGateway):
                         last_update = CURRENT_TIMESTAMP
                     """,
                     position.symbol,
+                    position.exchange,
                     position.size,
                     position.entry_price,
-                    0.0,  # mark_price placeholder
-                    0.0,  # unrealized_pnl placeholder
-                    0.0,  # delta placeholder
-                    0.0,  # gamma placeholder
-                    0.0,  # theta placeholder
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
                 )
         except Exception as e:
             logger.error(f"Failed to save position: {e}")
+
 
     async def get_latest_positions(self) -> List[Position]:
         """Fetch all non-zero positions from the database."""

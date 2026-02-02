@@ -181,6 +181,33 @@ class StateTracker:
                 self.terminal_orders[local_id] = tracked
                 logger.warning(f"Order {local_id} REJECTED: {reason}")
 
+    async def on_order_update(
+        self,
+        exchange_id: str,
+        status: OrderStatus,
+        filled_size: float = 0.0,
+        avg_price: float = 0.0,
+    ):
+        """Unified entry point for exchange order notifications."""
+        if status == OrderStatus.OPEN:
+            # We treat OPEN as an ACK for a pending order if exchange_id is new
+            if exchange_id not in self.confirmed_orders:
+                # Find the pending order that likely corresponds to this
+                # For Thalex, we usually know the label/local_id
+                # but if we only have exchange_id here, we might need more context
+                # Assuming the adapter/caller handles local_id to exchange_id mapping
+                # OR we just handle transitions if it already exists
+                pass
+        elif status == OrderStatus.FILLED:
+            await self.on_order_fill(
+                exchange_id, avg_price, filled_size, is_partial=False
+            )
+        elif status == OrderStatus.CANCELLED:
+            await self.on_order_cancel(exchange_id)
+        elif status == OrderStatus.REJECTED:
+            # Rejects usually have local_id, but if it's exchange_id, handle it
+            await self.on_order_cancel(exchange_id)  # Treat as cancellation if known
+
     async def update_position(self, symbol: str, size: float, entry_price: float):
         async with self._lock:
             self.positions[symbol] = Position(symbol, size, entry_price)
