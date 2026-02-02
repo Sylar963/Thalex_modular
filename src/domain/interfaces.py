@@ -100,9 +100,21 @@ class SignalEngine(ABC):
         pass
 
 
-class RiskManager(ABC):
-    """Abstract interface for risk management."""
+class RegimeAnalyzer(ABC):
+    @abstractmethod
+    def update(self, ticker: Ticker) -> None:
+        pass
 
+    @abstractmethod
+    def set_option_data(self, em_pct: float, atm_iv: float) -> None:
+        pass
+
+    @abstractmethod
+    def get_regime(self) -> Dict[str, Any]:
+        pass
+
+
+class RiskManager(ABC):
     @abstractmethod
     def validate_order(
         self,

@@ -42,6 +42,7 @@ class Ticker:
     ask_size: float
     last: float
     volume: float
+    exchange: str = "thalex"
     timestamp: float = field(default_factory=time.time)
 
     @property
@@ -55,13 +56,14 @@ class Ticker:
 
 @dataclass(slots=True)
 class Order:
-    id: str  # Client Order ID
+    id: str
     symbol: str
     side: OrderSide
     price: float
     size: float
     type: OrderType = OrderType.LIMIT
     status: OrderStatus = OrderStatus.PENDING
+    exchange: str = "thalex"
     exchange_id: Optional[str] = None
     filled_size: float = 0.0
     post_only: bool = False
@@ -76,6 +78,7 @@ class Trade:
     side: OrderSide
     price: float
     size: float
+    exchange: str = "thalex"
     fee: float = 0.0
     timestamp: float = field(default_factory=time.time)
 
@@ -85,6 +88,7 @@ class Position:
     symbol: str
     size: float
     entry_price: float
+    exchange: str = "thalex"
     unrealized_pnl: float = 0.0
     realized_pnl: float = 0.0
     timestamp: float = field(default_factory=time.time)
