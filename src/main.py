@@ -14,6 +14,7 @@ from src.adapters.exchanges.thalex_adapter import ThalexAdapter
 from src.domain.strategies.avellaneda import AvellanedaStoikovStrategy
 from src.domain.signals.volume_candle import VolumeCandleSignalEngine
 from src.domain.risk.basic_manager import BasicRiskManager
+from src.domain.market.regime_analyzer import MultiWindowRegimeAnalyzer
 from src.use_cases.quoting_service import QuotingService
 
 logging.basicConfig(
@@ -128,6 +129,8 @@ async def main():
         await sim_state.start(symbol, args.initial_balance, mode="shadow")
         logger.info(f"Shadow mode initialized with balance: {args.initial_balance}")
 
+    regime_analyzer = MultiWindowRegimeAnalyzer()
+
     service = QuotingService(
         gateway,
         strategy,
@@ -137,6 +140,7 @@ async def main():
         dry_run=dry_run,
         sim_engine=sim_engine,
         sim_state=sim_state,
+        regime_analyzer=regime_analyzer,
     )
 
     loop = asyncio.get_running_loop()

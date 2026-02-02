@@ -9,6 +9,7 @@ from ..domain.interfaces import (
     SignalEngine,
     RiskManager,
     StorageGateway,
+    RegimeAnalyzer,
 )
 from ..domain.entities import (
     MarketState,
@@ -43,6 +44,7 @@ class QuotingService:
         dry_run: bool = False,
         sim_engine: Optional["SimMatchEngine"] = None,
         sim_state: Optional["SimStateManager"] = None,
+        regime_analyzer: Optional[RegimeAnalyzer] = None,
     ):
         self.gateway = gateway
         self.strategy = strategy
@@ -52,6 +54,7 @@ class QuotingService:
         self.dry_run = dry_run
         self.sim_engine = sim_engine
         self.sim_state = sim_state
+        self.regime_analyzer = regime_analyzer
 
         self.symbol: str = ""
         self.market_state = MarketState()
@@ -140,12 +143,15 @@ class QuotingService:
             await self._cancel_all()
             return
 
-        # 3. Strategy Calculation
-        # Safely get tick_size from gateway, falling back to 0.5 (BTC default)
+        if self.regime_analyzer:
+            self.regime_analyzer.update(ticker)
+
+        regime = self.regime_analyzer.get_regime() if self.regime_analyzer else None
+
         tick_size = getattr(self.gateway, "tick_size", 0.5)
 
         desired_orders = self.strategy.calculate_quotes(
-            self.market_state, self.position, tick_size=tick_size
+            self.market_state, self.position, regime=regime, tick_size=tick_size
         )
 
         # 3.1 Force Tick Alignment
