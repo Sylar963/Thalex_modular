@@ -1,5 +1,6 @@
 import asyncpg
 import logging
+from datetime import timedelta
 from typing import List, Optional, Dict
 from ...domain.interfaces import StorageGateway
 from ...domain.entities import Ticker, Trade, Position
@@ -185,6 +186,7 @@ class TimescaleDBAdapter(StorageGateway):
                         symbol=r["symbol"],
                         size=r["size"],
                         entry_price=r["entry_price"],
+                        unrealized_pnl=r["unrealized_pnl"] or 0.0,
                     )
                     for r in rows
                 ]
@@ -237,12 +239,12 @@ class TimescaleDBAdapter(StorageGateway):
 
         # rudimentary interval mapping
         interval_map = {
-            "1m": "1 minute",
-            "5m": "5 minutes",
-            "1h": "1 hour",
-            "1d": "1 day",
+            "1m": timedelta(minutes=1),
+            "5m": timedelta(minutes=5),
+            "1h": timedelta(hours=1),
+            "1d": timedelta(days=1),
         }
-        bucket_interval = interval_map.get(resolution, "1 minute")
+        bucket_interval = interval_map.get(resolution, timedelta(minutes=1))
 
         try:
             async with self.pool.acquire() as conn:

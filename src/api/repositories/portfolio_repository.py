@@ -7,7 +7,17 @@ class PortfolioRepository(BaseRepository):
     async def get_summary(self) -> Dict:
         # Derived summary from database positions
         # Ideally, we'd have a separate account balance table, but for now:
-        positions = await self.db_adapter.get_latest_positions()
+        if not self.storage:
+            return {
+                "equity": 0.0,
+                "margin_used": 0.0,
+                "margin_available": 0.0,
+                "daily_pnl": 0.0,
+                "unrealized_pnl": 0.0,
+                "positions_count": 0,
+            }
+
+        positions = await self.storage.get_latest_positions()
         unrealized_pnl = sum(getattr(p, "unrealized_pnl", 0.0) for p in positions)
 
         return {
@@ -21,20 +31,20 @@ class PortfolioRepository(BaseRepository):
 
     async def get_positions(self) -> List[Dict]:
         """Fetch active positions from DB."""
-        if not self.db_adapter:
+        if not self.storage:
             return []
 
-        positions = await self.db_adapter.get_latest_positions()
+        positions = await self.storage.get_latest_positions()
         return [
             {
                 "symbol": p.symbol,
                 "size": p.size,
                 "entry_price": p.entry_price,
                 "mark_price": 0.0,  # Will be filled if mark_price stored
-                "unrealized_pnl": 0.0,
-                "delta": 0.0,
-                "gamma": 0.0,
-                "theta": 0.0,
+                "unrealized_pnl": getattr(p, "unrealized_pnl", 0.0),
+                "delta": getattr(p, "delta", 0.0),
+                "gamma": getattr(p, "gamma", 0.0),
+                "theta": getattr(p, "theta", 0.0),
             }
             for p in positions
         ]
