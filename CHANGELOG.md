@@ -17,6 +17,12 @@ All notable changes to this project will be documented in this file.
 - **Environment Configuration**: Fixed `.env` loading priority in `main.py` to ensure database credentials are available to all adapters before initialization.
 - **Empty Backfills**: Resolved issue where historical data loader returned zero records due to incorrect instrument name generation and missing `BTCUSD` underlying mappings.
 
+### Enhanced
+- **Hybrid Chart History**: Implemented automatic fallback to `market_tickers` when `market_trades` are empty, ensuring charts always display data even in low-liquidity conditions.
+- **Execution Persistence**: Created `bot_executions` table and API endpoint (`/portfolio/executions`) for dedicated tracking and plotting of bot fills.
+- **Position Reliability**: Added robust persistence callback in `QuotingService` to ensure live positions are always saved to `portfolio_positions`, fixing empty dashboard widgets.
+- **Database Schema**: Added `exchange` column migration to core tables to support multi-exchange architecture in the future.
+
 ---
 
 ## [Previous Milestones]

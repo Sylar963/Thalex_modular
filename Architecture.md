@@ -78,9 +78,12 @@ Adjusts strategy parameters based on real-time market conditions.
 - **Partial Fills**: Highly accurate tracking of simulated fill sizes.
 - **SSE Streams**: Live equity curves and fills are broadcasted via SSE to the dashboard.
 
-### 5. **Data Infrastructure**
-- **ThalexAdapter**: High-performance JSON-RPC client with Token Bucket rate limiting (targeting 90% of exchange limits).
-- **TimescaleDB**: High-resolution persistence. Uses hypertables for efficient storage of 1-minute OHLCV data and tick-by-tick trade history.
+### 5. **Data Infrastructure & Persistence**
+- **ThalexAdapter**: High-performance JSON-RPC client with Token Bucket rate limiting.
+- **TimescaleDB**:
+  - **Hypertables**: Efficient storage of 1m OHLCV, ticks, and trades.
+  - **Hybrid History**: Automatically serves chart data from Tickers (Quotes) if Trades (Tape) are missing, ensuring high availability.
+  - **Bot Executions**: Dedicated `bot_executions` table for precise fill tracking separate from public data.
 
 ---
 
@@ -90,7 +93,11 @@ Adjusts strategy parameters based on real-time market conditions.
 `WebSocket` -> `Adapter` -> `StateTracker` (Latency check) -> `RegimeAnalyzer` -> `QuotingService` -> `Strategy` -> `RiskCheck` -> `OrderReconciler` -> `Adapter/SimMatchEngine`.
 
 ### **Reactive Trace**:
-`Private Fill Msg` -> `StateTracker` -> `QuotingService.on_fill_event()` -> `Immediate Alpha Calculation`.
+`Private Fill Msg` -> `StateTracker` -> `QuotingService.on_fill_event()` -> `Persistence (bot_executions)` + `Immediate Alpha Calculation`.
+
+### **Persistence Flow**:
+- **Positions**: `WS Position Update` -> `ThalexAdapter` -> `QuotingService.on_position_update` -> `TimescaleDB (portfolio_positions)`.
+- **Public Trades**: `WS Trade` -> `ThalexAdapter` -> `QuotingService.on_trade_update` -> `TimescaleDB (market_trades, market_tickers)`.
 
 ---
 
