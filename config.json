@@ -1,5 +1,9 @@
 {
     "primary_instrument": "BTC-PERPETUAL",
+    "exchange": {
+        "me_rate_limit": 45.0,
+        "cancel_rate_limit": 900.0
+    },
     "strategy": {
         "name": "avellaneda",
         "params": {
@@ -15,6 +19,12 @@
     "risk": {
         "max_position": 0.01,
         "max_order_size": 0.001
+    },
+    "signals": {
+        "volume_candle": {
+            "volume_threshold": 10.0,
+            "max_candles": 50
+        }
     },
     "throttling": {
         "min_edge_threshold": 0.5

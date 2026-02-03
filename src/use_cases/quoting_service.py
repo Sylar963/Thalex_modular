@@ -62,11 +62,11 @@ class QuotingService:
         self.symbol: str = ""
         self.market_state = MarketState()
         self.running = False
-        self.tick_size = 1.0
         self._reconcile_lock = asyncio.Lock()
         self._last_equity_snapshot_time = 0.0
         self._last_mid_price = 0.0
         self.min_edge_threshold = 0.5
+        self.tick_size = 0.5
 
     async def start(self, symbol: str):
         self.symbol = symbol
@@ -91,13 +91,20 @@ class QuotingService:
         # 2. Connect
         await self.gateway.connect()
 
+        # 2.5 Clean Slate: Cancel all existing orders and clear local state
+        if hasattr(self.gateway, "cancel_all_orders"):
+            logger.info("Cancelling all existing orders on startup for clean state...")
+            await self.gateway.cancel_all_orders(symbol)
+            self.state_tracker.pending_orders.clear()
+            self.state_tracker.confirmed_orders.clear()
+            logger.info("StateTracker order state cleared.")
+
         # 3. Initial State Fetch & Sync
         try:
             initial_pos = await self.gateway.get_position(symbol)
             await self.state_tracker.update_position(
                 symbol, initial_pos.size, initial_pos.entry_price
             )
-            # Persist initial state too
             if self.storage:
                 await self.storage.save_position(initial_pos)
             logger.info(f"Initial Position: {initial_pos}")
@@ -424,7 +431,10 @@ class QuotingService:
                 for oid in to_cancel_ids:
                     self.sim_engine.cancel_order(oid)
             else:
-                await self.gateway.cancel_orders_batch(to_cancel_ids)
+                results = await self.gateway.cancel_orders_batch(to_cancel_ids)
+                for oid, success in zip(to_cancel_ids, results):
+                    if success:
+                        await self.state_tracker.on_order_cancel(oid)
 
         if to_place_orders:
             if self.dry_run and self.sim_engine:

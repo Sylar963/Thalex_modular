@@ -76,5 +76,6 @@ The system leverages TimescaleDB as a "Single Source of Truth":
 
 ---
 *This document is a living record of project directives and should be updated as the roadmap evolves.*
+
 DONT COMMENT WHILE WRITING CODE*
 ALWAYS USE VENV FIRST TO RUN COMMANDS.

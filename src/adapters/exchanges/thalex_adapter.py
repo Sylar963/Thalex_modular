@@ -72,7 +72,14 @@ class ThalexAdapter(ExchangeGateway):
     Implements robust connection handling, heartbeat monitoring, and RPC correlation.
     """
 
-    def __init__(self, api_key: str, api_secret: str, testnet: bool = True):
+    def __init__(
+        self,
+        api_key: str,
+        api_secret: str,
+        testnet: bool = True,
+        me_rate_limit: float = 45.0,
+        cancel_rate_limit: float = 900.0,
+    ):
         self.api_key = api_key
         self.api_secret = api_secret
         self.network = Network.TEST if testnet else Network.PROD
@@ -101,8 +108,12 @@ class ThalexAdapter(ExchangeGateway):
 
         self.sequence_callback: Optional[Callable] = None
 
-        self.me_rate_limiter = TokenBucket(capacity=50, fill_rate=45.0)
-        self.cancel_rate_limiter = TokenBucket(capacity=1000, fill_rate=900.0)
+        self.me_rate_limiter = TokenBucket(
+            capacity=int(me_rate_limit * 1.1), fill_rate=me_rate_limit
+        )
+        self.cancel_rate_limiter = TokenBucket(
+            capacity=int(cancel_rate_limit * 1.1), fill_rate=cancel_rate_limit
+        )
 
     def _get_next_id(self) -> int:
         self.request_id_counter += 1
@@ -494,6 +505,19 @@ class ThalexAdapter(ExchangeGateway):
                     )
             outcomes.append(success)
         return outcomes
+
+    async def cancel_all_orders(self, symbol: str = None) -> bool:
+        if not self.connected:
+            return False
+
+        try:
+            result = await self._rpc_request(self.client.cancel_all)
+            self.orders.clear()
+            logger.info(f"Cancelled all orders. Result: {result}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to cancel all orders: {e}")
+            return False
 
     async def get_position(self, symbol: str) -> Position:
         return self.positions.get(symbol, Position(symbol, 0.0, 0.0))

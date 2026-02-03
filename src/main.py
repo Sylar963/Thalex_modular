@@ -89,7 +89,14 @@ async def main():
     if not api_key or not api_secret:
         logger.warning("API credentials not found in environment.")
 
-    gateway = ThalexAdapter(api_key, api_secret, testnet=testnet)
+    exchange_config = bot_config.get("exchange", {})
+    gateway = ThalexAdapter(
+        api_key,
+        api_secret,
+        testnet=testnet,
+        me_rate_limit=exchange_config.get("me_rate_limit", 45.0),
+        cancel_rate_limit=exchange_config.get("cancel_rate_limit", 900.0),
+    )
 
     db_user = os.getenv("DATABASE_USER", "postgres")
     db_pass = os.getenv("DATABASE_PASSWORD", "password")
@@ -113,7 +120,11 @@ async def main():
     strategy_params = bot_config.get("strategy", {}).get("params", {})
     strategy.setup(strategy_params)
 
-    signal_engine = VolumeCandleSignalEngine(volume_threshold=10.0, max_candles=50)
+    signal_params = bot_config.get("signals", {}).get("volume_candle", {})
+    signal_engine = VolumeCandleSignalEngine(
+        volume_threshold=signal_params.get("volume_threshold", 10.0),
+        max_candles=signal_params.get("max_candles", 50)
+    )
 
     risk_params = bot_config.get("risk", {})
     risk_manager = BasicRiskManager()
