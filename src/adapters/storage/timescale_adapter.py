@@ -143,6 +143,22 @@ class TimescaleDBAdapter(StorageGateway):
                 except Exception:
                     pass
 
+                # MIGRATION: Add exchange column if missing (for existing tables)
+                tables_to_migrate = [
+                    "market_tickers",
+                    "market_trades",
+                    "portfolio_positions",
+                ]
+                for table in tables_to_migrate:
+                    try:
+                        await conn.execute(f"""
+                            ALTER TABLE {table} 
+                            ADD COLUMN IF NOT EXISTS exchange TEXT DEFAULT 'thalex';
+                        """)
+                    except Exception as e:
+                        # Ignore if column exists or other non-critical error
+                        logger.warning(f"Migration for {table} exchange column: {e}")
+
             except Exception as e:
                 logger.error(f"Failed to initialize schema: {e}")
                 raise
