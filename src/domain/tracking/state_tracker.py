@@ -2,7 +2,7 @@ import time
 import asyncio
 import logging
 from typing import Dict, List, Optional, Callable, Set
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from collections import OrderedDict
 from enum import Enum
 from ..entities import Order, OrderStatus, OrderSide, Position
@@ -124,9 +124,7 @@ class StateTracker:
                 tracked = self.pending_orders.pop(local_id)
                 tracked.state = OrderState.CONFIRMED
                 tracked.confirm_time = time.time()
-                tracked.order = tracked.order.__class__(
-                    **{**tracked.order.__dict__, "exchange_id": exchange_id}
-                )
+                tracked.order = replace(tracked.order, exchange_id=exchange_id)
                 self.confirmed_orders[exchange_id] = tracked
                 logger.debug(f"Order {local_id} -> {exchange_id} CONFIRMED")
 

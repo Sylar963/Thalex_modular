@@ -309,11 +309,11 @@ class TimescaleDBAdapter(StorageGateway):
                     position.exchange,
                     position.size,
                     position.entry_price,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
+                    position.mark_price,
+                    position.unrealized_pnl,
+                    position.delta,
+                    position.gamma,
+                    position.theta,
                 )
         except Exception as e:
             logger.error(f"Failed to save position: {e}")
@@ -336,7 +336,11 @@ class TimescaleDBAdapter(StorageGateway):
                         symbol=r["symbol"],
                         size=r["size"],
                         entry_price=r["entry_price"],
+                        mark_price=r["mark_price"] or 0.0,
                         unrealized_pnl=r["unrealized_pnl"] or 0.0,
+                        delta=r["delta"] or 0.0,
+                        gamma=r["gamma"] or 0.0,
+                        theta=r["theta"] or 0.0,
                     )
                     for r in rows
                 ]

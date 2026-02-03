@@ -51,6 +51,20 @@ class TokenBucket:
             return True
         return False
 
+    async def consume_wait(self, tokens: int = 1) -> bool:
+        while True:
+            now = time.time()
+            delta = now - self.last_update
+            self._tokens = min(self.capacity, self._tokens + delta * self.fill_rate)
+            self.last_update = now
+
+            if self._tokens >= tokens:
+                self._tokens -= tokens
+                return True
+
+            wait_time = (tokens - self._tokens) / self.fill_rate
+            await asyncio.sleep(min(wait_time, 0.1))
+
 
 class ThalexAdapter(ExchangeGateway):
     """
@@ -273,8 +287,15 @@ class ThalexAdapter(ExchangeGateway):
             response = await self._rpc_request(self.client.cancel, order_id=oid)
 
             if "error" in response:
-                logger.error(f"Cancel error: {response['error']}")
-                return False
+                err_msg = response["error"].get("message", "").lower()
+                if "order not found" in err_msg or "doesn't exist" in err_msg:
+                    logger.warning(
+                        f"Order {order_id} not found, treating as cancelled."
+                    )
+                    # Treat as success to stop retrying
+                else:
+                    logger.error(f"Cancel error: {response['error']}")
+                    return False
 
             if order_id in self.orders:
                 self.orders[order_id] = replace(
@@ -379,10 +400,7 @@ class ThalexAdapter(ExchangeGateway):
         if not self.connected:
             return [replace(o, status=OrderStatus.REJECTED) for o in orders]
 
-        # Rate Limit Check
-        if not self.me_rate_limiter.consume(len(orders)):
-            logger.warning(f"Rate limit hit (ME). Dropping batch of {len(orders)}.")
-            return [replace(o, status=OrderStatus.REJECTED) for o in orders]
+        await self.me_rate_limiter.consume_wait(len(orders))
 
         requests = []
         for o in orders:
@@ -429,10 +447,7 @@ class ThalexAdapter(ExchangeGateway):
         if not self.connected or not order_ids:
             return [False] * len(order_ids)
 
-        # Rate Limit
-        if not self.cancel_rate_limiter.consume(len(order_ids)):
-            logger.warning("Rate limit hit (Cancel Batch).")
-            return [False] * len(order_ids)
+        await self.cancel_rate_limiter.consume_wait(len(order_ids))
 
         requests = []
         for oid in order_ids:
@@ -449,6 +464,16 @@ class ThalexAdapter(ExchangeGateway):
             success = False
             if not isinstance(res, Exception) and "error" not in res:
                 success = True
+            elif isinstance(res, dict) and "error" in res:
+                err_msg = res["error"].get("message", "").lower()
+                if "order not found" in err_msg or "doesn't exist" in err_msg:
+                    # Treat as success/already cancelled
+                    success = True
+                    logger.debug(
+                        f"Batch cancel: Order {oid_str} not found, marking cancelled."
+                    )
+
+            if success:
                 if oid_str in self.orders:
                     self.orders[oid_str] = replace(
                         self.orders[oid_str], status=OrderStatus.CANCELLED

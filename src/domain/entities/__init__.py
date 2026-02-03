@@ -89,8 +89,12 @@ class Position:
     size: float
     entry_price: float
     exchange: str = "thalex"
+    mark_price: float = 0.0
     unrealized_pnl: float = 0.0
     realized_pnl: float = 0.0
+    delta: float = 0.0
+    gamma: float = 0.0
+    theta: float = 0.0
     timestamp: float = field(default_factory=time.time)
 
 

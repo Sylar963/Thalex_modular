@@ -65,6 +65,7 @@ class QuotingService:
         self.tick_size = 1.0
         self._reconcile_lock = asyncio.Lock()
         self._last_equity_snapshot_time = 0.0
+        self._last_mid_price = 0.0
 
     async def start(self, symbol: str):
         self.symbol = symbol
@@ -255,9 +256,20 @@ class QuotingService:
 
     async def _run_strategy(self, regime=None, tick_size=0.5):
         """Centralized strategy execution pipeline."""
-        # 1. Check Lock (Early Exit)
         if self._reconcile_lock.locked():
             return
+
+        current_mid = (
+            self.market_state.ticker.mid_price if self.market_state.ticker else 0.0
+        )
+
+        MIN_EDGE_THRESHOLD = tick_size * 0.5
+        mid_price_move = abs(current_mid - self._last_mid_price)
+
+        if self._last_mid_price > 0 and mid_price_move < MIN_EDGE_THRESHOLD:
+            return
+
+        self._last_mid_price = current_mid
 
         async with self._reconcile_lock:
             # 2. Strategy Calculation

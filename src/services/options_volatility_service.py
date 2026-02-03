@@ -64,6 +64,8 @@ class OptionsVolatilityService:
             ticker = await self._thalex.ticker(
                 instrument_name=f"{self._underlying}-PERP"
             )
+            if not ticker or "result" not in ticker:
+                return 0.0
             return float(ticker["result"]["index_price"])
         except Exception as e:
             logger.error(f"Failed to fetch index price: {e}")
