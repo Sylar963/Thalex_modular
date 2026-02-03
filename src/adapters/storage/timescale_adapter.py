@@ -123,6 +123,26 @@ class TimescaleDBAdapter(StorageGateway):
                     )
                 except Exception:
                     pass
+                # 5. Bot Executions Table (Private Fills)
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS bot_executions (
+                        time TIMESTAMPTZ NOT NULL,
+                        symbol TEXT NOT NULL,
+                        exchange TEXT NOT NULL DEFAULT 'thalex',
+                        side TEXT NOT NULL,
+                        price DOUBLE PRECISION NOT NULL,
+                        size DOUBLE PRECISION NOT NULL,
+                        order_id TEXT,
+                        fee DOUBLE PRECISION DEFAULT 0.0
+                    );
+                """)
+                try:
+                    await conn.execute(
+                        "SELECT create_hypertable('bot_executions', 'time', if_not_exists => TRUE);"
+                    )
+                except Exception:
+                    pass
+
             except Exception as e:
                 logger.error(f"Failed to initialize schema: {e}")
                 raise
@@ -191,11 +211,39 @@ class TimescaleDBAdapter(StorageGateway):
                     trade.exchange,
                     trade.price,
                     trade.size,
-                    trade.side.value,
+                    trade.side.value
+                    if hasattr(trade.side, "value")
+                    else str(trade.side),
                     trade.id,
                 )
         except Exception as e:
             logger.error(f"Failed to save trade: {e}")
+
+    async def save_execution(self, trade: Trade):
+        """Save a bot execution (fill) to the private table."""
+        if not self.pool:
+            return
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO bot_executions (time, symbol, exchange, side, price, size, order_id, fee)
+                    VALUES (to_timestamp($1), $2, $3, $4, $5, $6, $7, $8)
+                    """,
+                    trade.timestamp,
+                    trade.symbol,
+                    trade.exchange,
+                    trade.side.value
+                    if hasattr(trade.side, "value")
+                    else str(trade.side),
+                    trade.price,
+                    trade.size,
+                    trade.order_id,
+                    trade.fee,
+                )
+                logger.info(f"Saved execution for order {trade.order_id}")
+        except Exception as e:
+            logger.error(f"Failed to save execution: {e}")
 
     async def save_position(self, position: Position):
         if not self.pool:
@@ -288,12 +336,52 @@ class TimescaleDBAdapter(StorageGateway):
             logger.error(f"Failed to fetch recent tickers: {e}")
             return []
 
+    async def get_executions(
+        self, start: float, end: float, symbol: Optional[str] = None
+    ) -> List[Dict]:
+        """Fetch bot executions (private fills)."""
+        if not self.pool:
+            return []
+        try:
+            async with self.pool.acquire() as conn:
+                query = """
+                    SELECT time, symbol, side, price, size, order_id, fee
+                    FROM bot_executions
+                    WHERE time >= to_timestamp($1)
+                      AND time <= to_timestamp($2)
+                """
+                args = [start, end]
+                if symbol:
+                    query += " AND symbol = $3"
+                    args.append(symbol)
+
+                query += " ORDER BY time DESC"
+
+                rows = await conn.fetch(query, *args)
+                return [
+                    {
+                        "timestamp": r["time"].timestamp(),
+                        "symbol": r["symbol"],
+                        "side": r["side"],
+                        "price": r["price"],
+                        "size": r["size"],
+                        "order_id": r["order_id"],
+                        "fee": r["fee"],
+                    }
+                    for r in rows
+                ]
+        except Exception as e:
+            logger.error(f"Failed to fetch executions: {e}")
+            return []
+
     async def get_history(
         self, symbol: str, start: float, end: float, resolution: str = "1m"
     ) -> List[Dict]:
         """
         Fetch OHLCV history for a symbol.
-        Uses TimescaleDB's time_bucket for aggregation.
+        Hybrid Strategy:
+        1. Attempt to aggregate from 'market_trades' (Standard OHLCV).
+        2. If result is empty, fallback to 'market_tickers' (Last Price Candles).
         """
         if not self.pool:
             return []
@@ -309,12 +397,8 @@ class TimescaleDBAdapter(StorageGateway):
 
         try:
             async with self.pool.acquire() as conn:
-                # We use market_trades for OHLCV if available, or tickers if that's what we have.
-                # Assuming we construct candles from trades for accuracy,
-                # but if trades are sparse, we might use tickers (last price).
-                # For this implementation, let's use market_trades for OHLCV.
-
-                rows = await conn.fetch(
+                # 1. Try Market Trades
+                trade_rows = await conn.fetch(
                     """
                     SELECT
                         time_bucket($1, time) AS bucket,
@@ -336,6 +420,48 @@ class TimescaleDBAdapter(StorageGateway):
                     end,
                 )
 
+                if trade_rows:
+                    logger.info(
+                        f"Fetched {len(trade_rows)} candles from market_trades for {symbol}"
+                    )
+                    return [
+                        {
+                            "time": r["bucket"].timestamp(),
+                            "open": r["open"],
+                            "high": r["high"],
+                            "low": r["low"],
+                            "close": r["close"],
+                            "volume": r["volume"] or 0.0,
+                        }
+                        for r in trade_rows
+                    ]
+
+                # 2. Fallback to Market Tickers
+                logger.warning(
+                    f"No trades found for {symbol} history. Falling back to market_tickers."
+                )
+                ticker_rows = await conn.fetch(
+                    """
+                    SELECT
+                        time_bucket($1, time) AS bucket,
+                        FIRST(last, time) as open,
+                        MAX(last) as high,
+                        MIN(last) as low,
+                        LAST(last, time) as close,
+                        SUM(volume) as volume
+                    FROM market_tickers
+                    WHERE symbol = $2
+                      AND time >= to_timestamp($3)
+                      AND time <= to_timestamp($4)
+                    GROUP BY bucket
+                    ORDER BY bucket ASC
+                    """,
+                    bucket_interval,
+                    symbol,
+                    start,
+                    end,
+                )
+
                 return [
                     {
                         "time": r["bucket"].timestamp(),
@@ -345,8 +471,9 @@ class TimescaleDBAdapter(StorageGateway):
                         "close": r["close"],
                         "volume": r["volume"] or 0.0,
                     }
-                    for r in rows
+                    for r in ticker_rows
                 ]
+
         except Exception as e:
             logger.error(f"Failed to fetch OHLCV history: {e}")
             return []

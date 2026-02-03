@@ -56,3 +56,15 @@ class PortfolioRepository(BaseRepository):
             {"timestamp": 1700086400, "pnl": 100.0},
             {"timestamp": 1700172800, "pnl": 250.0},
         ]
+
+    async def get_executions(
+        self, start: float, end: float, symbol: Optional[str] = None
+    ) -> List[Dict]:
+        """Fetch bot executions (private fills)."""
+        if not self.storage:
+            return []
+
+        # Check if storage has the method (it should now)
+        if hasattr(self.storage, "get_executions"):
+            return await self.storage.get_executions(start, end, symbol)
+        return []

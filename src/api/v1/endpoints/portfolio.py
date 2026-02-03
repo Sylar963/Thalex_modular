@@ -22,3 +22,14 @@ async def get_positions(repo: PortfolioRepository = Depends(get_portfolio_repo))
 async def get_history(repo: PortfolioRepository = Depends(get_portfolio_repo)):
     """Historical realized PNL curve."""
     return await repo.get_history()
+
+
+@router.get("/executions", response_model=List[Dict])
+async def get_executions(
+    start: float,
+    end: float,
+    symbol: str = None,
+    repo: PortfolioRepository = Depends(get_portfolio_repo),
+):
+    """Bot executions (fills)."""
+    return await repo.get_executions(start, end, symbol)
