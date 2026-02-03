@@ -123,8 +123,23 @@ async def main():
     signal_params = bot_config.get("signals", {}).get("volume_candle", {})
     signal_engine = VolumeCandleSignalEngine(
         volume_threshold=signal_params.get("volume_threshold", 10.0),
-        max_candles=signal_params.get("max_candles", 50)
+        max_candles=signal_params.get("max_candles", 50),
     )
+
+    or_params = bot_config.get("signals", {}).get("open_range", {})
+    or_engine = None
+    if or_params.get("enabled", False):
+        from src.domain.signals.open_range import OpenRangeSignalEngine
+
+        or_engine = OpenRangeSignalEngine(
+            session_start_utc=or_params.get("session_start_utc", "20:00"),
+            session_end_utc=or_params.get("session_end_utc", "20:15"),
+            target_pct_from_mid=or_params.get("target_pct_from_mid", 1.49),
+            subsequent_target_pct_of_range=or_params.get(
+                "subsequent_target_pct_of_range", 220
+            ),
+        )
+        logger.info("OpenRangeSignalEngine initialized")
 
     risk_params = bot_config.get("risk", {})
     risk_manager = BasicRiskManager()
@@ -184,6 +199,7 @@ async def main():
         sim_state=sim_state,
         regime_analyzer=regime_analyzer,
         state_tracker=state_tracker,
+        or_engine=or_engine,
     )
 
     # Apply throttling config if present

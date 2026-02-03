@@ -30,11 +30,6 @@ logger = logging.getLogger(__name__)
 
 
 class QuotingService:
-    """
-    Core Application Service for the Trading Bot.
-    Orchestrates the flow of data: Market Data -> Signals -> Strategy -> Execution.
-    """
-
     def __init__(
         self,
         gateway: ExchangeGateway,
@@ -47,6 +42,7 @@ class QuotingService:
         sim_state: Optional["SimStateManager"] = None,
         regime_analyzer: Optional[RegimeAnalyzer] = None,
         state_tracker: Optional[StateTracker] = None,
+        or_engine: Optional[SignalEngine] = None,
     ):
         self.gateway = gateway
         self.strategy = strategy
@@ -58,6 +54,7 @@ class QuotingService:
         self.sim_state = sim_state
         self.regime_analyzer = regime_analyzer
         self.state_tracker = state_tracker or StateTracker()
+        self.or_engine = or_engine
 
         self.symbol: str = ""
         self.market_state = MarketState()
@@ -192,14 +189,25 @@ class QuotingService:
         if regime and self.storage and not self.dry_run:
             asyncio.create_task(self.storage.save_regime(self.symbol, regime))
 
-        # Fix: Save ticker to DB to keep Dashboard "Online"
         if self.storage and not self.dry_run:
             asyncio.create_task(self.storage.save_ticker(ticker))
 
+        if self.or_engine:
+            self.or_engine.update(ticker)
+            or_signals = self.or_engine.get_signals()
+            self.market_state.signals.update(or_signals)
+
+            if (
+                hasattr(self.or_engine, "is_session_just_completed")
+                and self.or_engine.is_session_just_completed()
+            ):
+                if self.storage and not self.dry_run:
+                    asyncio.create_task(
+                        self.storage.save_signal(self.symbol, "open_range", or_signals)
+                    )
+
         tick_size = getattr(self.gateway, "tick_size", 0.5)
 
-        # 2. Strategy Logic & Execution
-        # We delegate to _run_strategy to ensure consistency with _fast_reconcile
         await self._run_strategy(regime=regime, tick_size=tick_size)
 
     async def on_trade_update(self, trade):
@@ -218,6 +226,13 @@ class QuotingService:
 
         self.signal_engine.update_trade(trade)
         signals = self.signal_engine.get_signals()
+
+        if hasattr(self.signal_engine, "pop_completed_candle"):
+            completed = self.signal_engine.pop_completed_candle()
+            if completed and self.storage and not self.dry_run:
+                asyncio.create_task(
+                    self.storage.save_signal(self.symbol, "vamp", signals)
+                )
 
         immediate_flow = signals.get("immediate_flow", 0.0)
         TOXIC_THRESHOLD = 0.7

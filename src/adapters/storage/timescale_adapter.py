@@ -183,6 +183,34 @@ class TimescaleDBAdapter(StorageGateway):
                 except Exception as e:
                     logger.warning(f"Migration for bot_executions UNIQUE: {e}")
 
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS market_signals (
+                        time TIMESTAMPTZ NOT NULL,
+                        symbol TEXT NOT NULL,
+                        signal_type TEXT NOT NULL,
+                        momentum DOUBLE PRECISION,
+                        reversal DOUBLE PRECISION,
+                        volatility DOUBLE PRECISION,
+                        exhaustion DOUBLE PRECISION,
+                        gamma_adjustment DOUBLE PRECISION,
+                        reservation_price_offset DOUBLE PRECISION,
+                        volatility_adjustment DOUBLE PRECISION,
+                        vamp_value DOUBLE PRECISION,
+                        market_impact DOUBLE PRECISION,
+                        immediate_flow DOUBLE PRECISION,
+                        orh DOUBLE PRECISION,
+                        orl DOUBLE PRECISION,
+                        orm DOUBLE PRECISION,
+                        breakout_direction TEXT
+                    );
+                """)
+                try:
+                    await conn.execute(
+                        "SELECT create_hypertable('market_signals', 'time', if_not_exists => TRUE);"
+                    )
+                except Exception:
+                    pass
+
             except Exception as e:
                 logger.error(f"Failed to initialize schema: {e}")
                 raise
@@ -214,6 +242,65 @@ class TimescaleDBAdapter(StorageGateway):
                 )
         except Exception as e:
             logger.error(f"Failed to save regime: {e}")
+
+    async def save_signal(self, symbol: str, signal_type: str, signals: Dict[str, Any]):
+        if not self.pool:
+            return
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO market_signals 
+                    (time, symbol, signal_type, momentum, reversal, volatility, exhaustion, 
+                     gamma_adjustment, reservation_price_offset, volatility_adjustment, 
+                     vamp_value, market_impact, immediate_flow, orh, orl, orm, breakout_direction)
+                    VALUES (NOW(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                    """,
+                    symbol,
+                    signal_type,
+                    signals.get("momentum"),
+                    signals.get("reversal"),
+                    signals.get("volatility"),
+                    signals.get("exhaustion"),
+                    signals.get("gamma_adjustment"),
+                    signals.get("reservation_price_offset"),
+                    signals.get("volatility_adjustment"),
+                    signals.get("vamp_value"),
+                    signals.get("market_impact"),
+                    signals.get("immediate_flow"),
+                    signals.get("orh"),
+                    signals.get("orl"),
+                    signals.get("orm"),
+                    signals.get("breakout_direction"),
+                )
+        except Exception as e:
+            logger.error(f"Failed to save signal: {e}")
+
+    async def get_signal_history(
+        self, symbol: str, start: float, end: float, signal_type: Optional[str] = None
+    ) -> List[Dict]:
+        if not self.pool:
+            return []
+        try:
+            async with self.pool.acquire() as conn:
+                query = """
+                    SELECT * FROM market_signals
+                    WHERE symbol = $1
+                      AND time >= to_timestamp($2)
+                      AND time <= to_timestamp($3)
+                """
+                args = [symbol, start, end]
+                if signal_type:
+                    query += " AND signal_type = $4"
+                    args.append(signal_type)
+
+                query += " ORDER BY time ASC"
+
+                rows = await conn.fetch(query, *args)
+                return [dict(r) for r in rows]
+        except Exception as e:
+            logger.error(f"Failed to fetch signal history: {e}")
+            return []
 
     async def save_ticker(self, ticker: Ticker):
         if not self.pool:
@@ -545,4 +632,136 @@ class TimescaleDBAdapter(StorageGateway):
                 return [dict(r) for r in rows]
         except Exception as e:
             logger.error(f"Failed to fetch regime history: {e}")
+            return []
+
+    async def get_volume_bars(
+        self, symbol: str, volume_threshold: float = 0.1, limit: int = 100
+    ) -> List[Dict]:
+        if not self.pool:
+            return []
+        try:
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    WITH trades_numbered AS (
+                        SELECT 
+                            time,
+                            price,
+                            size,
+                            side,
+                            SUM(size) OVER (ORDER BY time) as cumulative_volume
+                        FROM market_trades
+                        WHERE symbol = $1
+                        ORDER BY time DESC
+                        LIMIT 50000
+                    ),
+                    trades_with_bar_id AS (
+                        SELECT *,
+                            FLOOR(cumulative_volume / $2) as bar_id
+                        FROM trades_numbered
+                    )
+                    SELECT 
+                        bar_id,
+                        FIRST(price, time) as open,
+                        MAX(price) as high,
+                        MIN(price) as low,
+                        LAST(price, time) as close,
+                        SUM(size) as volume,
+                        COUNT(*) as trade_count,
+                        SUM(CASE WHEN side = 'buy' THEN size ELSE 0 END) as buy_volume,
+                        SUM(CASE WHEN side = 'sell' THEN size ELSE 0 END) as sell_volume,
+                        MIN(time) as start_time,
+                        MAX(time) as end_time
+                    FROM trades_with_bar_id
+                    GROUP BY bar_id
+                    ORDER BY bar_id DESC
+                    LIMIT $3
+                    """,
+                    symbol,
+                    volume_threshold,
+                    limit,
+                )
+                return [
+                    {
+                        "time": r["end_time"].timestamp(),
+                        "open": r["open"],
+                        "high": r["high"],
+                        "low": r["low"],
+                        "close": r["close"],
+                        "volume": r["volume"],
+                        "trade_count": r["trade_count"],
+                        "buy_volume": r["buy_volume"],
+                        "sell_volume": r["sell_volume"],
+                        "delta": (r["buy_volume"] or 0) - (r["sell_volume"] or 0),
+                    }
+                    for r in rows
+                ]
+        except Exception as e:
+            logger.error(f"Failed to fetch volume bars: {e}")
+            return []
+
+    async def get_tick_bars(
+        self, symbol: str, tick_count: int = 2500, limit: int = 100
+    ) -> List[Dict]:
+        if not self.pool:
+            return []
+        try:
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    WITH trades_numbered AS (
+                        SELECT 
+                            time,
+                            price,
+                            size,
+                            side,
+                            ROW_NUMBER() OVER (ORDER BY time) as row_num
+                        FROM market_trades
+                        WHERE symbol = $1
+                        ORDER BY time DESC
+                        LIMIT 250000
+                    ),
+                    trades_with_bar_id AS (
+                        SELECT *,
+                            FLOOR((row_num - 1) / $2) as bar_id
+                        FROM trades_numbered
+                    )
+                    SELECT 
+                        bar_id,
+                        FIRST(price, time) as open,
+                        MAX(price) as high,
+                        MIN(price) as low,
+                        LAST(price, time) as close,
+                        SUM(size) as volume,
+                        COUNT(*) as trade_count,
+                        SUM(CASE WHEN side = 'buy' THEN size ELSE 0 END) as buy_volume,
+                        SUM(CASE WHEN side = 'sell' THEN size ELSE 0 END) as sell_volume,
+                        MIN(time) as start_time,
+                        MAX(time) as end_time
+                    FROM trades_with_bar_id
+                    GROUP BY bar_id
+                    ORDER BY bar_id DESC
+                    LIMIT $3
+                    """,
+                    symbol,
+                    tick_count,
+                    limit,
+                )
+                return [
+                    {
+                        "time": r["end_time"].timestamp(),
+                        "open": r["open"],
+                        "high": r["high"],
+                        "low": r["low"],
+                        "close": r["close"],
+                        "volume": r["volume"],
+                        "trade_count": r["trade_count"],
+                        "buy_volume": r["buy_volume"],
+                        "sell_volume": r["sell_volume"],
+                        "delta": (r["buy_volume"] or 0) - (r["sell_volume"] or 0),
+                    }
+                    for r in rows
+                ]
+        except Exception as e:
+            logger.error(f"Failed to fetch tick bars: {e}")
             return []

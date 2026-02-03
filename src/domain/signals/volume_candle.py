@@ -53,10 +53,12 @@ class VolumeCandleSignalEngine(SignalEngine):
             "volatility_adjustment": 0.0,
         }
 
-        # EMA State
         self.ema_periods = {"fast": 8, "med": 21, "slow": 55}
         self.ema_values = {name: 0.0 for name in self.ema_periods}
         self.delta_ema = {name: 0.0 for name in self.ema_periods}
+
+        self._candle_completed = False
+        self._last_completed_candle: Optional[VolumeCandle] = None
 
     def update(self, ticker: Ticker):
         # Ticker updates might be used for mark price reference, but
@@ -97,12 +99,20 @@ class VolumeCandleSignalEngine(SignalEngine):
         return self.signals.copy()
 
     def _complete_candle(self):
+        self._last_completed_candle = self.current_candle
+        self._candle_completed = True
+
         self.candles.append(self.current_candle)
         self._update_indicators(self.current_candle)
         self._calculate_signals()
 
-        # Reset current candle
         self.current_candle = VolumeCandle()
+
+    def pop_completed_candle(self) -> Optional[VolumeCandle]:
+        if self._candle_completed:
+            self._candle_completed = False
+            return self._last_completed_candle
+        return None
 
     def _update_indicators(self, candle: VolumeCandle):
         for name, period in self.ema_periods.items():

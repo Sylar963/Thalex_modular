@@ -27,10 +27,51 @@ class MarketRepository(BaseRepository):
         return await self.storage.get_regime_history(symbol, start, end)
 
     async def get_instruments(self) -> List[Dict]:
-        # Placeholder for instrument discovery.
-        # Ideally fetches from Convex or Thalex Adapter cache.
-        # For now return static list or query DB distinct symbols
         return [
             {"symbol": "BTC-PERPETUAL", "type": "future"},
             {"symbol": "ETH-PERPETUAL", "type": "future"},
         ]
+
+    async def get_volume_bars(
+        self, symbol: str, volume_threshold: float, limit: int
+    ) -> List[Dict]:
+        if not self.storage:
+            return []
+        if hasattr(self.storage, "get_volume_bars"):
+            return await self.storage.get_volume_bars(symbol, volume_threshold, limit)
+        return []
+
+    async def get_tick_bars(
+        self, symbol: str, tick_count: int, limit: int
+    ) -> List[Dict]:
+        if not self.storage:
+            return []
+        if hasattr(self.storage, "get_tick_bars"):
+            return await self.storage.get_tick_bars(symbol, tick_count, limit)
+        return []
+
+    async def get_signal_history(
+        self, symbol: str, start: float, end: float, signal_type: Optional[str] = None
+    ) -> List[Dict]:
+        if not self.storage:
+            return []
+        if hasattr(self.storage, "get_signal_history"):
+            return await self.storage.get_signal_history(
+                symbol, start, end, signal_type
+            )
+        return []
+
+    async def get_open_range_levels(self) -> Dict:
+        if hasattr(self, "_or_engine") and self._or_engine:
+            return self._or_engine.get_chart_levels()
+        return {
+            "orh": None,
+            "orl": None,
+            "orm": None,
+            "day_dir": 0,
+            "up_targets": [],
+            "down_targets": [],
+            "up_signal": False,
+            "down_signal": False,
+            "session_active": False,
+        }

@@ -43,3 +43,40 @@ async def get_regime_history(
 ):
     """Get historical regime metrics (RV, Trend, EM, Vol Delta)."""
     return await repo.get_regime_history(symbol, start, end)
+
+
+@router.get("/chart/{symbol}/volume-bars", response_model=List[Dict])
+async def get_volume_bars(
+    symbol: str,
+    threshold: float = 0.1,
+    limit: int = 100,
+    repo: MarketRepository = Depends(get_market_repo),
+):
+    """Get OHLCV candles aggregated by volume threshold (e.g., 0.1 BTC per candle)."""
+    return await repo.get_volume_bars(symbol, threshold, limit)
+
+
+@router.get("/chart/{symbol}/tick-bars", response_model=List[Dict])
+async def get_tick_bars(
+    symbol: str,
+    tick_count: int = 2500,
+    limit: int = 100,
+    repo: MarketRepository = Depends(get_market_repo),
+):
+    return await repo.get_tick_bars(symbol, tick_count, limit)
+
+
+@router.get("/signals/history/{symbol}", response_model=List[Dict])
+async def get_signal_history(
+    symbol: str,
+    start: float,
+    end: float,
+    signal_type: str = None,
+    repo: MarketRepository = Depends(get_market_repo),
+):
+    return await repo.get_signal_history(symbol, start, end, signal_type)
+
+
+@router.get("/signals/open-range/levels", response_model=Dict)
+async def get_open_range_levels(repo: MarketRepository = Depends(get_market_repo)):
+    return await repo.get_open_range_levels()

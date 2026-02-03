@@ -24,6 +24,14 @@
         "volume_candle": {
             "volume_threshold": 10.0,
             "max_candles": 50
+        },
+        "open_range": {
+            "enabled": false,
+            "session_start_utc": "20:00",
+            "session_end_utc": "20:15",
+            "target_pct_from_mid": 1.49,
+            "subsequent_target_pct_of_range": 220,
+            "timezone": "UTC"
         }
     },
     "throttling": {
