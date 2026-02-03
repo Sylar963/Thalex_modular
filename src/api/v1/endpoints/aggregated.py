@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends
 from typing import Dict, List, Any
 
-from ..dependencies import get_db_adapter
+from ...dependencies import get_db_adapter
 
 router = APIRouter()
 
