@@ -40,11 +40,11 @@ class PortfolioRepository(BaseRepository):
                 "symbol": p.symbol,
                 "size": p.size,
                 "entry_price": p.entry_price,
-                "mark_price": 0.0,  # Will be filled if mark_price stored
-                "unrealized_pnl": getattr(p, "unrealized_pnl", 0.0),
-                "delta": getattr(p, "delta", 0.0),
-                "gamma": getattr(p, "gamma", 0.0),
-                "theta": getattr(p, "theta", 0.0),
+                "mark_price": p.mark_price,
+                "unrealized_pnl": p.unrealized_pnl,
+                "delta": p.delta,
+                "gamma": p.gamma,
+                "theta": p.theta,
             }
             for p in positions
         ]

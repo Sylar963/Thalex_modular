@@ -654,8 +654,25 @@ class ThalexAdapter(ExchangeGateway):
                     if symbol:
                         amount = float(p_data.get("amount", 0.0))
                         entry_price = float(p_data.get("average_price", 0.0))
-                        self.positions[symbol] = Position(symbol, amount, entry_price)
-                        logger.debug(f"Position update for {symbol}: {amount}")
+                        mark_price = float(p_data.get("mark_price", 0.0))
+                        unrealized_pnl = float(p_data.get("floating_profit_loss", 0.0))
+                        delta = float(p_data.get("delta", 0.0))
+                        gamma = float(p_data.get("gamma", 0.0))
+                        theta = float(p_data.get("theta", 0.0))
+
+                        self.positions[symbol] = Position(
+                            symbol=symbol,
+                            size=amount,
+                            entry_price=entry_price,
+                            mark_price=mark_price,
+                            unrealized_pnl=unrealized_pnl,
+                            delta=delta,
+                            gamma=gamma,
+                            theta=theta,
+                        )
+                        logger.debug(
+                            f"Position update for {symbol}: {amount} @ {entry_price}"
+                        )
 
                         if self.position_callback:
                             await self.position_callback(symbol, amount, entry_price)

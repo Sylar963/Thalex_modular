@@ -121,9 +121,13 @@ class QuotingService:
 
         # 2. Persist to DB
         if self.storage and not self.dry_run:
-            position = Position(symbol, size, entry_price)
-            # Re-fetch full position object loop if needed for complex fields,
-            # but simple update is usually enough for dashboard.
+            # Fetch the full position object from gateway if available
+            if hasattr(self.gateway, "positions") and symbol in self.gateway.positions:
+                position = self.gateway.positions[symbol]
+            else:
+                # Fallback to basic position if full data not available
+                position = Position(symbol, size, entry_price)
+
             asyncio.create_task(self.storage.save_position(position))
 
     async def on_ticker_update(self, ticker: Ticker):
