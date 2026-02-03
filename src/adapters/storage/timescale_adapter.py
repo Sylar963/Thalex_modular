@@ -174,6 +174,15 @@ class TimescaleDBAdapter(StorageGateway):
                 except Exception as e:
                     logger.warning(f"Migration for portfolio_positions PK: {e}")
 
+                # MIGRATION: Add Unique ID to bot_executions (idempotency)
+                try:
+                    await conn.execute("""
+                        ALTER TABLE bot_executions DROP CONSTRAINT IF EXISTS bot_executions_order_time_unique;
+                        ALTER TABLE bot_executions ADD CONSTRAINT bot_executions_order_time_unique UNIQUE (order_id, time);
+                    """)
+                except Exception as e:
+                    logger.warning(f"Migration for bot_executions UNIQUE: {e}")
+
             except Exception as e:
                 logger.error(f"Failed to initialize schema: {e}")
                 raise
@@ -260,6 +269,7 @@ class TimescaleDBAdapter(StorageGateway):
                     """
                     INSERT INTO bot_executions (time, symbol, exchange, side, price, size, order_id, fee)
                     VALUES (to_timestamp($1), $2, $3, $4, $5, $6, $7, $8)
+                    ON CONFLICT (order_id, time) DO NOTHING
                     """,
                     trade.timestamp,
                     trade.symbol,

@@ -179,6 +179,10 @@ class QuotingService:
         if regime and self.storage and not self.dry_run:
             asyncio.create_task(self.storage.save_regime(self.symbol, regime))
 
+        # Fix: Save ticker to DB to keep Dashboard "Online"
+        if self.storage and not self.dry_run:
+            asyncio.create_task(self.storage.save_ticker(ticker))
+
         tick_size = getattr(self.gateway, "tick_size", 0.5)
 
         # 2. Strategy Logic & Execution
