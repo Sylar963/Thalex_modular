@@ -426,17 +426,20 @@ class QuotingService:
                 await self.gateway.cancel_orders_batch(to_cancel_ids)
 
         if to_place_orders:
-            for o in to_place_orders:
-                await self.state_tracker.submit_order(o)
-
             if self.dry_run and self.sim_engine:
                 for o in to_place_orders:
+                    await self.state_tracker.submit_order(o)
                     self.sim_engine.submit_order(o)
             else:
                 new_orders = await self.gateway.place_orders_batch(to_place_orders)
                 for o in new_orders:
                     if o.status == OrderStatus.OPEN and o.exchange_id:
+                        await self.state_tracker.submit_order(o)
                         await self.state_tracker.on_order_ack(o.id, o.exchange_id)
+                    elif o.status == OrderStatus.REJECTED:
+                        logger.warning(
+                            f"Order {o.id} was rejected by exchange, not tracking."
+                        )
 
     async def _cancel_all(self):
         all_active = self.state_tracker.get_open_orders()

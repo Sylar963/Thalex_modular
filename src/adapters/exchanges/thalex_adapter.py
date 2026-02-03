@@ -398,9 +398,12 @@ class ThalexAdapter(ExchangeGateway):
     async def place_orders_batch(self, orders: List[Order]) -> List[Order]:
         """Place multiple orders in a single batch request."""
         if not self.connected:
+            logger.warning(f"Cannot place {len(orders)} orders: Not connected.")
             return [replace(o, status=OrderStatus.REJECTED) for o in orders]
 
+        logger.debug(f"Waiting for rate limit tokens for {len(orders)} orders...")
         await self.me_rate_limiter.consume_wait(len(orders))
+        logger.debug(f"Rate limit cleared, placing {len(orders)} orders.")
 
         requests = []
         for o in orders:
@@ -421,24 +424,34 @@ class ThalexAdapter(ExchangeGateway):
             requests.append({"method": method, "params": params})
 
         results = await self._send_batch(requests)
+        logger.debug(f"Received {len(results)} results from batch send.")
 
         updated_orders = []
         for order, res in zip(orders, results):
-            if isinstance(res, Exception) or "error" in res:
-                # Log error if needed
+            if isinstance(res, Exception):
+                logger.warning(f"Order {order.id} failed with exception: {res}")
+                updated_orders.append(replace(order, status=OrderStatus.REJECTED))
+            elif "error" in res:
+                logger.warning(f"Order {order.id} rejected: {res.get('error')}")
                 updated_orders.append(replace(order, status=OrderStatus.REJECTED))
             else:
-                # Parse result
                 result_data = res.get("result", {})
                 exchange_id = str(
                     result_data.get("order_id", result_data.get("id", ""))
                 )
-                updated_orders.append(
-                    replace(order, exchange_id=exchange_id, status=OrderStatus.OPEN)
-                )
-                # Cache
                 if exchange_id:
+                    logger.info(
+                        f"Order {order.id} placed successfully as {exchange_id}"
+                    )
+                    updated_orders.append(
+                        replace(order, exchange_id=exchange_id, status=OrderStatus.OPEN)
+                    )
                     self.orders[exchange_id] = updated_orders[-1]
+                else:
+                    logger.error(
+                        f"Order {order.id} response missing exchange_id: {res}"
+                    )
+                    updated_orders.append(replace(order, status=OrderStatus.REJECTED))
 
         return updated_orders
 
