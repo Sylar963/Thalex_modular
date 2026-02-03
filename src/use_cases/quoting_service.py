@@ -76,7 +76,8 @@ class QuotingService:
         self.gateway.set_ticker_callback(self.on_ticker_update)
         self.gateway.set_trade_callback(self.on_trade_update)
         self.gateway.set_order_callback(self.state_tracker.on_order_update)
-        self.gateway.set_position_callback(self.state_tracker.update_position)
+        # Fix: Use wrapper to ensure persistence
+        self.gateway.set_position_callback(self.on_position_update)
 
         # Wire reactive events
         self.state_tracker.set_fill_callback(self.on_fill_event)
@@ -94,6 +95,9 @@ class QuotingService:
             await self.state_tracker.update_position(
                 symbol, initial_pos.size, initial_pos.entry_price
             )
+            # Persist initial state too
+            if self.storage:
+                await self.storage.save_position(initial_pos)
             logger.info(f"Initial Position: {initial_pos}")
         except Exception as e:
             logger.warning(f"Could not fetch initial position: {e}")
@@ -108,6 +112,18 @@ class QuotingService:
         await self._cancel_all()
         await self.gateway.disconnect()
         logger.info("Quoting Service Stopped.")
+
+    async def on_position_update(self, symbol: str, size: float, entry_price: float):
+        """Callback for position updates from Gateway."""
+        # 1. Update In-Memory Tracker
+        await self.state_tracker.update_position(symbol, size, entry_price)
+
+        # 2. Persist to DB
+        if self.storage and not self.dry_run:
+            position = Position(symbol, size, entry_price)
+            # Re-fetch full position object loop if needed for complex fields,
+            # but simple update is usually enough for dashboard.
+            asyncio.create_task(self.storage.save_position(position))
 
     async def on_ticker_update(self, ticker: Ticker):
         if not self.running:
@@ -145,12 +161,11 @@ class QuotingService:
                     )
                     await self.sim_state.record_equity_snapshot(snapshot)
         else:
-            new_position = await self.gateway.get_position(self.symbol)
-                new_position.entry_price,
-            )
-            # PERSISTENCE: Save position to DB for Dashboard
-            if self.storage:
-                await self.storage.save_position(new_position)
+            # We rely on callback for updates, but fetching here ensures consistency
+            # However, aggressive polling AND callback might be duplicate.
+            # Let's keep the persistence here just in case callback misses,
+            # BUT make it non-blocking.
+            pass
 
         if not self.dry_run and not self.risk_manager.can_trade():
             await self._cancel_all()
@@ -431,36 +446,39 @@ class QuotingService:
     async def on_fill_event(self, exchange_id: str, price: float, size: float):
         """Reactive fill handler."""
         logger.info(f"FILL RECEIVED: {exchange_id} at {price} ({size} units)")
-        
+
         # PERSISTENCE: Record Bot Execution
         if self.storage and not self.dry_run:
             # Try to resolve order details
             found_order = None
             known_orders = self.state_tracker.get_open_orders()
-            
+
             for tracker_item in known_orders:
                 if tracker_item.order.exchange_id == exchange_id:
                     found_order = tracker_item.order
                     break
-            
+
             if found_order:
                 # Create Trade Object for storage
                 from ..domain.entities import Trade
                 import time
+
                 exec_trade = Trade(
-                    id=f"exec_{int(time.time()*1000)}_{exchange_id}",
-                    order_id=found_order.id, # Internal ID
+                    id=f"exec_{int(time.time() * 1000)}_{exchange_id}",
+                    order_id=found_order.id,  # Internal ID
                     symbol=found_order.symbol,
                     side=found_order.side,
                     price=price,
                     size=size,
                     exchange="thalex",
                     fee=0.0,
-                    timestamp=time.time()
+                    timestamp=time.time(),
                 )
                 asyncio.create_task(self.storage.save_execution(exec_trade))
             else:
-                logger.warning(f"Could not find order for fill {exchange_id} - execution not saved.")
+                logger.warning(
+                    f"Could not find order for fill {exchange_id} - execution not saved."
+                )
         # Trigger immediate re-quotes or signal updates if needed
         # This allows the bot to react to fills faster than the next ticker
         if not self._reconcile_lock.locked():
