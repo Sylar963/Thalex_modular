@@ -1,0 +1,22 @@
+{
+    "primary_instrument": "BTC-PERPETUAL",
+    "strategy": {
+        "name": "avellaneda",
+        "params": {
+            "gamma": 0.5,
+            "volatility": 0.05,
+            "position_limit": 0.01,
+            "min_spread": 20,
+            "quote_levels": 1,
+            "level_spacing_factor": 0.5,
+            "order_size": 0.001
+        }
+    },
+    "risk": {
+        "max_position": 0.01,
+        "max_order_size": 0.001
+    },
+    "throttling": {
+        "min_edge_threshold": 0.5
+    }
+}

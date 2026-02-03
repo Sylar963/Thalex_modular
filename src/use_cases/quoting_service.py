@@ -66,6 +66,7 @@ class QuotingService:
         self._reconcile_lock = asyncio.Lock()
         self._last_equity_snapshot_time = 0.0
         self._last_mid_price = 0.0
+        self.min_edge_threshold = 0.5
 
     async def start(self, symbol: str):
         self.symbol = symbol
@@ -267,7 +268,7 @@ class QuotingService:
             self.market_state.ticker.mid_price if self.market_state.ticker else 0.0
         )
 
-        MIN_EDGE_THRESHOLD = tick_size * 0.5
+        MIN_EDGE_THRESHOLD = tick_size * self.min_edge_threshold
         mid_price_move = abs(current_mid - self._last_mid_price)
 
         if self._last_mid_price > 0 and mid_price_move < MIN_EDGE_THRESHOLD:

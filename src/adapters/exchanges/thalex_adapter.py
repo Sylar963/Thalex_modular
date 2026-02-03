@@ -98,6 +98,7 @@ class ThalexAdapter(ExchangeGateway):
         self.tick_size: float = 1.0
 
         self.last_sequence: int = 0
+
         self.sequence_callback: Optional[Callable] = None
 
         self.me_rate_limiter = TokenBucket(capacity=50, fill_rate=45.0)

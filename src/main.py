@@ -4,6 +4,7 @@ import signal
 import argparse
 import sys
 import os
+import json
 from dotenv import load_dotenv
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -71,7 +72,19 @@ async def main():
             "THALEX_PRIVATE_KEY"
         )
 
-    symbol = os.getenv("PRIMARY_INSTRUMENT", "BTC-PERPETUAL")
+    # Load Config from config.json
+    config_path = os.path.join(project_root, "config.json")
+    try:
+        with open(config_path, "r") as f:
+            bot_config = json.load(f)
+        logger.info(f"Loaded configuration from {config_path}")
+    except FileNotFoundError:
+        logger.warning(f"config.json not found at {config_path}, using empty config")
+        bot_config = {}
+
+    symbol = os.getenv("PRIMARY_INSTRUMENT") or bot_config.get(
+        "primary_instrument", "BTC-PERPETUAL"
+    )
 
     if not api_key or not api_secret:
         logger.warning("API credentials not found in environment.")
@@ -97,21 +110,14 @@ async def main():
         logger.warning("asyncpg not installed, skipping DB storage.")
 
     strategy = AvellanedaStoikovStrategy()
-    strategy.setup(
-        {
-            "gamma": 0.5,
-            "kappa": 2.0,
-            "volatility": 0.05,
-            "position_limit": 0.01,
-            "base_spread": 0.001,
-            "quote_levels": 2,
-            "level_spacing_factor": 0.5,
-            "order_size": 0.001,
-        }
-    )
+    strategy_params = bot_config.get("strategy", {}).get("params", {})
+    strategy.setup(strategy_params)
 
     signal_engine = VolumeCandleSignalEngine(volume_threshold=10.0, max_candles=50)
-    risk_manager = BasicRiskManager(max_position=0.01, max_order_size=0.001)
+
+    risk_params = bot_config.get("risk", {})
+    risk_manager = BasicRiskManager()
+    risk_manager.setup(risk_params)
 
     sim_engine = None
     sim_state = None
@@ -168,6 +174,11 @@ async def main():
         regime_analyzer=regime_analyzer,
         state_tracker=state_tracker,
     )
+
+    # Apply throttling config if present
+    throttling_params = bot_config.get("throttling", {})
+    if "min_edge_threshold" in throttling_params:
+        service.min_edge_threshold = throttling_params["min_edge_threshold"]
 
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()

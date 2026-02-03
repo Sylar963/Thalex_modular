@@ -4,7 +4,6 @@ import math
 import logging
 from typing import Optional, List, Dict, Any
 from enum import Enum
-import numpy as nptional
 from ..interfaces import Strategy
 from ..entities import MarketState, Position, Order, OrderSide, OrderType, Ticker
 
@@ -70,7 +69,7 @@ class AvellanedaStoikovStrategy(Strategy):
         self.last_recalc_time = 0
 
         # Multi-level params
-        self.quote_levels = 2
+        self.quote_levels = 1
         self.level_spacing_factor = 0.5  # Fraction of spread to add for next level
 
     def setup(self, config: Dict[str, Any]):
@@ -84,7 +83,7 @@ class AvellanedaStoikovStrategy(Strategy):
         self.order_size = config.get("order_size", 0.001)
         self.min_spread_ticks = config.get("min_spread", 20)
 
-        self.quote_levels = config.get("quote_levels", 2)
+        self.quote_levels = config.get("quote_levels", 1)
         self.level_spacing_factor = config.get("level_spacing_factor", 0.5)
 
         # Heuristic Params
