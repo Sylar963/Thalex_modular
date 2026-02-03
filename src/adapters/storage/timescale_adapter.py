@@ -159,6 +159,21 @@ class TimescaleDBAdapter(StorageGateway):
                         # Ignore if column exists or other non-critical error
                         logger.warning(f"Migration for {table} exchange column: {e}")
 
+                # MIGRATION: Fix Portfolio Positions Primary Key (symbol -> symbol, exchange)
+                try:
+                    # Check if PK needs update
+                    # We can try to drop the old one and add the new one.
+                    # If it already exists as (symbol, exchange), drop might fail if name differs,
+                    # or adding might fail.
+                    # Safest is to try dropping the specific default name 'portfolio_positions_pkey'
+                    # and recreating it.
+                    await conn.execute("""
+                        ALTER TABLE portfolio_positions DROP CONSTRAINT IF EXISTS portfolio_positions_pkey;
+                        ALTER TABLE portfolio_positions ADD CONSTRAINT portfolio_positions_pkey PRIMARY KEY (symbol, exchange);
+                    """)
+                except Exception as e:
+                    logger.warning(f"Migration for portfolio_positions PK: {e}")
+
             except Exception as e:
                 logger.error(f"Failed to initialize schema: {e}")
                 raise
