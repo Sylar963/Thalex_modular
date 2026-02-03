@@ -51,7 +51,6 @@ class TimescaleDBAdapter(StorageGateway):
                         volume DOUBLE PRECISION
                     );
                 """)
-                """)
                 # Convert to hypertable (if not already)
                 try:
                     await conn.execute(
@@ -177,7 +176,6 @@ class TimescaleDBAdapter(StorageGateway):
         except Exception as e:
             logger.error(f"Failed to save ticker: {e}")
 
-
     async def save_trade(self, trade: Trade):
         if not self.pool:
             return
@@ -198,7 +196,6 @@ class TimescaleDBAdapter(StorageGateway):
                 )
         except Exception as e:
             logger.error(f"Failed to save trade: {e}")
-
 
     async def save_position(self, position: Position):
         if not self.pool:
@@ -231,7 +228,6 @@ class TimescaleDBAdapter(StorageGateway):
                 )
         except Exception as e:
             logger.error(f"Failed to save position: {e}")
-
 
     async def get_latest_positions(self) -> List[Position]:
         """Fetch all non-zero positions from the database."""
@@ -351,6 +347,8 @@ class TimescaleDBAdapter(StorageGateway):
                     }
                     for r in rows
                 ]
+        except Exception as e:
+            logger.error(f"Failed to fetch OHLCV history: {e}")
             return []
 
     async def get_regime_history(

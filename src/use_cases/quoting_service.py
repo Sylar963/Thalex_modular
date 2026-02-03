@@ -119,7 +119,7 @@ class QuotingService:
         # tick_size remains 1.0 for now, could be dynamic later
 
         if self.dry_run and self.sim_engine:
-            self.position = Position(
+            await self.state_tracker.update_position(
                 self.symbol,
                 self.sim_engine.position_size,
                 self.sim_engine.position_entry_price,
@@ -146,7 +146,11 @@ class QuotingService:
                     await self.sim_state.record_equity_snapshot(snapshot)
         else:
             new_position = await self.gateway.get_position(self.symbol)
-            self.position = new_position
+            await self.state_tracker.update_position(
+                new_position.symbol,
+                new_position.size,
+                new_position.entry_price,
+            )
 
         if not self.dry_run and not self.risk_manager.can_trade():
             await self._cancel_all()
@@ -162,46 +166,9 @@ class QuotingService:
 
         tick_size = getattr(self.gateway, "tick_size", 0.5)
 
-        # 2. Strategy Logic
-        position = self.state_tracker.get_position(self.symbol)
-
-        desired_orders = self.strategy.calculate_quotes(
-            self.market_state, position, regime=regime, tick_size=tick_size
-        )
-
-        # 3.1 Force Tick Alignment
-        for i in range(len(desired_orders)):
-            o = desired_orders[i]
-            if o.price:
-                rounded_price = round(o.price / self.tick_size) * self.tick_size
-                desired_orders[i] = replace(o, price=rounded_price)
-
-        # 4. Risk Validation
-        valid_orders = []
-        position = self.state_tracker.get_position(self.symbol)
-        open_orders = [t.order for t in self.state_tracker.get_open_orders()]
-
-        for o in desired_orders:
-            if self.risk_manager.validate_order(
-                o, position, active_orders=valid_orders
-            ):
-                valid_orders.append(o)
-            else:
-                logger.warning(f"Risk Manager rejected order: {o}")
-
-        # Observability Log
-        if self.running:
-            # Just a periodic summary or if things change?
-            # For now, log the target vs active count
-            pass
-
-        # 5. Execution (Diff against active orders)
-        # Use a lock to prevent concurrent reconciliation on fast tickers
-        if self._reconcile_lock.locked():
-            return
-
-        async with self._reconcile_lock:
-            await self._reconcile_orders(valid_orders)
+        # 2. Strategy Logic & Execution
+        # We delegate to _run_strategy to ensure consistency with _fast_reconcile
+        await self._run_strategy(regime=regime, tick_size=tick_size)
 
     async def on_trade_update(self, trade):
         if not self.running:
@@ -259,33 +226,48 @@ class QuotingService:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _fast_reconcile(self):
-        """Wrapper to run reconciliation logic triggered by trades."""
-        # Need to ensure we have a valid position/ticker
+        """Wrapper to run reconciliation logic triggered by trades/fills."""
         if not self.market_state.ticker:
             return
 
-        async with self._reconcile_lock:
-            # Re-run strategy
-            # Note: This duplicates logic from on_ticker_update.
-            # Refactoring to a centralized _run_strategy() would be cleaner.
-            # For now, keeping it inline for minimizing diffs.
+        tick_size = getattr(self.gateway, "tick_size", 0.5)
+        await self._run_strategy(tick_size=tick_size)
 
-            tick_size = getattr(self.gateway, "tick_size", 0.5)
+    async def _run_strategy(self, regime=None, tick_size=0.5):
+        """Centralized strategy execution pipeline."""
+        # 1. Check Lock (Early Exit)
+        if self._reconcile_lock.locked():
+            return
+
+        async with self._reconcile_lock:
+            # 2. Strategy Calculation
             position = self.state_tracker.get_position(self.symbol)
             desired_orders = self.strategy.calculate_quotes(
-                self.market_state, position, tick_size=tick_size
+                self.market_state, position, regime=regime, tick_size=tick_size
             )
-            # Tick align
+
+            # 3. Tick Alignment
             for i in range(len(desired_orders)):
                 o = desired_orders[i]
                 if o.price:
-                    rounded_price = round(o.price / self.tick_size) * self.tick_size
+                    rounded_price = round(o.price / tick_size) * tick_size
                     desired_orders[i] = replace(o, price=rounded_price)
 
-            active = []
-            # Risk validate against current active orders (simplified)
-            # Ideally we full diff. _reconcile_orders handles the diff.
-            await self._reconcile_orders(desired_orders)
+            # 4. Risk Validation
+            valid_orders = []
+            # Note: We validate against *open* orders in the tracker + current pos
+            active_orders_ref = [t.order for t in self.state_tracker.get_open_orders()]
+
+            for o in desired_orders:
+                if self.risk_manager.validate_order(
+                    o, position, active_orders=valid_orders
+                ):
+                    valid_orders.append(o)
+                else:
+                    logger.warning(f"Risk Manager rejected order: {o}")
+
+            # 5. Execution
+            await self._reconcile_orders(valid_orders)
 
     async def _reconcile_orders(self, desired_orders: List[Order]):
         """
