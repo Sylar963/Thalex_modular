@@ -252,7 +252,7 @@ class QuotingService:
 
         if abs(immediate_flow) > 0.3:
             if not self._reconcile_lock.locked():
-                self.market_state.signals = signals
+                self.market_state.signals.update(signals)
                 asyncio.create_task(self._fast_reconcile())
 
         if self.storage and not self.dry_run:

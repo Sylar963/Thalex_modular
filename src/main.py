@@ -95,13 +95,15 @@ async def main():
         logger.warning("API credentials not found in environment.")
 
     exchange_config = bot_config.get("exchange", {})
-    gateway = ThalexAdapter(
-        api_key,
-        api_secret,
-        testnet=testnet,
-        me_rate_limit=exchange_config.get("me_rate_limit", 45.0),
-        cancel_rate_limit=exchange_config.get("cancel_rate_limit", 900.0),
-    )
+    gateway = None
+    if not args.multi_venue:
+        gateway = ThalexAdapter(
+            api_key,
+            api_secret,
+            testnet=testnet,
+            me_rate_limit=exchange_config.get("me_rate_limit", 45.0),
+            cancel_rate_limit=exchange_config.get("cancel_rate_limit", 900.0),
+        )
 
     db_user = os.getenv("DATABASE_USER", "postgres")
     db_pass = os.getenv("DATABASE_PASSWORD", "password")
@@ -171,8 +173,7 @@ async def main():
     regime_analyzer = MultiWindowRegimeAnalyzer()
 
     # Initialize Options Volatility Service (if not backtesting)
-    if mode != "backtest":
-        # Pass the underlying Thalex client to the service
+    if mode != "backtest" and gateway is not None:
         vol_service = OptionsVolatilityService(gateway.client, symbol.split("-")[0])
 
         async def _poll_vol_data():
@@ -186,9 +187,8 @@ async def main():
                         )
                 except Exception as e:
                     logger.error(f"Failed to poll options data: {e}")
-                await asyncio.sleep(15)  # Poll every 15s
+                await asyncio.sleep(15)
 
-        # Create background task
         asyncio.create_task(_poll_vol_data())
 
     state_tracker = StateTracker()

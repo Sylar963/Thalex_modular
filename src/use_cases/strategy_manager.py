@@ -209,6 +209,9 @@ class MultiExchangeStrategyManager:
             exchange = venue.config.gateway.name
             position = self.portfolio.get_position(venue.config.symbol, exchange)
 
+            if self.signal_engine:
+                venue.market_state.signals.update(self.signal_engine.get_signals())
+
             active_strategy = (
                 venue.config.strategy if venue.config.strategy else self.strategy
             )

@@ -115,6 +115,10 @@ class ThalexAdapter(ExchangeGateway):
             capacity=int(cancel_rate_limit * 1.1), fill_rate=cancel_rate_limit
         )
 
+    @property
+    def name(self) -> str:
+        return "thalex"
+
     def _get_next_id(self) -> int:
         self.request_id_counter += 1
         return self.request_id_counter
