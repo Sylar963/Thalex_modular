@@ -2,28 +2,33 @@
     "primary_instrument": "BTC-PERPETUAL",
     "venues": {
         "thalex": {
-            "enabled": true,
+            "enabled": false,
             "symbols": ["BTC-PERPETUAL"],
-            "testnet": true,
-            "tick_size": 0.5
+            "testnet": false
         },
         "bybit": {
-            "enabled": false,
-            "symbols": ["BTCUSDT"],
-            "testnet": true,
-            "tick_size": 0.5
+            "enabled": true,
+            "symbols": ["HYPEUSDT"],
+            "testnet": false,
+            "strategy_params": {
+                "gamma": 0.3,
+                "volatility": 0.08,
+                "position_limit": 2.0,
+                "min_spread": 15,
+                "quote_levels": 1,
+                "level_spacing_factor": 0.5,
+                "order_size": 0.5
+            }
         },
         "binance": {
             "enabled": false,
             "symbols": ["BTCUSDT"],
-            "testnet": true,
-            "tick_size": 0.1
+            "testnet": false
         },
         "hyperliquid": {
             "enabled": false,
             "symbols": ["BTC"],
-            "testnet": true,
-            "tick_size": 0.1
+            "testnet": false
         }
     },
     "exchange": {
@@ -35,21 +40,21 @@
         "params": {
             "gamma": 0.5,
             "volatility": 0.05,
-            "position_limit": 0.01,
+            "position_limit": 5.0,
             "min_spread": 20,
             "quote_levels": 1,
             "level_spacing_factor": 0.5,
-            "order_size": 0.001
+            "order_size": 0.01
         }
     },
     "risk": {
-        "max_position": 0.01,
-        "max_order_size": 0.001,
+        "max_position": 10.0,
+        "max_order_size": 1.0,
         "venue_limits": {
-            "thalex": 0.01,
-            "bybit": 0.005,
-            "binance": 0.005,
-            "hyperliquid": 0.005
+            "thalex": 1.0,
+            "bybit": 1.0,
+            "binance": 1.0,
+            "hyperliquid": 1.0
         }
     },
     "signals": {

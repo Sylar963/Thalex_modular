@@ -113,6 +113,11 @@ class MultiExchangeStrategyManager:
 
         await gw.connect()
 
+        if hasattr(gw, "fetch_instrument_info"):
+            await gw.fetch_instrument_info(cfg.symbol)
+            cfg.tick_size = getattr(gw, "tick_size", cfg.tick_size)
+            logger.info(f"Dynamic tick_size for {cfg.symbol}: {cfg.tick_size}")
+
         if hasattr(gw, "cancel_all_orders"):
             await gw.cancel_all_orders(cfg.symbol)
             venue.state_tracker.pending_orders.clear()
@@ -149,6 +154,9 @@ class MultiExchangeStrategyManager:
 
             ticker = replace(ticker, exchange=exchange)
             venue.market_state = MarketState(ticker=ticker, timestamp=ticker.timestamp)
+
+            if self.signal_engine:
+                self.signal_engine.update(ticker)
 
             await self.sync_engine.update_ticker(exchange, ticker.symbol, ticker)
 

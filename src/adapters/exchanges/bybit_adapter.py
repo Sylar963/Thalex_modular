@@ -50,16 +50,49 @@ class BybitAdapter(BaseExchangeAdapter):
 
         self.positions: Dict[str, Position] = {}
         self.orders: Dict[str, Order] = {}
+        self.tick_size: float = 0.01
+        self.lot_size: float = 0.001
 
         self._msg_loop_task: Optional[asyncio.Task] = None
         self._ping_task: Optional[asyncio.Task] = None
+        self._time_offset_ms: int = 0
 
     @property
     def name(self) -> str:
         return "bybit"
 
+    async def _sync_server_time(self):
+        url = f"{self.base_url}/v5/market/time"
+        try:
+            async with self.session.get(url) as resp:
+                data = await resp.json()
+                if data.get("retCode") == 0:
+                    server_time = (
+                        int(data.get("result", {}).get("timeSecond", 0)) * 1000
+                    )
+                    if server_time == 0:
+                        server_time = (
+                            int(data.get("result", {}).get("timeNano", 0)) // 1_000_000
+                        )
+                    local_time = int(time.time() * 1000)
+                    self._time_offset_ms = server_time - local_time
+                    logger.info(
+                        f"Bybit time offset: {self._time_offset_ms}ms (server ahead)"
+                        if self._time_offset_ms > 0
+                        else f"Bybit time offset: {self._time_offset_ms}ms (local ahead)"
+                    )
+        except Exception as e:
+            logger.warning(f"Failed to sync Bybit server time: {e}")
+        self._last_sync_time = time.time()
+
+    def _get_timestamp(self) -> int:
+        if time.time() - getattr(self, "_last_sync_time", 0) > 10:
+            asyncio.create_task(self._sync_server_time())
+        return int(time.time() * 1000) + self._time_offset_ms
+
     def _sign(self, timestamp: int, payload: str) -> str:
-        param_str = f"{timestamp}{self.api_key}5000{payload}"
+        recv_window = "10000"
+        param_str = f"{timestamp}{self.api_key}{recv_window}{payload}"
         return hmac.new(
             self.api_secret.encode("utf-8"),
             param_str.encode("utf-8"),
@@ -67,11 +100,11 @@ class BybitAdapter(BaseExchangeAdapter):
         ).hexdigest()
 
     def _get_headers(self, payload: str = "") -> Dict[str, str]:
-        timestamp = int(time.time() * 1000)
+        timestamp = self._get_timestamp()
         return {
             "X-BAPI-API-KEY": self.api_key,
             "X-BAPI-TIMESTAMP": str(timestamp),
-            "X-BAPI-RECV-WINDOW": "5000",
+            "X-BAPI-RECV-WINDOW": "10000",
             "X-BAPI-SIGN": self._sign(timestamp, payload),
             "Content-Type": "application/json",
         }
@@ -82,7 +115,9 @@ class BybitAdapter(BaseExchangeAdapter):
         )
         self.session = aiohttp.ClientSession()
 
-        timestamp = int(time.time() * 1000)
+        await self._sync_server_time()
+
+        timestamp = self._get_timestamp()
         expires = timestamp + 10000
         signature = hmac.new(
             self.api_secret.encode("utf-8"),
@@ -101,6 +136,27 @@ class BybitAdapter(BaseExchangeAdapter):
         await self._subscribe_private()
         logger.info("Bybit Adapter connected.")
 
+    async def fetch_instrument_info(self, symbol: str) -> Dict:
+        url = f"{self.base_url}/v5/market/instruments-info"
+        params = {"category": "linear", "symbol": symbol}
+        async with self.session.get(url, params=params) as resp:
+            data = await resp.json()
+            if data.get("retCode") == 0:
+                items = data.get("result", {}).get("list", [])
+                if items:
+                    info = items[0]
+                    self.tick_size = float(
+                        info.get("priceFilter", {}).get("tickSize", 0.01)
+                    )
+                    self.lot_size = float(
+                        info.get("lotSizeFilter", {}).get("minOrderQty", 0.001)
+                    )
+                    logger.info(
+                        f"Fetched {symbol} tick_size={self.tick_size}, lot_size={self.lot_size}"
+                    )
+                    return info
+        return {}
+
     async def disconnect(self):
         self.connected = False
         if self._msg_loop_task:
@@ -118,10 +174,15 @@ class BybitAdapter(BaseExchangeAdapter):
         await self.ws_private.send_json(sub_msg)
 
     async def _ping_loop(self):
+        resync_counter = 0
         while self.connected:
             await asyncio.sleep(20)
             if self.ws_private:
                 await self.ws_private.send_json({"op": "ping"})
+            resync_counter += 1
+            if resync_counter >= 2:
+                await self._sync_server_time()
+                resync_counter = 0
 
     async def _msg_loop(self):
         while self.connected and self.ws_private:

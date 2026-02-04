@@ -252,12 +252,47 @@ async def main():
                 continue
 
             for sym in venue_symbols:
+                venue_strategy = None
+                venue_strategy_params = venue_cfg.get("strategy_params")
+                if venue_strategy_params:
+                    venue_strategy = AvellanedaStoikovStrategy()
+                    merged_params = {
+                        "gamma": venue_strategy_params.get(
+                            "gamma", strategy_params.get("gamma", 0.5)
+                        ),
+                        "volatility": venue_strategy_params.get(
+                            "volatility", strategy_params.get("volatility", 0.05)
+                        ),
+                        "position_limit": venue_strategy_params.get(
+                            "position_limit",
+                            strategy_params.get("position_limit", 0.01),
+                        ),
+                        "min_spread": venue_strategy_params.get(
+                            "min_spread", strategy_params.get("min_spread", 20)
+                        ),
+                        "quote_levels": venue_strategy_params.get(
+                            "quote_levels", strategy_params.get("quote_levels", 3)
+                        ),
+                        "level_spacing_factor": venue_strategy_params.get(
+                            "level_spacing_factor",
+                            strategy_params.get("level_spacing_factor", 0.5),
+                        ),
+                        "order_size": venue_strategy_params.get(
+                            "order_size", strategy_params.get("order_size", 0.001)
+                        ),
+                    }
+                    venue_strategy.setup(merged_params)
+                    logger.info(
+                        f"Created venue-specific strategy for {venue_name}/{sym}"
+                    )
+
                 exchange_configs.append(
                     ExchangeConfig(
                         gateway=gw,
                         symbol=sym,
                         enabled=True,
                         tick_size=venue_tick_size,
+                        strategy=venue_strategy,
                     )
                 )
                 logger.info(f"Configured {venue_name} for {sym}")

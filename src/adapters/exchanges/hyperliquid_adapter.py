@@ -50,16 +50,45 @@ class HyperliquidAdapter(BaseExchangeAdapter):
         self.meta: Dict = {}
 
         self._msg_loop_task: Optional[asyncio.Task] = None
+        self._time_offset_ms: int = 0
 
     @property
     def name(self) -> str:
         return "hyperliquid"
+
+    async def _sync_server_time(self):
+        url = f"{self.base_url}/info"
+        try:
+            async with self.session.post(url, json={"type": "meta"}) as resp:
+                server_time = int(resp.headers.get("Date-Ms", 0))
+                if server_time == 0:
+                    from email.utils import parsedate_to_datetime
+
+                    date_str = resp.headers.get("Date", "")
+                    if date_str:
+                        dt = parsedate_to_datetime(date_str)
+                        server_time = int(dt.timestamp() * 1000)
+                if server_time > 0:
+                    local_time = int(time.time() * 1000)
+                    self._time_offset_ms = server_time - local_time
+                    logger.info(
+                        f"Hyperliquid time offset: {self._time_offset_ms}ms (server ahead)"
+                        if self._time_offset_ms > 0
+                        else f"Hyperliquid time offset: {self._time_offset_ms}ms (local ahead)"
+                    )
+        except Exception as e:
+            logger.warning(f"Failed to sync Hyperliquid server time: {e}")
+
+    def _get_timestamp(self) -> int:
+        return int(time.time() * 1000) + self._time_offset_ms
 
     async def connect(self):
         logger.info(
             f"Connecting to Hyperliquid ({'Testnet' if self.testnet else 'Mainnet'})..."
         )
         self.session = aiohttp.ClientSession()
+
+        await self._sync_server_time()
 
         await self._fetch_meta()
 
@@ -190,7 +219,7 @@ class HyperliquidAdapter(BaseExchangeAdapter):
 
     async def place_order(self, order: Order) -> Order:
         asset_index = self._get_asset_index(order.symbol)
-        nonce = int(time.time() * 1000)
+        nonce = self._get_timestamp()
 
         action = {
             "type": "order",
@@ -245,7 +274,7 @@ class HyperliquidAdapter(BaseExchangeAdapter):
             return False
 
         asset_index = self._get_asset_index(order.symbol)
-        nonce = int(time.time() * 1000)
+        nonce = self._get_timestamp()
 
         action = {
             "type": "cancel",

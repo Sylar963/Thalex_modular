@@ -48,10 +48,31 @@ class BinanceAdapter(BaseExchangeAdapter):
 
         self._msg_loop_task: Optional[asyncio.Task] = None
         self._keepalive_task: Optional[asyncio.Task] = None
+        self._time_offset_ms: int = 0
 
     @property
     def name(self) -> str:
         return "binance"
+
+    async def _sync_server_time(self):
+        url = f"{self.base_url}/fapi/v1/time"
+        try:
+            async with self.session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    server_time = data.get("serverTime", 0)
+                    local_time = int(time.time() * 1000)
+                    self._time_offset_ms = server_time - local_time
+                    logger.info(
+                        f"Binance time offset: {self._time_offset_ms}ms (server ahead)"
+                        if self._time_offset_ms > 0
+                        else f"Binance time offset: {self._time_offset_ms}ms (local ahead)"
+                    )
+        except Exception as e:
+            logger.warning(f"Failed to sync Binance server time: {e}")
+
+    def _get_timestamp(self) -> int:
+        return int(time.time() * 1000) + self._time_offset_ms
 
     def _sign(self, params: Dict) -> str:
         query_string = urlencode(params)
@@ -67,6 +88,8 @@ class BinanceAdapter(BaseExchangeAdapter):
             f"Connecting to Binance ({'Testnet' if self.testnet else 'Mainnet'})..."
         )
         self.session = aiohttp.ClientSession(headers={"X-MBX-APIKEY": self.api_key})
+
+        await self._sync_server_time()
 
         self.listen_key = await self._create_listen_key()
         if not self.listen_key:
@@ -103,11 +126,17 @@ class BinanceAdapter(BaseExchangeAdapter):
             return None
 
     async def _keepalive_loop(self):
+        resync_interval = 60
+        keepalive_interval = 30 * 60
+        elapsed = 0
         while self.connected:
-            await asyncio.sleep(30 * 60)
-            if self.listen_key:
+            await asyncio.sleep(resync_interval)
+            elapsed += resync_interval
+            await self._sync_server_time()
+            if elapsed >= keepalive_interval and self.listen_key:
                 url = f"{self.base_url}/fapi/v1/listenKey"
                 await self.session.put(url)
+                elapsed = 0
 
     async def _msg_loop(self):
         while self.connected and self.ws:
@@ -174,7 +203,7 @@ class BinanceAdapter(BaseExchangeAdapter):
             "price": order.price,
             "timeInForce": "GTX" if order.post_only else "GTC",
             "newClientOrderId": order.id,
-            "timestamp": int(time.time() * 1000),
+            "timestamp": self._get_timestamp(),
         }
         params["signature"] = self._sign(params)
 
@@ -203,7 +232,7 @@ class BinanceAdapter(BaseExchangeAdapter):
         params = {
             "symbol": order.symbol,
             "orderId": int(order_id),
-            "timestamp": int(time.time() * 1000),
+            "timestamp": self._get_timestamp(),
         }
         params["signature"] = self._sign(params)
 
