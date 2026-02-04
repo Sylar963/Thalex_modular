@@ -119,20 +119,17 @@ class RiskManager(ABC):
     def validate_order(
         self,
         order: Order,
-        position: Position,
+        position,
         active_orders: Optional[List[Order]] = None,
     ) -> bool:
-        """Check if an order is safe to place."""
         pass
 
     @abstractmethod
-    def check_position_limits(self, position: Position) -> bool:
-        """Check if position is within limits."""
+    def check_position_limits(self, position) -> bool:
         pass
 
     @abstractmethod
     def can_trade(self) -> bool:
-        """Global switch to check if trading is allowed."""
         pass
 
 

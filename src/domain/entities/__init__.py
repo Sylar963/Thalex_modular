@@ -101,6 +101,40 @@ class Position:
 @dataclass(slots=True)
 class MarketState:
     ticker: Optional[Ticker] = None
-    orderbook: Optional[Dict] = None  # Placeholder for full orderbook
+    orderbook: Optional[Dict] = None
     signals: Dict[str, float] = field(default_factory=dict)
     timestamp: float = field(default_factory=time.time)
+
+
+@dataclass
+class Portfolio:
+    positions: Dict[str, Position] = field(default_factory=dict)
+
+    def get_position(self, symbol: str, exchange: str = "") -> Position:
+        key = f"{exchange}:{symbol}" if exchange else symbol
+        return self.positions.get(key, Position(symbol, 0.0, 0.0, exchange=exchange))
+
+    def set_position(self, position: Position):
+        key = (
+            f"{position.exchange}:{position.symbol}"
+            if position.exchange
+            else position.symbol
+        )
+        self.positions[key] = position
+
+    def get_aggregate_exposure(self, symbol: str) -> float:
+        total = 0.0
+        for key, pos in self.positions.items():
+            if pos.symbol == symbol:
+                total += pos.size
+        return total
+
+    def get_exposure_by_exchange(self, exchange: str) -> float:
+        total = 0.0
+        for key, pos in self.positions.items():
+            if pos.exchange == exchange:
+                total += abs(pos.size)
+        return total
+
+    def all_positions(self) -> List[Position]:
+        return list(self.positions.values())

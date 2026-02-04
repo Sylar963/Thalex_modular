@@ -1,5 +1,31 @@
 {
     "primary_instrument": "BTC-PERPETUAL",
+    "venues": {
+        "thalex": {
+            "enabled": true,
+            "symbols": ["BTC-PERPETUAL"],
+            "testnet": true,
+            "tick_size": 0.5
+        },
+        "bybit": {
+            "enabled": false,
+            "symbols": ["BTCUSDT"],
+            "testnet": true,
+            "tick_size": 0.5
+        },
+        "binance": {
+            "enabled": false,
+            "symbols": ["BTCUSDT"],
+            "testnet": true,
+            "tick_size": 0.1
+        },
+        "hyperliquid": {
+            "enabled": false,
+            "symbols": ["BTC"],
+            "testnet": true,
+            "tick_size": 0.1
+        }
+    },
     "exchange": {
         "me_rate_limit": 45.0,
         "cancel_rate_limit": 900.0
@@ -18,7 +44,13 @@
     },
     "risk": {
         "max_position": 0.01,
-        "max_order_size": 0.001
+        "max_order_size": 0.001,
+        "venue_limits": {
+            "thalex": 0.01,
+            "bybit": 0.005,
+            "binance": 0.005,
+            "hyperliquid": 0.005
+        }
     },
     "signals": {
         "volume_candle": {

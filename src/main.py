@@ -52,6 +52,11 @@ def parse_args():
         default=0.0,
         help="Simulated slippage in ticks for shadow mode",
     )
+    parser.add_argument(
+        "--multi-venue",
+        action="store_true",
+        help="Enable multi-venue mode for quoting on multiple exchanges",
+    )
     return parser.parse_args()
 
 
@@ -188,24 +193,112 @@ async def main():
 
     state_tracker = StateTracker()
 
-    service = QuotingService(
-        gateway,
-        strategy,
-        signal_engine,
-        risk_manager,
-        storage_gateway=storage,
-        dry_run=dry_run,
-        sim_engine=sim_engine,
-        sim_state=sim_state,
-        regime_analyzer=regime_analyzer,
-        state_tracker=state_tracker,
-        or_engine=or_engine,
-    )
+    service = None
+    multi_service = None
 
-    # Apply throttling config if present
-    throttling_params = bot_config.get("throttling", {})
-    if "min_edge_threshold" in throttling_params:
-        service.min_edge_threshold = throttling_params["min_edge_threshold"]
+    if args.multi_venue:
+        from src.use_cases.strategy_manager import (
+            MultiExchangeStrategyManager,
+            ExchangeConfig,
+        )
+        from src.domain.tracking.sync_engine import SyncEngine
+
+        venues_config = bot_config.get("venues", {})
+        exchange_configs = []
+
+        for venue_name, venue_cfg in venues_config.items():
+            if not venue_cfg.get("enabled", False):
+                continue
+
+            venue_testnet = venue_cfg.get("testnet", True)
+            venue_symbols = venue_cfg.get("symbols", [])
+            venue_tick_size = venue_cfg.get("tick_size", 0.5)
+
+            if venue_name == "thalex":
+                from src.adapters.exchanges.thalex_adapter import ThalexAdapter
+
+                thalex_key = (
+                    os.getenv("THALEX_TEST_API_KEY_ID")
+                    if venue_testnet
+                    else os.getenv("THALEX_PROD_API_KEY_ID")
+                )
+                thalex_secret = (
+                    os.getenv("THALEX_TEST_PRIVATE_KEY")
+                    if venue_testnet
+                    else os.getenv("THALEX_PROD_PRIVATE_KEY")
+                )
+                gw = ThalexAdapter(thalex_key, thalex_secret, testnet=venue_testnet)
+            elif venue_name == "bybit":
+                from src.adapters.exchanges.bybit_adapter import BybitAdapter
+
+                bybit_key = os.getenv("BYBIT_API_KEY")
+                bybit_secret = os.getenv("BYBIT_API_SECRET")
+                gw = BybitAdapter(bybit_key, bybit_secret, testnet=venue_testnet)
+            elif venue_name == "binance":
+                from src.adapters.exchanges.binance_adapter import BinanceAdapter
+
+                binance_key = os.getenv("BINANCE_API_KEY")
+                binance_secret = os.getenv("BINANCE_API_SECRET")
+                gw = BinanceAdapter(binance_key, binance_secret, testnet=venue_testnet)
+            elif venue_name == "hyperliquid":
+                from src.adapters.exchanges.hyperliquid_adapter import (
+                    HyperliquidAdapter,
+                )
+
+                hl_key = os.getenv("HYPERLIQUID_PRIVATE_KEY")
+                gw = HyperliquidAdapter(hl_key, testnet=venue_testnet)
+            else:
+                logger.warning(f"Unknown venue: {venue_name}")
+                continue
+
+            for sym in venue_symbols:
+                exchange_configs.append(
+                    ExchangeConfig(
+                        gateway=gw,
+                        symbol=sym,
+                        enabled=True,
+                        tick_size=venue_tick_size,
+                    )
+                )
+                logger.info(f"Configured {venue_name} for {sym}")
+
+        sync_engine = SyncEngine()
+        multi_service = MultiExchangeStrategyManager(
+            exchanges=exchange_configs,
+            strategy=strategy,
+            risk_manager=risk_manager,
+            sync_engine=sync_engine,
+            signal_engine=signal_engine,
+            storage=storage,
+            dry_run=dry_run,
+        )
+
+        throttling_params = bot_config.get("throttling", {})
+        if "min_edge_threshold" in throttling_params:
+            multi_service.min_edge_threshold = throttling_params["min_edge_threshold"]
+
+        logger.info(
+            f"Multi-venue mode: {len(exchange_configs)} venue-symbol pairs configured"
+        )
+
+    else:
+        service = QuotingService(
+            gateway,
+            strategy,
+            signal_engine,
+            risk_manager,
+            storage_gateway=storage,
+            dry_run=dry_run,
+            sim_engine=sim_engine,
+            sim_state=sim_state,
+            regime_analyzer=regime_analyzer,
+            state_tracker=state_tracker,
+            or_engine=or_engine,
+        )
+
+        throttling_params = bot_config.get("throttling", {})
+        if "min_edge_threshold" in throttling_params:
+            service.min_edge_threshold = throttling_params["min_edge_threshold"]
 
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
@@ -221,13 +314,20 @@ async def main():
         if storage:
             await storage.connect()
 
-        await service.start(symbol)
+        if args.multi_venue:
+            await multi_service.start()
+        else:
+            await service.start(symbol)
+
         await stop_event.wait()
 
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
     finally:
-        await service.stop()
+        if args.multi_venue:
+            await multi_service.stop()
+        else:
+            await service.stop()
         if sim_state:
             await sim_state.stop()
         if storage:
