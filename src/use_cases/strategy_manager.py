@@ -281,6 +281,9 @@ class MultiExchangeStrategyManager:
         tick_size = venue.config.tick_size
         min_edge = tick_size * self.min_edge_threshold
 
+        # 3. Handle Momentum Sub-strategy (Adds and Exits)
+        await self._manage_momentum_strategy(venue)
+
         if (
             venue.last_mid_price > 0
             and abs(current_mid - venue.last_mid_price) < min_edge
@@ -288,9 +291,6 @@ class MultiExchangeStrategyManager:
             return
 
         venue.last_mid_price = current_mid
-
-        # 3. Handle Momentum Sub-strategy (Adds and Exits)
-        await self._manage_momentum_strategy(venue)
 
         async with self._reconcile_lock:
             exchange = venue.config.gateway.name
@@ -559,6 +559,10 @@ class MultiExchangeStrategyManager:
             add_side = OrderSide.BUY
         elif vamp_impact < -0.7 and current_price < or_mid and trend_side == "DOWN":
             add_side = OrderSide.SELL
+
+        print(
+            f"[DEBUG_COND] Impact={vamp_impact}, Price={current_price}, ORM={or_mid}, Trend={trend_side}, AddSide={add_side}"
+        )
 
         if add_side:
             logger.critical(
