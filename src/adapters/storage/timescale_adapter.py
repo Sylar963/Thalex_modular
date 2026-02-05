@@ -2,6 +2,7 @@ import asyncpg
 import logging
 from datetime import timedelta
 from typing import List, Optional, Dict, Any
+import json
 from ...domain.interfaces import StorageGateway
 from ...domain.entities import Ticker, Trade, Position
 
@@ -256,6 +257,29 @@ class TimescaleDBAdapter(StorageGateway):
                 )
         except Exception as e:
             logger.error(f"Failed to save regime: {e}")
+
+    async def save_bot_status(self, status: Dict[str, Any]):
+        if not self.pool:
+            return
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO bot_status 
+                    (time, symbol, exchange, risk_state, trend_state, execution_mode, active_signals, risk_breach, metadata)
+                    VALUES (NOW(), $1, $2, $3, $4, $5, $6, $7, $8)
+                    """,
+                    status.get("symbol"),
+                    status.get("exchange"),
+                    status.get("risk_state", "UNKNOWN"),
+                    status.get("trend_state", "FLAT"),
+                    status.get("execution_mode", "NORMAL"),
+                    str(status.get("active_signals", [])),
+                    status.get("risk_breach", False),
+                    json.dumps(status.get("metadata", {})),
+                )
+        except Exception as e:
+            logger.error(f"Failed to save bot status: {e}")
 
     async def save_signal(self, symbol: str, signal_type: str, signals: Dict[str, Any]):
         if not self.pool:

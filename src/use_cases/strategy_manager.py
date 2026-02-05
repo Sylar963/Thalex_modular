@@ -2,6 +2,7 @@ import asyncio
 import logging
 import time
 from typing import List, Dict, Optional, Callable
+import json
 from dataclasses import dataclass, replace
 
 from ..domain.interfaces import (
@@ -73,6 +74,7 @@ class MultiExchangeStrategyManager:
         self.trend_service = HistoricalTrendService(storage) if storage else None
         self._venue_trends: Dict[str, float] = {}  # symbol -> trend_value
         self._last_trend_update = 0.0
+        self._last_status_persist: Dict[str, float] = {}
 
         self._momentum_adds: Dict[
             str, List[Dict]
@@ -266,6 +268,15 @@ class MultiExchangeStrategyManager:
 
         # 1. Update Long-Term Trend
         await self._update_trends_if_needed(venue.config.symbol)
+
+        # 1.5 Persist Bot Status (Every 1M approx, throttled by update_trends logic or separate timer)
+        # For simplicity, we pigggyback on trend check or add explicit check
+        now = time.time()
+        venue_key = f"{venue.config.gateway.name}:{venue.config.symbol}"
+        last_persist = self._last_status_persist.get(venue_key, 0.0)
+        if now - last_persist > 60:
+            await self._persist_bot_status(venue)
+            self._last_status_persist[venue_key] = now
 
         # 2. Check for Risk Breach
         if self.risk_manager.has_breached():
@@ -598,4 +609,41 @@ class MultiExchangeStrategyManager:
             type=OrderType.MARKET,
             exchange=venue.config.gateway.name,
         )
-        await venue.config.gateway.place_order(exit_order)
+        if hasattr(venue.config.gateway, "place_order"):
+            await venue.config.gateway.place_order(exit_order)
+
+    async def _persist_bot_status(self, venue: VenueContext):
+        if not self.storage:
+            return
+
+        exchange = venue.config.gateway.name
+        symbol = venue.config.symbol
+
+        # Determine Execution Mode
+        mode = "QUOTING"
+        if self.risk_manager.has_breached():
+            mode = "SMART_REDUCING"
+        elif len(self._momentum_adds.get(f"{exchange}:{symbol}", [])) > 0:
+            mode = "ADD_MOMENTUM"
+
+        # Determine Trend
+        trend_val = self._venue_trends.get(symbol, 0.0)
+        trend_side = (
+            self.trend_service.get_trend_side(trend_val)
+            if self.trend_service
+            else "FLAT"
+        )
+
+        status = {
+            "symbol": symbol,
+            "exchange": exchange,
+            "risk_state": "BREACHED" if self.risk_manager.has_breached() else "NORMAL",
+            "trend_state": trend_side,
+            "execution_mode": mode,
+            "active_signals": list(venue.market_state.signals.keys()),
+            "risk_breach": self.risk_manager.has_breached(),
+            "metadata": {"trend_value": trend_val, "mid_price": venue.last_mid_price},
+        }
+
+        if hasattr(self.storage, "save_bot_status"):
+            await self.storage.save_bot_status(status)

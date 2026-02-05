@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, Query
 from typing import List, Dict, Optional
+import json
 from ...dependencies import get_db_adapter
 
 router = APIRouter()
@@ -44,6 +45,8 @@ async def get_signal_history(
             "volatility": row["volatility"],
             "exhaustion": row["exhaustion"],
             "vamp_value": row["vamp_value"],
+            "market_impact": row["market_impact"],
+            "immediate_flow": row["immediate_flow"],
             "orh": row["orh"],
             "orl": row["orl"],
             "orm": row["orm"],
@@ -73,6 +76,8 @@ async def get_latest_signals(
     return {
         row["signal_type"]: {
             "vamp_value": row["vamp_value"],
+            "market_impact": row["market_impact"],
+            "immediate_flow": row["immediate_flow"],
             "momentum": row["momentum"],
             "reversal": row["reversal"],
             "volatility": row["volatility"],
@@ -85,3 +90,41 @@ async def get_latest_signals(
         }
         for row in rows
     }
+
+
+@router.get("/bot_status", response_model=List[Dict])
+async def get_bot_status(
+    symbol: Optional[str] = None,
+    limit: int = Query(10, ge=1, le=100),
+    db=Depends(get_db_adapter),
+):
+    if not db or not db.pool:
+        return []
+
+    query = """
+        SELECT time, symbol, exchange, risk_state, trend_state, execution_mode, risk_breach, metadata
+        FROM bot_status
+    """
+    params = []
+
+    if symbol:
+        query += " WHERE symbol = $1"
+        params.append(symbol)
+
+    query += " ORDER BY time DESC LIMIT $" + str(len(params) + 1)
+    params.append(limit)
+
+    rows = await db.pool.fetch(query, *params)
+    return [
+        {
+            "time": row["time"].isoformat() if row["time"] else None,
+            "symbol": row["symbol"],
+            "exchange": row["exchange"],
+            "risk_state": row["risk_state"],
+            "trend_state": row["trend_state"],
+            "execution_mode": row["execution_mode"],
+            "risk_breach": row["risk_breach"],
+            "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
+        }
+        for row in rows
+    ]
