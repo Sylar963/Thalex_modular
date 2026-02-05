@@ -2,7 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Current State] - 2026-02-01
+## [Current State] - 2026-02-04
+
+### Added
+- **High-Fidelity Alpha Simulation**: 
+    - `LOBMatchEngine`: Implemented ticker-level precision matching with simulated orderbook spreads and latency.
+    - `StatsEngine`: Introduced Alpha Analytics tracking **Edge** (fill vs mid) and **Adverse Selection** (MtM decay at 5s/30s/60s).
+    - `BybitHistoryAdapter`: Modular history provider that fetches 1m klines/trades from Bybit and persists them to TimescaleDB for reusable backtesting.
+    - `SimulationEngine`: Unified orchestration logic for high-fidelity backtests.
+- **Multi-Exchange Scaling**:
+    - **Bybit Integration**: Full historical data ingestion and simulation support for Bybit.
+    - **API Venue Support**: Updated `/simulation/start` to support exchange-specific backtesting via the `venue` parameter.
+- **Developer Tools**:
+    - `test_sim_endpoints.py`: Utility script for CLI verification of simulation API endpoints.
+    - Enhanced `FRONTEND_HANDOFF.md` with specific simulation dashboard requirements.
+
+### Enhanced
+- **Documentation Overhaul**: Rewrote `README.md` to reflect the transition from a single-exchange quoter to a multi-venue HFT and alpha analysis framework.
+- **Repository Layer**: Refactored `SimulationRepository` to inject modular history providers and the new simulation engine.
+- **TimescaleDB Integration**: Improved ticker saving performance and added support for larger history loops in Bybit ingestion.
+
+## [Previous State] - 2026-02-01
 
 ### Added
 - **1-Minute Data Scaling**: Updated `historical_options_loader.py` to support high-resolution (1m) data fetching from Thalex.
