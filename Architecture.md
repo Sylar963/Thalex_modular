@@ -85,6 +85,60 @@ Adjusts strategy parameters based on real-time market conditions.
   - **Hybrid History**: Automatically serves chart data from Tickers (Quotes) if Trades (Tape) are missing, ensuring high availability.
   - **Bot Executions**: Dedicated `bot_executions` table for precise fill tracking separate from public data.
 
+### 6. **Multi-Exchange Architecture** (NEW)
+
+The system now supports simultaneous quoting across multiple exchanges via the `MultiExchangeStrategyManager`.
+
+#### Core Components
+- **MultiExchangeStrategyManager** (`strategy_manager.py`): Orchestrates connections, state, and order execution across all enabled venues.
+- **VenueContext**: Per-exchange container holding `ExchangeConfig`, `StateTracker`, and `MarketState`.
+- **SyncEngine**: Aggregates state across all venues for global risk assessment and arbitrage detection.
+- **Portfolio Entity**: Unified position tracking across exchanges.
+
+#### Configuration
+Per-venue settings are defined in `config.json`:
+
+```json
+"venues": {
+    "bybit": {
+        "enabled": true,
+        "symbols": ["HYPEUSDT"],
+        "testnet": false,
+        "strategy_params": {
+            "gamma": 0.3,
+            "volatility": 0.08,
+            "position_limit": 2.0,
+            "order_size": 0.05
+        }
+    }
+}
+```
+
+If `strategy_params` is omitted, the venue uses the global `strategy.params`.
+
+#### Exchange Adapters
+| Adapter | Features |
+|---------|----------|
+| **ThalexAdapter** | COD, Token Bucket rate limiting, batch orders |
+| **BybitAdapter** | Time sync, dynamic tick_size fetch, REST+WS |
+| **BinanceAdapter** | Futures API, listenKey auth |
+| **HyperliquidAdapter** | EIP-712 signing, L1 order book |
+
+#### Data Flow (Multi-Venue)
+```
+main.py --multi-venue
+    └── MultiExchangeStrategyManager.start()
+        ├── For each venue: _connect_exchange()
+        │   ├── fetch_instrument_info() → tick_size
+        │   ├── subscribe_ticker()
+        │   └── Set callbacks (ticker, trade, position)
+        └── Per-ticker: _run_strategy_for_venue()
+            ├── Load venue-specific strategy (or default)
+            ├── Calculate quotes
+            ├── Risk validation (BasicRiskManager + Portfolio)
+            └── Order reconciliation (cancel stale, place new)
+```
+
 ---
 
 ## Data Flows
