@@ -1,9 +1,10 @@
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
-from typing import List, Dict
+from typing import List, Dict, Any, Union
 from ...repositories import SimulationRepository
 from ...dependencies import get_simulation_repo
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
+from datetime import datetime
 import asyncio
 import json
 
@@ -15,6 +16,7 @@ class SimulationConfig(BaseModel):
     venue: str = "bybit"
     start_date: float
     end_date: float
+    initial_balance: float = 1000.0
     strategy_config: Dict = {}
     risk_config: Dict = {}
 

@@ -42,6 +42,7 @@ class SimulationRepository(BaseRepository):
             risk_manager=risk,
             data_provider=history_provider,
             history_db=self.storage,
+            initial_balance=params.get("initial_balance", 1000.0),
         )
 
         result = await engine.run_simulation(
