@@ -1,17 +1,21 @@
-# Thalex Modular: PNL Simulation Framework & Trading Bot
+# Thalex Modular: Multi-Exchange Trading & Alpha Simulation Framework
 
-A high-performance **PNL Simulation Framework** and **Trading Bot** for the [Thalex](https://www.thalex.com) derivatives exchange. This project has evolved from a simple quoter into a robust system for simulating trading strategies with **1-minute resolution** precision and persistent data analysis using **TimescaleDB**.
+A high-performance **Multi-Exchange Trading Bot** and **High-Fidelity Alpha Simulation Framework**. This project has evolved into a robust ecosystem for executing HFT strategies across multiple venues (Thalex, Bybit, Binance, Hyperliquid) and simulating trading alpha with **ticker-level precision** and persistent analysis using **TimescaleDB**.
 
 ![Thalex](https://thalex.com/images/thalex-logo-white.svg)
 
 ## 🚀 Key Features & Updates
 
-- **High-Resolution Simulation**: Simulates PnL and strategy performance using **1-minute resolution data**.
-- **Historical Backfills**: Capable of fetching and processing **30-day historical data chunks** for extensive strategy verification.
-- **TimescaleDB Persistence**: Native integration with **TimescaleDB** for high-performance storage of market data (ticks, trades) and portfolio snapshots.
-- **Visual Analytics**: Includes a modern **SvelteKit Dashboard** (served via FastAPI) for visualizing trading performance and market dynamics.
-- **Modular Architecture**: Built with **Clean Architecture** principles (adapters, domain, use cases) for testability and scalability.
-- **Latency Optimized**: Retains the legacy low-latency core for live trading while adding robust simulation capabilities.
+- **Multi-Venue Execution**: Native support for **Thalex**, **Bybit**, **Binance Futures**, and **Hyperliquid**.
+- **High-Fidelity Alpha Simulation**: 
+  - Ticker-by-ticker backtesting with realistic **LOB (Limit Order Book)** spread simulation.
+  - **Latency Modeling**: Simulated time-to-market and order activation delays.
+- **Advanced Alpha Analytics**: 
+  - **Edge Tracking**: Measuring profit vs. mid-price at the moment of fill.
+  - **Adverse Selection (MtM Decay)**: Analyzing mark-to-market decay at 5s, 30s, and 60s post-fill.
+- **TimescaleDB Persistence**: Hypertables for high-performance storage of market data, trading signals (VAMP, Open Range), and portfolio snapshots.
+- **Visual Excellence Dashboard**: A modern **SvelteKit Dashboard** (served via FastAPI) providing real-time PnL, signal overlays, and simulation analytics.
+- **Modular Clean Architecture**: Decoupled domain logic from exchange-specific adapters for seamless venue integration.
 
 ---
 
@@ -20,15 +24,17 @@ A high-performance **PNL Simulation Framework** and **Trading Bot** for the [Tha
 ```text
 Thalex_modular/
 ├── src/                        # Modular Core (Clean Architecture)
-│   ├── adapters/               # External interfaces (Thalex API, TimescaleDB)
-│   ├── domain/                 # Core logic (Strategies, Signals, Risk)
-│   ├── use_cases/              # Orchestration (Quoting, Simulation)
-│   ├── api/                    # FastAPI Backend for Dashboard
-│   └── main.py                 # Trading Bot Entry Point
-├── thalex_py/                  # Legacy Core & SDK
-├── GEMINI.md                   # Project Management & Directives
-├── TASKS.md                    # Roadmap & Todo
-└── Architecture.md             # Technical Documentation
+│   ├── adapters/               # External interfaces (Exchange Adapters, Storage)
+│   ├── domain/                 # Core entities, signals, and matching logic
+│   ├── use_cases/              # Orchestration (Quoting, SimulationEngine)
+│   ├── api/                    # FastAPI Backend for SvelteKit Dashboard
+│   └── main.py                 # Multi-Exchange Trading Bot Entry Point
+├── thalex_py/                  # Thalex Core SDK
+├── thalex_modular_dashboard/   # SvelteKit Frontend
+├── scripts/                    # Utility scripts & API tests
+├── GEMINI.md                   # Project Directives
+├── TASKS.md                    # Roadmap & Progress
+└── Architecture.md             # Detailed Technical Design
 ```
 
 ---
@@ -38,7 +44,8 @@ Thalex_modular/
 ### Prerequisites
 - **Python 3.10+**
 - **TimescaleDB** (PostgreSQL extension)
-- **Thalex API Keys** (Testnet recommended for development)
+- **Node.js** (for SvelteKit dashboard)
+- **API Keys**: Stored in a secure `.env` file
 
 ### Installation
 
@@ -47,74 +54,62 @@ Thalex_modular/
     git clone <repository-url>
     cd Thalex_modular
     python -m venv venv
-    source venv/bin/activate  # Linux/macOS
+    source venv/bin/activate
     pip install -r requirements.txt
     ```
 
 2.  **Configure Environment Variables**:
     ```bash
-    cp .example.env .env
+    cp .env.example .env
     ```
-    Edit `.env` with your API keys and database credentials.
+    Initialize your API keys (Bybit, Binance, Hyperliquid, Thalex) and DB credentials.
 
-3.  **Start Infrastructure**:
-    Use Docker Compose to start TimescaleDB:
-    ```bash
-    docker-compose up -d
-    ```
+3.  **Database Migration**:
+    The system automatically initializes TimescaleDB hypertables on startup.
 
 ---
 
 ## 🏃 Running the System
 
- The system consists of two main components: the **Trading/Simulation Engine** and the **Dashboard API**.
-
-### 1. Start the Simulation Engine / Trading Bot
-This runs the core logic, fetches market data, executes the strategy (or simulation), and persists data.
+### 1. Multi-Exchange Trading Bot
+To run live or shadow quoting on multiple venues concurrently:
 
 ```bash
-# Run the modular core
-python src/main.py
+python src/main.py --multi-venue
 ```
 
-### 2. Start the Reporting API
-The FastAPI backend serves data to the frontend dashboard.
+### 2. High-Fidelity Simulation / Backtesting
+Simulate alpha metrics on historical Bybit/Thalex data:
 
 ```bash
-# Serve API on localhost:8000
+# Handled via API/Dashboard or CLI test scripts
+python scripts/test_sim_endpoints.py
+```
+
+### 3. Start the Backend API
+Required for the SvelteKit dashboard:
+
+```bash
 python -m uvicorn src.api.main:app --host 127.0.0.1 --port 8000 --reload
-```
-
-### 3. Production Deployment (Screen)
-For long-running sessions, use `screen`:
-
-```bash
-# Bot Session
-screen -S thalex-bot
-source venv/bin/activate
-python src/main.py
-
-# API Session
-screen -S thalex-api
-source venv/bin/activate
-python -m uvicorn src.api.main:app --host 0.0.0.0 --port 8000
 ```
 
 ---
 
-## 🏗️ Architecture & Data Flow
+## 📊 Analytics & Alpha Metrics
 
-### Simulation to Dashboard Pipeline
-1.  **Ingestion**: `ThalexAdapter` fetches real-time or historical data.
-2.  **Processing**: `VolumeCandleSignalEngine` and `AvellanedaStoikovStrategy` calculate metrics (VAMP, spreads).
-3.  **Persistence**: `TimescaleDBAdapter` stores 1m candles, trades, and portfolio snapshots into **Hypertables**.
-4.  **Serving**: `src/api` queries TimescaleDB to serve aggregated JSON data to the Frontend.
+The framework introduces a dedicated `StatsEngine` to quantify trading edge:
+
+| Metric | Description |
+|--------|-------------|
+| **Edge** | $\text{Fill Price} - \text{Mid Price at Fill}$ (for Maker) |
+| **Adverse Selection** | Change in mid-price $N$ seconds after fill |
+| **VAMP Alignment** | Correlation between VAMP signals and positive trade outcomes |
 
 ---
 
 ## ⚠️ Risk Warning
 
-**Trading derivatives involves substantial risk.** This software is for educational and research purposes. The "Simulation Framework" allows for risk-free strategy testing, but live trading should always be approached with caution.
+**Trading derivatives involves substantial risk.** This software is for educational and research purposes. The "Alpha Simulation Framework" allows for risk-free strategy testing, but live trading should always be approached with caution and proper risk management.
 
 ## 📄 License
 
