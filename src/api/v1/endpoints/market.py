@@ -80,3 +80,22 @@ async def get_signal_history(
 @router.get("/signals/open-range/levels", response_model=Dict)
 async def get_open_range_levels(repo: MarketRepository = Depends(get_market_repo)):
     return await repo.get_open_range_levels()
+
+
+from pydantic import BaseModel
+
+
+class SyncRequest(BaseModel):
+    symbol: str
+    venue: str = "bybit"
+
+
+@router.post("/sync", response_model=Dict)
+async def trigger_sync(
+    request: SyncRequest, repo: MarketRepository = Depends(get_market_repo)
+):
+    """
+    Trigger a manual data sync (gap-fill) for the specified symbol.
+    Fetches missing historical data from the exchange and saves to DB.
+    """
+    return await repo.trigger_sync(request.symbol, request.venue)

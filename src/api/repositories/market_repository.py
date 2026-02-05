@@ -4,6 +4,21 @@ from ...domain.entities import Ticker
 
 
 class MarketRepository(BaseRepository):
+    async def trigger_sync(self, symbol: str, venue: str = "bybit") -> dict:
+        from ...services.data_ingestor import DataIngestor
+
+        if not self.storage:
+            return {"status": "error", "message": "Storage not available"}
+
+        ingestor = DataIngestor(self.storage)
+        try:
+            await ingestor.sync_symbol(symbol, venue)
+            return {"status": "success", "message": f"Sync triggered for {symbol}"}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+        finally:
+            await ingestor.close()
+
     async def get_recent_tickers(self, symbol: str, limit: int = 100) -> List[Ticker]:
         if not self.storage:
             return []

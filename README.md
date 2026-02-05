@@ -95,7 +95,35 @@ python -m uvicorn src.api.main:app --host 127.0.0.1 --port 8000 --reload
 
 ---
 
-## 📊 Analytics & Alpha Metrics
+## � Production Deployment (Screen)
+
+For long-running sessions, use `screen` to keep the bot and API active:
+
+### 1. Bot Session
+```bash
+screen -S thalex-bot
+source venv/bin/activate
+python src/main.py --multi-venue
+```
+
+### 2. API Session
+```bash
+screen -S thalex-api
+source venv/bin/activate
+python -m uvicorn src.api.main:app --host 0.0.0.0 --port 8000
+```
+
+### 3. Screen Management
+| Action | Command |
+|--------|---------|
+| **Detach** from session | `Ctrl + A`, then `D` |
+| **List** active sessions | `screen -ls` |
+| **Reattach** to session | `screen -r <session-name>` |
+| **Kill** a session | `screen -X -S <session-name> quit` |
+
+---
+
+## �📊 Analytics & Alpha Metrics
 
 The framework introduces a dedicated `StatsEngine` to quantify trading edge:
 
