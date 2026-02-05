@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from typing import List, Dict, Optional, Callable
 from dataclasses import dataclass, replace
 
@@ -10,13 +11,16 @@ from ..domain.interfaces import (
     StorageGateway,
     SignalEngine,
 )
+from ..domain.market.trend_service import HistoricalTrendService
 from ..domain.tracking.sync_engine import SyncEngine, GlobalState
 from ..domain.tracking.state_tracker import StateTracker
 from ..domain.entities import (
     Ticker,
     Trade,
     Position,
+    Position,
     Order,
+    OrderType,
     OrderSide,
     OrderStatus,
     Portfolio,
@@ -51,6 +55,7 @@ class MultiExchangeStrategyManager:
         risk_manager: RiskManager,
         sync_engine: SyncEngine,
         signal_engine: Optional[SignalEngine] = None,
+        or_engine: Optional[SignalEngine] = None,
         storage: Optional[StorageGateway] = None,
         dry_run: bool = False,
     ):
@@ -62,8 +67,17 @@ class MultiExchangeStrategyManager:
         self.risk_manager = risk_manager
         self.sync_engine = sync_engine
         self.signal_engine = signal_engine
+        self.or_engine = or_engine
         self.storage = storage
         self.dry_run = dry_run
+
+        self.trend_service = HistoricalTrendService(storage) if storage else None
+        self._venue_trends: Dict[str, float] = {}  # symbol -> trend_value
+        self._last_trend_update = 0.0
+
+        self._momentum_adds: Dict[
+            str, List[Dict]
+        ] = {}  # venue_key (exchange:symbol) -> list of adds
 
         self.portfolio = Portfolio()
         self._running = False
@@ -159,6 +173,21 @@ class MultiExchangeStrategyManager:
             if self.signal_engine:
                 self.signal_engine.update(ticker)
 
+            if self.or_engine:
+                self.or_engine.update(ticker)
+                # Persist Open Range signals on session end OR breakout
+                if (
+                    hasattr(self.or_engine, "is_session_just_completed")
+                    and self.or_engine.is_session_just_completed()
+                ):
+                    or_signals = self.or_engine.get_signals()
+                    if self.storage and not self.dry_run:
+                        asyncio.create_task(
+                            self.storage.save_signal(
+                                ticker.symbol, "open_range", or_signals
+                            )
+                        )
+
             await self.sync_engine.update_ticker(exchange, ticker.symbol, ticker)
 
             if self.storage and not self.dry_run:
@@ -175,6 +204,14 @@ class MultiExchangeStrategyManager:
 
             if self.signal_engine:
                 self.signal_engine.update_trade(trade)
+                # Persist VAMP signals on candle completion
+                if hasattr(self.signal_engine, "pop_completed_candle"):
+                    completed = self.signal_engine.pop_completed_candle()
+                    if completed and self.storage and not self.dry_run:
+                        signals = self.signal_engine.get_signals()
+                        asyncio.create_task(
+                            self.storage.save_signal(trade.symbol, "vamp", signals)
+                        )
 
             logger.debug(
                 f"[{exchange}] Trade: {trade.side.value} {trade.size} @ {trade.price}"
@@ -207,8 +244,27 @@ class MultiExchangeStrategyManager:
         if self.storage:
             await self.storage.save_balance(balance)
 
+    async def _update_trends_if_needed(self, symbol: str):
+        if not self.trend_service:
+            return
+
+        now = time.time()
+        if now - self._last_trend_update > 3600:  # Refresh once per hour
+            trend = await self.trend_service.get_trend_14d(symbol)
+            self._venue_trends[symbol] = trend
+            self._last_trend_update = now
+
     async def _run_strategy_for_venue(self, venue: VenueContext):
         if self._reconcile_lock.locked():
+            return
+
+        # 1. Update Long-Term Trend
+        await self._update_trends_if_needed(venue.config.symbol)
+
+        # 2. Check for Risk Breach
+        if self.risk_manager.has_breached():
+            logger.critical(f"RISK BREACH DETECTED - ENTERING SMART REDUCING MODE")
+            await self._run_smart_reducing_mode(venue)
             return
 
         if not venue.market_state.ticker:
@@ -225,6 +281,9 @@ class MultiExchangeStrategyManager:
             return
 
         venue.last_mid_price = current_mid
+
+        # 3. Handle Momentum Sub-strategy (Adds and Exits)
+        await self._manage_momentum_strategy(venue)
 
         async with self._reconcile_lock:
             exchange = venue.config.gateway.name
@@ -358,4 +417,179 @@ class MultiExchangeStrategyManager:
                 k: {"bid": t.bid, "ask": t.ask, "exchange": t.exchange}
                 for k, t in self.sync_engine.state.tickers.items()
             },
+            "risk": self.risk_manager.get_risk_state(),
+            "trends": self._venue_trends,
         }
+
+    async def _run_smart_reducing_mode(self, venue: VenueContext):
+        """
+        Intelligently liquidates or manages positions during a risk breach.
+        """
+        async with self._reconcile_lock:
+            exchange = venue.config.gateway.name
+            symbol = venue.config.symbol
+            position = self.portfolio.get_position(symbol, exchange)
+
+            if abs(position.size) < 1e-9:
+                return  # No position to reduce
+
+            trend_val = self._venue_trends.get(symbol, 0.0)
+            trend_side = (
+                self.trend_service.get_trend_side(trend_val)
+                if self.trend_service
+                else "FLAT"
+            )
+
+            is_counter_trend = False
+            if position.size > 0 and trend_side == "DOWN":
+                is_counter_trend = True
+            elif position.size < 0 and trend_side == "UP":
+                is_counter_trend = True
+
+            # Calculate Exit Quote
+            ticker = venue.market_state.ticker
+            if not ticker:
+                return
+
+            desired_orders = []
+            if is_counter_trend:
+                # AGGRESSIVE EXIT: Counter-trend trades are dangerous
+                logger.warning(
+                    f"Counter-trend position detected in breach ({trend_side}). Exiting aggressively."
+                )
+                price = ticker.bid if position.size > 0 else ticker.ask
+                desired_orders.append(
+                    Order(
+                        id=f"exit_{int(time.time())}",
+                        symbol=symbol,
+                        side=OrderSide.SELL if position.size > 0 else OrderSide.BUY,
+                        price=price,
+                        size=abs(position.size),
+                        type=OrderType.LIMIT,
+                        exchange=exchange,
+                    )
+                )
+            else:
+                # DEFENSIVE EXIT: Trend-following trades get a chance to break-even
+                logger.info(
+                    f"Trend-following position in breach ({trend_side}). Setting break-even TP."
+                )
+                fee_bps = 5  # 0.05% approx
+                break_even = position.entry_price * (
+                    1 + (fee_bps / 10000 if position.size > 0 else -fee_bps / 10000)
+                )
+
+                # Ensure break_even is not worse than current market significantly?
+                # For now, just use it.
+                desired_orders.append(
+                    Order(
+                        id=f"tp_{int(time.time())}",
+                        symbol=symbol,
+                        side=OrderSide.SELL if position.size > 0 else OrderSide.BUY,
+                        price=break_even,
+                        size=abs(position.size),
+                        type=OrderType.LIMIT,
+                        exchange=exchange,
+                    )
+                )
+
+            await self._reconcile_orders_venue(venue, desired_orders)
+
+    async def _manage_momentum_strategy(self, venue: VenueContext):
+        """
+        Handles adding to momentum and managing time-based exits.
+        """
+        if not self.signal_engine or not self.or_engine:
+            return
+
+        exchange = venue.config.gateway.name
+        symbol = venue.config.symbol
+        venue_key = f"{exchange}:{symbol}"
+
+        vamp_signals = self.signal_engine.get_signals()
+        or_signals = self.or_engine.get_signals()
+        trend_val = self._venue_trends.get(symbol, 0.0)
+        trend_side = (
+            self.trend_service.get_trend_side(trend_val)
+            if self.trend_service
+            else "FLAT"
+        )
+
+        vamp_impact = vamp_signals.get("market_impact", 0.0)
+        or_mid = or_signals.get("orm", 0.0)
+        current_price = venue.market_state.ticker.mid_price
+
+        # 1. Check for Exits (10-minute cap)
+        now = time.time()
+        active_adds = self._momentum_adds.get(venue_key, [])
+        remaining_adds = []
+        for add in active_adds:
+            should_exit = False
+            # Time cap (10 mins)
+            if now - add["timestamp"] > 600:
+                logger.warning(f"Momentum ADD timed out (10 mins). Exiting.")
+                should_exit = True
+            # VAMP reversal
+            elif (add["side"] == OrderSide.BUY and vamp_impact < 0.2) or (
+                add["side"] == OrderSide.SELL and vamp_impact > -0.2
+            ):
+                logger.info(f"Momentum ADD signal reversal detected. Exiting.")
+                should_exit = True
+
+            if should_exit:
+                await self._exit_momentum_add(venue, add)
+            else:
+                remaining_adds.append(add)
+        self._momentum_adds[venue_key] = remaining_adds
+
+        # 2. Check for New Adds
+        if len(remaining_adds) >= 1:  # Max 1 add for now
+            return
+
+        add_side = None
+        # Condition: Impact > 0.7 + Price > OR Mid + Trend matches VAMP
+        if vamp_impact > 0.7 and current_price > or_mid and trend_side == "UP":
+            add_side = OrderSide.BUY
+        elif vamp_impact < -0.7 and current_price < or_mid and trend_side == "DOWN":
+            add_side = OrderSide.SELL
+
+        if add_side:
+            logger.critical(
+                f"MOMENTUM TRIGGERED: {add_side} Add on {exchange} {symbol}"
+            )
+            # Execute Market Add
+            # We use a small fixed size for now or % of max
+            add_size = 0.1  # Placeholder
+            order = Order(
+                id=f"mom_add_{int(now)}",
+                symbol=symbol,
+                side=add_side,
+                price=0.0,  # Market
+                size=add_size,
+                type=OrderType.MARKET,
+                exchange=exchange,
+            )
+            resp = await venue.config.gateway.place_order(order)
+            if resp.status != OrderStatus.REJECTED:
+                self._momentum_adds.setdefault(venue_key, []).append(
+                    {
+                        "side": add_side,
+                        "size": add_size,
+                        "timestamp": now,
+                        "order_id": resp.exchange_id,
+                    }
+                )
+
+    async def _exit_momentum_add(self, venue: VenueContext, add_info: Dict):
+        """Executes a market order to exit a momentum addition."""
+        logger.info(f"Exiting Momentum Add ({add_info['side']})")
+        exit_order = Order(
+            id=f"mom_exit_{int(time.time())}",
+            symbol=venue.config.symbol,
+            side=OrderSide.SELL if add_info["side"] == OrderSide.BUY else OrderSide.BUY,
+            price=0.0,  # Market
+            size=add_info["size"],
+            type=OrderType.MARKET,
+            exchange=venue.config.gateway.name,
+        )
+        await venue.config.gateway.place_order(exit_order)

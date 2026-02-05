@@ -22,6 +22,7 @@ from ...domain.entities import (
     OrderStatus,
     Position,
     Ticker,
+    Balance,
 )
 
 logger = logging.getLogger(__name__)
@@ -175,6 +176,52 @@ class BybitAdapter(BaseExchangeAdapter):
                 return info
         return {}
 
+    async def get_balances(self) -> List[Balance]:
+        url = f"{self.base_url}/v5/account/wallet-balance"
+        params = {"accountType": "UNIFIED"}
+        try:
+            timestamp = self._get_timestamp()
+            query_str = "accountType=UNIFIED"
+            signature = self._sign(timestamp, query_str)
+            headers = {
+                "X-BAPI-API-KEY": self.api_key,
+                "X-BAPI-TIMESTAMP": str(timestamp),
+                "X-BAPI-RECV-WINDOW": "10000",
+                "X-BAPI-SIGN": signature,
+                # "Content-Type" not strictly needed for GET but ok
+            }
+
+            async with self.session.get(url, params=params, headers=headers) as resp:
+                data = await resp.json()
+                if data.get("retCode") == 0:
+                    result = data.get("result", {})
+                    list_data = result.get("list", [])
+                    balances = []
+                    if list_data:
+                        account_data = list_data[0]
+                        coins = account_data.get("coin", [])
+                        for c in coins:
+                            coin_name = c.get("coin")
+                            wallet_bal = float(c.get("walletBalance", 0))
+                            available = float(c.get("availableToWithdraw", 0))
+                            equity = float(c.get("equity", 0))
+
+                            bal = Balance(
+                                exchange=self.name,
+                                asset=coin_name,
+                                total=wallet_bal,
+                                available=available,
+                                margin_used=wallet_bal - available,
+                                equity=equity,
+                            )
+                            balances.append(bal)
+                            if self.balance_callback:
+                                await self.balance_callback(bal)
+                    return balances
+        except Exception as e:
+            logger.error(f"Failed to fetch balances: {e}")
+        return []
+
     async def disconnect(self):
         self.connected = False
         if self._msg_loop_task:
@@ -267,8 +314,6 @@ class BybitAdapter(BaseExchangeAdapter):
                 await self.position_callback(symbol, amount, entry_price)
 
     async def _handle_wallet_update(self, data: Dict):
-        from ...domain.entities import Balance
-
         coins = data.get("coin", [])
         for coin_data in coins:
             coin = coin_data.get("coin", "USD")

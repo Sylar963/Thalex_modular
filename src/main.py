@@ -21,7 +21,12 @@ from src.domain.tracking.state_tracker import StateTracker
 from src.use_cases.quoting_service import QuotingService
 
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("logs/bot_output.log"),
+        logging.StreamHandler(sys.stdout),
+    ],
 )
 logger = logging.getLogger("Main")
 
@@ -108,7 +113,7 @@ async def main():
     db_user = os.getenv("DATABASE_USER", "postgres")
     db_pass = os.getenv("DATABASE_PASSWORD", "password")
     db_host = os.getenv("DATABASE_HOST", "localhost")
-    db_port = os.getenv("DATABASE_PORT", "5432")
+    db_port = os.getenv("DATABASE_PORT", "5433")
     db_name = os.getenv("DATABASE_NAME", "thalex_trading")
     db_dsn = f"postgresql://{db_user}:{db_pass}@{db_host}:{db_port}/{db_name}"
 

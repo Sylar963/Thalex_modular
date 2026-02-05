@@ -189,26 +189,35 @@ class VolumeCandleSignalEngine(SignalEngine):
             market_regime = "volatile"
 
         # --- 3. Signal Generation (Parity with Legacy) ---
-
         self.signals["volatility"] = volatility
         self.signals["market_impact"] = vamp_impact
         # Pass VAMP impact as reservation offset helper
-        # Logic: If high buy pressure (impact > 0), skew prices up (higher res price)
-        self.signals["reservation_price_offset"] = vamp_impact * 0.0005  # Sensitivity
+        self.signals["reservation_price_offset"] = vamp_impact * 0.0005
 
-        # Gamma/Vol adjustments based on Regime
+        # Gamma/Vol adjustments
         if market_regime == "volatile":
             self.signals["gamma_adjustment"] = 0.5
             self.signals["volatility_adjustment"] = 0.5
         elif market_regime == "trending":
-            self.signals[
-                "gamma_adjustment"
-            ] = -0.2  # Looser spread to capture trend? Or tighter?
-            # Legacy usually widened spread in trend to avoid adverse selection
             self.signals["gamma_adjustment"] = 0.2
+            self.signals["volatility_adjustment"] = 0.1
         else:
             self.signals["gamma_adjustment"] = 0.0
             self.signals["volatility_adjustment"] = 0.0
+
+        # --- 4. EMA Momentum ---
+        fast_ema = self.ema_values["fast"]
+        med_ema = self.ema_values["med"]
+        slow_ema = self.ema_values["slow"]
+
+        if slow_ema > 0:
+            if fast_ema > med_ema > slow_ema:
+                ema_momentum = 1.0
+            elif fast_ema < med_ema < slow_ema:
+                ema_momentum = -1.0
+            else:
+                ema_momentum = 0.0
+            self.signals["momentum"] = (ema_momentum * 0.4) + (vamp_impact * 0.6)
 
         self.signals["vamp_value"] = vamp_value
 

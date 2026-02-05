@@ -1,10 +1,15 @@
 from abc import ABC, abstractmethod
 from typing import List, Optional, Dict, Any
-from .entities import Order, Ticker, Position, Trade, Instrument, MarketState
+from .entities import Order, Ticker, Position, Trade, Instrument, MarketState, Balance
 
 
 class ExchangeGateway(ABC):
     """Abstract interface for exchange connectivity."""
+
+    @abstractmethod
+    async def get_balances(self) -> List[Balance]:
+        """Fetch current account balances."""
+        pass
 
     @abstractmethod
     async def connect(self):

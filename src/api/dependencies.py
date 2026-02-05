@@ -32,7 +32,7 @@ async def init_dependencies():
     db_name = os.getenv("DATABASE_NAME", "thalex_trading")
 
     # Robust Port Detection
-    db_port = os.getenv("DATABASE_PORT", "5432")
+    db_port = os.getenv("DATABASE_PORT", "5433")
 
     # Log configuration for verification (masking password)
     print(f"Initializing DB Connection: {db_user}@{db_host}:{db_port}/{db_name}")

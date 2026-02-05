@@ -323,8 +323,26 @@ class OpenRangeSignalEngine(SignalEngine):
             return int(val) + 1
         return int(val)
 
+    async def update_batch(self, tickers: List[Ticker]):
+        """Efficiently process a batch of tickers to reconstruct session state."""
+        for ticker in tickers:
+            self.update(ticker)
+
     def update_trade(self, trade: Trade):
-        pass
+        """Update using a trade (as a fallback or for precision)."""
+        # We can wrap trade in a dummy ticker or handle it directly
+        ticker = Ticker(
+            symbol=trade.symbol,
+            bid=trade.price,
+            ask=trade.price,
+            bid_size=0,
+            ask_size=0,
+            last=trade.price,
+            volume=trade.size,
+            exchange=trade.exchange,
+            timestamp=trade.timestamp,
+        )
+        self.update(ticker)
 
     def get_signals(self) -> Dict[str, float]:
         return self.signals.copy()
