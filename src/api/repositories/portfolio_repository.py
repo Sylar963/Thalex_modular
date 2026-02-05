@@ -4,9 +4,7 @@ from ...domain.entities import Position
 
 
 class PortfolioRepository(BaseRepository):
-    async def get_summary(self) -> Dict:
-        # Derived summary from database positions
-        # Ideally, we'd have a separate account balance table, but for now:
+    async def get_summary(self, exchange: Optional[str] = None) -> Dict:
         if not self.storage:
             return {
                 "equity": 0.0,
@@ -17,14 +15,36 @@ class PortfolioRepository(BaseRepository):
                 "positions_count": 0,
             }
 
+        # Fetch real balances
+        balances = []
+        if hasattr(self.storage, "get_latest_balances"):
+            balances = await self.storage.get_latest_balances()
+
+        # Fetch real positions
         positions = await self.storage.get_latest_positions()
+
+        # Filter by exchange if requested
+        if exchange:
+            balances = [b for b in balances if b.exchange == exchange]
+            positions = [
+                p for p in positions if getattr(p, "exchange", None) == exchange
+            ]
+
+        # Aggregate metrics
+        total_equity = sum(b.equity for b in balances)
+        margin_used = sum(b.margin_used for b in balances)
+        available = sum(b.available for b in balances)
+
+        # If no balances found (e.g. cold start), fallback to 0 or potentially mocked logic
+        # but better to show 0 to indicate "waiting for data"
+
         unrealized_pnl = sum(getattr(p, "unrealized_pnl", 0.0) for p in positions)
 
         return {
-            "equity": 150000.00,  # Mocked until balance table added
-            "margin_used": 25000.00,
-            "margin_available": 125000.00,
-            "daily_pnl": 1250.50,
+            "equity": total_equity,
+            "margin_used": margin_used,
+            "margin_available": available,
+            "daily_pnl": 0.0,  # Placeholder until PnL history is tracked
             "unrealized_pnl": unrealized_pnl,
             "positions_count": len(positions),
         }

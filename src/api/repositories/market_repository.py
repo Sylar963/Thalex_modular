@@ -57,12 +57,12 @@ class MarketRepository(BaseRepository):
         return []
 
     async def get_tick_bars(
-        self, symbol: str, tick_count: int, limit: int
+        self, symbol: str, tick_count: int, limit: int, exchange: str = "thalex"
     ) -> List[Dict]:
         if not self.storage:
             return []
         if hasattr(self.storage, "get_tick_bars"):
-            return await self.storage.get_tick_bars(symbol, tick_count, limit)
+            return await self.storage.get_tick_bars(symbol, tick_count, limit, exchange)
         return []
 
     async def get_signal_history(

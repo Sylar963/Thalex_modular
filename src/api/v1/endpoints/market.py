@@ -61,9 +61,10 @@ async def get_tick_bars(
     symbol: str,
     tick_count: int = 2500,
     limit: int = 100,
+    exchange: str = "thalex",
     repo: MarketRepository = Depends(get_market_repo),
 ):
-    return await repo.get_tick_bars(symbol, tick_count, limit)
+    return await repo.get_tick_bars(symbol, tick_count, limit, exchange)
 
 
 @router.get("/signals/history/{symbol}", response_model=List[Dict])

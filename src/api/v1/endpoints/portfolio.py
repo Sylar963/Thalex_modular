@@ -7,8 +7,11 @@ router = APIRouter()
 
 
 @router.get("/summary", response_model=Dict)
-async def get_summary(repo: PortfolioRepository = Depends(get_portfolio_repo)):
-    return await repo.get_summary()
+async def get_summary(
+    exchange: Optional[str] = Query(None, description="Filter by exchange name"),
+    repo: PortfolioRepository = Depends(get_portfolio_repo),
+):
+    return await repo.get_summary(exchange=exchange)
 
 
 @router.get("/positions", response_model=List[Dict])

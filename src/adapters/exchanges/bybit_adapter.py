@@ -142,24 +142,39 @@ class BybitAdapter(BaseExchangeAdapter):
     async def fetch_instrument_info(
         self, symbol: str, category: str = "linear"
     ) -> Dict:
+        mapped_symbol = InstrumentService.get_exchange_symbol(symbol, self.name)
         url = f"{self.base_url}/v5/market/instruments-info"
-        params = {"category": category, "symbol": symbol}
+        params = {"category": category, "symbol": mapped_symbol}
         async with self.session.get(url, params=params) as resp:
             data = await resp.json()
-            if data.get("retCode") == 0:
-                items = data.get("result", {}).get("list", [])
-                if items:
-                    info = items[0]
-                    self.tick_size = float(
-                        info.get("priceFilter", {}).get("tickSize", 0.01)
-                    )
-                    self.lot_size = float(
-                        info.get("lotSizeFilter", {}).get("minOrderQty", 0.001)
-                    )
-                    logger.info(
-                        f"Fetched {symbol} tick_size={self.tick_size}, lot_size={self.lot_size}"
-                    )
-                    return info
+            items = data.get("result", {}).get("list", [])
+
+            if data.get("retCode") == 0 and items:
+                pass
+            elif category == "linear":
+                # Fallback to option
+                params["category"] = "option"
+                async with self.session.get(url, params=params) as resp2:
+                    data2 = await resp2.json()
+                    if data2.get("retCode") == 0 and data2.get("result", {}).get(
+                        "list", []
+                    ):
+                        data = data2
+                        category = "option"  # Update for future use if needed
+                        items = data.get("result", {}).get("list", [])
+
+            if items:
+                info = items[0]
+                self.tick_size = float(
+                    info.get("priceFilter", {}).get("tickSize", 0.01)
+                )
+                self.lot_size = float(
+                    info.get("lotSizeFilter", {}).get("minOrderQty", 0.001)
+                )
+                logger.info(
+                    f"Fetched {symbol} tick_size={self.tick_size}, lot_size={self.lot_size}"
+                )
+                return info
         return {}
 
     async def disconnect(self):
@@ -281,9 +296,10 @@ class BybitAdapter(BaseExchangeAdapter):
         self.balance_callback = callback
 
     async def place_order(self, order: Order) -> Order:
+        mapped_symbol = InstrumentService.get_exchange_symbol(order.symbol, self.name)
         payload = {
             "category": "linear",
-            "symbol": order.symbol,
+            "symbol": mapped_symbol,
             "side": "Buy" if order.side == OrderSide.BUY else "Sell",
             "orderType": "Limit" if order.type == OrderType.LIMIT else "Market",
             "qty": str(order.size),
@@ -322,7 +338,8 @@ class BybitAdapter(BaseExchangeAdapter):
 
         import json
 
-        payload = {"category": "linear", "symbol": order.symbol, "orderId": order_id}
+        mapped_symbol = InstrumentService.get_exchange_symbol(order.symbol, self.name)
+        payload = {"category": "linear", "symbol": mapped_symbol, "orderId": order_id}
         payload_str = json.dumps(payload)
 
         url = f"{self.base_url}/v5/order/cancel"
@@ -348,8 +365,9 @@ class BybitAdapter(BaseExchangeAdapter):
         asyncio.create_task(self._ticker_stream(symbol))
 
     async def _ticker_stream(self, symbol: str):
+        mapped_symbol = InstrumentService.get_exchange_symbol(symbol, self.name)
         async with self.session.ws_connect(self.ws_public_url) as ws:
-            sub_msg = {"op": "subscribe", "args": [f"orderbook.1.{symbol}"]}
+            sub_msg = {"op": "subscribe", "args": [f"orderbook.1.{mapped_symbol}"]}
             await ws.send_json(sub_msg)
 
             while self.connected:

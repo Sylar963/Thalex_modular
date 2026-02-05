@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 class GlobalState:
     positions: Dict[str, Position] = field(default_factory=dict)
     tickers: Dict[str, Ticker] = field(default_factory=dict)
+    balances: Dict[str, Any] = field(default_factory=dict)  # Key: "exchange:asset"
     last_update: float = field(default_factory=time.time)
 
     @property
@@ -54,6 +55,22 @@ class SyncEngine:
             key = f"{exchange}:{symbol}"
             self.state.tickers[key] = ticker
             self.state.last_update = time.time()
+
+    async def update_balance(self, balance: Any):
+        async with self._lock:
+            key = f"{balance.exchange}:{balance.asset}"
+            self.state.balances[key] = balance
+            self.state.last_update = time.time()
+
+            if self.on_state_change:
+                self.on_state_change(self.state)
+
+    def get_total_equity(self) -> float:
+        total = 0.0
+        for bal in self.state.balances.values():
+            # Naive sum, assumes all in USD/USDC nominal
+            total += bal.equity
+        return total
 
     def get_net_position(self, symbol: str) -> float:
         total = 0.0

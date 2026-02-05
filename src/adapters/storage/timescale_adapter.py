@@ -726,7 +726,11 @@ class TimescaleDBAdapter(StorageGateway):
             return []
 
     async def get_tick_bars(
-        self, symbol: str, tick_count: int = 2500, limit: int = 100
+        self,
+        symbol: str,
+        tick_count: int = 2500,
+        limit: int = 100,
+        exchange: str = "thalex",
     ) -> List[Dict]:
         if not self.pool:
             return []
@@ -742,7 +746,7 @@ class TimescaleDBAdapter(StorageGateway):
                             side,
                             ROW_NUMBER() OVER (ORDER BY time) as row_num
                         FROM market_trades
-                        WHERE symbol = $1
+                        WHERE symbol = $1 AND exchange = $4
                         ORDER BY time DESC
                         LIMIT 250000
                     ),
@@ -771,6 +775,7 @@ class TimescaleDBAdapter(StorageGateway):
                     symbol,
                     tick_count,
                     limit,
+                    exchange,
                 )
                 return [
                     {

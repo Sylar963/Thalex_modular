@@ -110,6 +110,7 @@ class MultiExchangeStrategyManager:
         gw.set_trade_callback(self._make_trade_callback(gw.name))
         gw.set_order_callback(venue.state_tracker.on_order_update)
         gw.set_position_callback(self._make_position_callback(gw.name))
+        gw.set_balance_callback(self._handle_balance_update)
 
         await gw.connect()
 
@@ -135,8 +136,8 @@ class MultiExchangeStrategyManager:
                 exchange=gw.name,
             )
             self.portfolio.set_position(pos)
-            if self.storage:
-                await self.storage.save_position(pos)
+            if self.risk_manager:
+                self.risk_manager.update_position(pos)
         except Exception as e:
             logger.warning(f"Could not fetch initial position for {gw.name}: {e}")
 
@@ -200,6 +201,11 @@ class MultiExchangeStrategyManager:
                 asyncio.create_task(self.storage.save_position(position))
 
         return callback
+
+    async def _handle_balance_update(self, balance):
+        await self.sync_engine.update_balance(balance)
+        if self.storage:
+            await self.storage.save_balance(balance)
 
     async def _run_strategy_for_venue(self, venue: VenueContext):
         if self._reconcile_lock.locked():
