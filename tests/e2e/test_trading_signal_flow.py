@@ -103,17 +103,11 @@ async def test_momentum_add_flow():
         await gateway.push_trade(t)
         # Also need to trigger manager update loop via ticker
         await gateway.push_ticker(ticker)
-        print(
-            f"[DEBUG_LOOP] i={i}, Impact={vamp_engine.get_signals().get('market_impact', 0.0)}"
-        )
 
     # Allow async tasks to process
     await asyncio.sleep(0.5)
 
     # 4. Assertions
-    print(f"\n[DEBUG] VAMP Signals: {vamp_engine.get_signals()}")
-    print(f"\n[DEBUG] Manager Adds: {manager._momentum_adds}")
-
     # Check if Momentum Add was placed in SimEngine
     # It should be a MARKET BUY
     fills = sim_engine.fills

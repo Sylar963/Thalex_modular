@@ -18,7 +18,6 @@ from ..domain.entities import (
     Ticker,
     Trade,
     Position,
-    Position,
     Order,
     OrderType,
     OrderSide,
@@ -270,7 +269,7 @@ class MultiExchangeStrategyManager:
 
         # 2. Check for Risk Breach
         if self.risk_manager.has_breached():
-            logger.critical(f"RISK BREACH DETECTED - ENTERING SMART REDUCING MODE")
+            logger.critical("RISK BREACH DETECTED - ENTERING SMART REDUCING MODE")
             await self._run_smart_reducing_mode(venue)
             return
 
@@ -534,13 +533,13 @@ class MultiExchangeStrategyManager:
             should_exit = False
             # Time cap (10 mins)
             if now - add["timestamp"] > 600:
-                logger.warning(f"Momentum ADD timed out (10 mins). Exiting.")
+                logger.warning("Momentum ADD timed out (10 mins). Exiting.")
                 should_exit = True
             # VAMP reversal
             elif (add["side"] == OrderSide.BUY and vamp_impact < 0.2) or (
                 add["side"] == OrderSide.SELL and vamp_impact > -0.2
             ):
-                logger.info(f"Momentum ADD signal reversal detected. Exiting.")
+                logger.info("Momentum ADD signal reversal detected. Exiting.")
                 should_exit = True
 
             if should_exit:
@@ -559,10 +558,6 @@ class MultiExchangeStrategyManager:
             add_side = OrderSide.BUY
         elif vamp_impact < -0.7 and current_price < or_mid and trend_side == "DOWN":
             add_side = OrderSide.SELL
-
-        print(
-            f"[DEBUG_COND] Impact={vamp_impact}, Price={current_price}, ORM={or_mid}, Trend={trend_side}, AddSide={add_side}"
-        )
 
         if add_side:
             logger.critical(
