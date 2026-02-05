@@ -128,6 +128,13 @@ class MultiExchangeStrategyManager:
 
         await gw.connect()
 
+        # Fetch initial balances
+        try:
+            if hasattr(gw, "get_balances"):
+                await gw.get_balances()
+        except Exception as e:
+            logger.warning(f"Failed to fetch initial balances for {gw.name}: {e}")
+
         if hasattr(gw, "fetch_instrument_info"):
             await gw.fetch_instrument_info(cfg.symbol)
             cfg.tick_size = getattr(gw, "tick_size", cfg.tick_size)
