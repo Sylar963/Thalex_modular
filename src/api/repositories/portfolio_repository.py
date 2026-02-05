@@ -25,9 +25,11 @@ class PortfolioRepository(BaseRepository):
 
         # Filter by exchange if requested
         if exchange:
-            balances = [b for b in balances if b.exchange == exchange]
+            balances = [b for b in balances if b.exchange.lower() == exchange.lower()]
             positions = [
-                p for p in positions if getattr(p, "exchange", None) == exchange
+                p
+                for p in positions
+                if getattr(p, "exchange", "").lower() == exchange.lower()
             ]
 
         # Aggregate metrics
@@ -57,7 +59,9 @@ class PortfolioRepository(BaseRepository):
 
         if exchange:
             positions = [
-                p for p in positions if getattr(p, "exchange", None) == exchange
+                p
+                for p in positions
+                if getattr(p, "exchange", "").lower() == exchange.lower()
             ]
 
         return [

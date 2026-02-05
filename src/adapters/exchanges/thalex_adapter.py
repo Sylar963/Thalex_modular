@@ -23,6 +23,7 @@ from ...domain.entities import (
     Position,
     Ticker,
     Trade,
+    Balance,
 )
 
 logger = logging.getLogger(__name__)
@@ -203,6 +204,35 @@ class ThalexAdapter(ExchangeGateway):
                 logger.info(f"Fetched tick size for {symbol}: {self.tick_size}")
         except Exception as e:
             logger.error(f"Failed to fetch instrument details: {e}")
+
+    async def get_balances(self) -> List[Balance]:
+        try:
+            # Try to use get_account_summary or fall back to requesting subscription update
+            # Since Thalex lib might not expose get_account_summary directly if not defined,
+            # check availability. Assuming it exists or we can rely on msg stream updates.
+            # But let's try calling it.
+            if hasattr(self.client, "get_account_summary"):
+                response = await self._rpc_request(self.client.get_account_summary)
+                if "result" in response:
+                    res = response["result"]
+                    total = float(res.get("equity", 0.0))
+                    available = float(res.get("available_funds", 0.0))
+                    margin_used = float(res.get("margin_used", 0.0))
+
+                    bal = Balance(
+                        exchange=self.name,
+                        asset="USD",
+                        total=total,
+                        available=available,
+                        margin_used=margin_used,
+                        equity=total,
+                    )
+                    if self.balance_callback:
+                        await self.balance_callback(bal)
+                    return [bal]
+        except Exception as e:
+            logger.error(f"Failed to fetch balances: {e}")
+        return []
 
     async def place_order(self, order: Order) -> Order:
         if not self.connected:
@@ -687,9 +717,7 @@ class ThalexAdapter(ExchangeGateway):
                             await self.position_callback(symbol, amount, entry_price)
 
             elif channel == "account":
-                # Handle account/balance updates
                 acc_data = data if isinstance(data, list) else [data]
-                from ...domain.entities import Balance
 
                 for acc in acc_data:
                     # Map fields - adjusting based on assumed Thalex API response for account
