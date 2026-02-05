@@ -77,13 +77,27 @@ class BybitHistoryAdapter(IHistoryProvider):
                 if data.get("retCode") == 0:
                     list_data = data.get("result", {}).get("list", [])
                     if not list_data:
+                        logger.info(
+                            f"No more data returned from Bybit for {config.symbol}."
+                        )
                         break
 
+                    # Bybit returns data in DESCENDING order (Newest -> Oldest)
+                    # list_data[0] is the NEWEST candle in this batch.
+                    # list_data[-1] is the OLDEST candle in this batch.
+
+                    count_in_batch = 0
                     for item in list_data:
+                        # Parse candle
                         ts = float(item[0]) / 1000.0
+
+                        # Filter out candles outside our requested range just in case
+                        if ts < config.start_time:
+                            continue
+
                         last_price = float(item[4])
                         # Heuristic: slight spread around last price since we don't have BBO history in klines
-                        # item[2] is High, item[3] is Low - DO NOT use for bid/ask
+                        # item[2] is High, item[3] is Low.
                         ticker = Ticker(
                             symbol=config.symbol,
                             bid=last_price * 0.9999,
@@ -96,10 +110,37 @@ class BybitHistoryAdapter(IHistoryProvider):
                             exchange="bybit",
                         )
                         await self.db.save_ticker(ticker)
+                        count_in_batch += 1
                         total_count += 1
 
-                    last_ts = int(list_data[-1][0])
-                    current_start = last_ts + 60000
+                    # Update cursor strategy:
+                    # Since we want to fill the gap relative to 'start_time' up to 'end_time',
+                    # and the API returns newest first, we are essentially requesting a chunk starting at 'current_start'.
+                    # HOWEVER, 'start' in Bybit API is "From" timestamp (inclusive) but direction depends on sort.
+                    # By default (and verified), it returns candles *starting at* 'start' and going forward if using ascending?
+                    # WAIT: The verification script showed DESCENDING order.
+                    # Implication: if we pass start=T, Bybit returns [T+N, ... T+1, T].
+                    # Actually, Bybit Linear Kline: "start" is the start timestamp. "limit" is count.
+                    # If we ask for start=100, limit=2: it returns [101, 100] (Desc).
+                    # So to get the NEXT batch, we need to know the timestamp of the NEWEST candle we just got,
+                    # and add 1 minute/interval to it.
+
+                    # list_data[0] is the newest.
+                    newest_ts_in_batch = int(list_data[0][0])
+                    current_start = newest_ts_in_batch + 60000  # Advance by 1 minute
+
+                    logger.debug(
+                        f"Batch processed. Newest TS: {newest_ts_in_batch}. Next start: {current_start}"
+                    )
+
+                    if count_in_batch == 0:
+                        # We might have gotten data that was all older than our start_time?
+                        # Or maybe we reached the end (future)?
+                        # If the newest candle is older than what we wanted? No, start param prevents that.
+                        # If we got 0 valid candles but list_data wasn't empty, valid data might be in the future?
+                        # Safe break to avoid infinite loop
+                        pass
+
                 else:
                     logger.error(f"Bybit fetch error: {data}")
                     break

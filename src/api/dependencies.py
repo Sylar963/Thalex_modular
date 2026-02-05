@@ -29,8 +29,23 @@ async def init_dependencies():
     db_user = os.getenv("DATABASE_USER", "postgres")
     db_pass = os.getenv("DATABASE_PASSWORD", "password")
     db_host = os.getenv("DATABASE_HOST", "localhost")
-    db_port = os.getenv("DATABASE_PORT", "5432")
     db_name = os.getenv("DATABASE_NAME", "thalex_trading")
+
+    # Robust Port Detection
+    # 1. Check DATABASE_PORT (preferred)
+    # 2. Check DB_PORT (fallback)
+    # 3. Default to 5433 (Thalex default) with warning
+    db_port = os.getenv("DATABASE_PORT")
+    if not db_port:
+        db_port = os.getenv("DB_PORT")
+
+    if not db_port:
+        print("WARNING: Neither DATABASE_PORT nor DB_PORT set. Defaulting to 5433.")
+        db_port = "5433"
+
+    # Log configuration for verification (masking password)
+    print(f"Initializing DB Connection: {db_user}@{db_host}:{db_port}/{db_name}")
+
     db_dsn = f"postgresql://{db_user}:{db_pass}@{db_host}:{db_port}/{db_name}"
 
     try:

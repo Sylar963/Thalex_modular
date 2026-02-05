@@ -413,7 +413,7 @@ class TimescaleDBAdapter(StorageGateway):
             async with self.pool.acquire() as conn:
                 rows = await conn.fetch(
                     """
-                    SELECT symbol, size, entry_price, mark_price, unrealized_pnl, delta, gamma, theta
+                    SELECT symbol, size, entry_price, mark_price, unrealized_pnl, delta, gamma, theta, exchange
                     FROM portfolio_positions
                     WHERE size != 0
                 """
@@ -428,6 +428,7 @@ class TimescaleDBAdapter(StorageGateway):
                         delta=r["delta"] or 0.0,
                         gamma=r["gamma"] or 0.0,
                         theta=r["theta"] or 0.0,
+                        exchange=r["exchange"] or "thalex",
                     )
                     for r in rows
                 ]
@@ -435,31 +436,41 @@ class TimescaleDBAdapter(StorageGateway):
             logger.error(f"Failed to fetch latest positions: {e}")
             return []
 
-    async def get_recent_tickers(self, symbol: str, limit: int = 100) -> List[Ticker]:
+    async def get_recent_tickers(
+        self, symbol: str, limit: int = 100, exchange: Optional[str] = None
+    ) -> List[Ticker]:
         if not self.pool:
             return []
         try:
             async with self.pool.acquire() as conn:
-                rows = await conn.fetch(
-                    """
-                    SELECT time, symbol, bid, ask, last, volume
+                query = """
+                    SELECT time, symbol, bid, ask, last, volume, exchange
                     FROM market_tickers
                     WHERE symbol = $1
+                """
+                args = [symbol]
+
+                if exchange:
+                    query += " AND exchange = $2"
+                    args.append(exchange)
+
+                query += """
                     ORDER BY time DESC
-                    LIMIT $2
-                    """,
-                    symbol,
-                    limit,
-                )
+                    LIMIT $""" + str(len(args) + 1)
+
+                args.append(limit)
+
+                rows = await conn.fetch(query, *args)
                 return [
                     Ticker(
                         symbol=r["symbol"],
                         bid=r["bid"],
                         ask=r["ask"],
-                        bid_size=0.0,  # Not stored currently
-                        ask_size=0.0,  # Not stored currently
+                        bid_size=0.0,
+                        ask_size=0.0,
                         last=r["last"],
                         volume=r["volume"],
+                        exchange=r["exchange"],
                         timestamp=r["time"].timestamp(),
                     )
                     for r in rows
