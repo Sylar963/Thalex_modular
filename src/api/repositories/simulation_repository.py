@@ -88,8 +88,29 @@ class SimulationRepository(BaseRepository):
     async def get_stats(self, run_id: str) -> Dict:
         result = self.runs.get(run_id)
         if not result or not result.stats:
-            return {}
-        return asdict(result.stats)
+            return {"edge": [], "decay": []}
+
+        # Map flat stats to frontend array format
+        # Frontend expects arrays of metrics over time or windows
+        # Our current backend stats are just averages (one point)
+        # We'll create a single-item array for now to suffice the interface
+
+        stats = result.stats
+
+        edge_metrics = [
+            {
+                "timestamp": result.end_time,
+                "edge": stats.avg_edge,
+                "count": stats.total_trades,
+            }
+        ]
+
+        decay_metrics = [
+            {"window": "5s", "decay": stats.avg_adverse_selection_5s},
+            {"window": "30s", "decay": stats.avg_adverse_selection_30s},
+        ]
+
+        return {"edge": edge_metrics, "decay": decay_metrics, "summary": asdict(stats)}
 
     def get_live_status(self) -> Dict:
         return sim_state_manager.get_status()

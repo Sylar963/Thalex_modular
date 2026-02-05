@@ -55,7 +55,10 @@ class BybitAdapter(BaseExchangeAdapter):
 
         self._msg_loop_task: Optional[asyncio.Task] = None
         self._ping_task: Optional[asyncio.Task] = None
+        self._msg_loop_task: Optional[asyncio.Task] = None
+        self._ping_task: Optional[asyncio.Task] = None
         self._time_offset_ms: int = 0
+        self.balance_callback: Optional[Callable] = None
 
     @property
     def name(self) -> str:
@@ -136,9 +139,11 @@ class BybitAdapter(BaseExchangeAdapter):
         await self._subscribe_private()
         logger.info("Bybit Adapter connected.")
 
-    async def fetch_instrument_info(self, symbol: str) -> Dict:
+    async def fetch_instrument_info(
+        self, symbol: str, category: str = "linear"
+    ) -> Dict:
         url = f"{self.base_url}/v5/market/instruments-info"
-        params = {"category": "linear", "symbol": symbol}
+        params = {"category": category, "symbol": symbol}
         async with self.session.get(url, params=params) as resp:
             data = await resp.json()
             if data.get("retCode") == 0:
@@ -170,7 +175,10 @@ class BybitAdapter(BaseExchangeAdapter):
         logger.info("Bybit Adapter disconnected.")
 
     async def _subscribe_private(self):
-        sub_msg = {"op": "subscribe", "args": ["order", "execution", "position"]}
+        sub_msg = {
+            "op": "subscribe",
+            "args": ["order", "execution", "position", "wallet"],
+        }
         await self.ws_private.send_json(sub_msg)
 
     async def _ping_loop(self):
@@ -208,6 +216,9 @@ class BybitAdapter(BaseExchangeAdapter):
         elif topic == "position":
             for item in msg.get("data", []):
                 await self._handle_position_update(item)
+        elif topic == "wallet":
+            for item in msg.get("data", []):
+                await self._handle_wallet_update(item)
 
     async def _handle_order_update(self, data: Dict):
         exchange_id = data.get("orderId", "")
@@ -241,6 +252,33 @@ class BybitAdapter(BaseExchangeAdapter):
 
             if self.position_callback:
                 await self.position_callback(symbol, amount, entry_price)
+
+    async def _handle_wallet_update(self, data: Dict):
+        from ...domain.entities import Balance
+
+        coins = data.get("coin", [])
+        for coin_data in coins:
+            coin = coin_data.get("coin", "USD")
+            equity = float(coin_data.get("equity", 0))
+            wallet_balance = float(coin_data.get("walletBalance", 0))
+            available = float(coin_data.get("availableToWithdraw", 0))
+            # Bybit Unified Account: totalEquity, etc. might be in different fields
+            # For standard account or UTA, 'equity' usually present.
+            # margin used = equity - available (approx) or totalMargin
+
+            bal = Balance(
+                exchange=self.name,
+                asset=coin,
+                total=wallet_balance,
+                available=available,
+                margin_used=wallet_balance - available,  # Approx
+                equity=equity,
+            )
+            if self.balance_callback:
+                await self.balance_callback(bal)
+
+    def set_balance_callback(self, callback: Callable):
+        self.balance_callback = callback
 
     async def place_order(self, order: Order) -> Order:
         payload = {

@@ -64,6 +64,11 @@ class ExchangeGateway(ABC):
     def set_position_callback(self, callback):
         pass
 
+    @abstractmethod
+    def set_balance_callback(self, callback):
+        """Set callback for balance updates: async def cb(balance: Balance)."""
+        pass
+
 
 class Strategy(ABC):
     """Abstract interface for trading strategies."""
@@ -173,4 +178,14 @@ class StorageGateway(ABC):
         self, symbol: str, start: float, end: float
     ) -> List[Dict]:
         """Retrieve historical regime metrics."""
+        pass
+
+    @abstractmethod
+    async def save_balance(self, balance: Any):
+        """Save account balance snapshot."""
+        pass
+
+    @abstractmethod
+    async def get_latest_balances(self) -> List[Any]:
+        """Retrieve latest balances for all exchanges."""
         pass

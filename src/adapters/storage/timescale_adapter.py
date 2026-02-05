@@ -211,6 +211,20 @@ class TimescaleDBAdapter(StorageGateway):
                 except Exception:
                     pass
 
+                # 7. Account Balances Table
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS account_balances (
+                        exchange TEXT NOT NULL,
+                        asset TEXT NOT NULL,
+                        total DOUBLE PRECISION NOT NULL,
+                        available DOUBLE PRECISION NOT NULL,
+                        margin_used DOUBLE PRECISION DEFAULT 0.0,
+                        equity DOUBLE PRECISION DEFAULT 0.0,
+                        last_update TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (exchange, asset)
+                    );
+                """)
+
             except Exception as e:
                 logger.error(f"Failed to initialize schema: {e}")
                 raise
@@ -775,4 +789,78 @@ class TimescaleDBAdapter(StorageGateway):
                 ]
         except Exception as e:
             logger.error(f"Failed to fetch tick bars: {e}")
+            return []
+
+    async def _init_balances_table(self, conn):
+        """Create account balances table."""
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS account_balances (
+                exchange TEXT NOT NULL,
+                asset TEXT NOT NULL,
+                total DOUBLE PRECISION NOT NULL,
+                available DOUBLE PRECISION NOT NULL,
+                margin_used DOUBLE PRECISION DEFAULT 0.0,
+                equity DOUBLE PRECISION DEFAULT 0.0,
+                last_update TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (exchange, asset)
+            );
+        """)
+
+    async def save_balance(self, balance):
+        if not self.pool:
+            return
+        try:
+            async with self.pool.acquire() as conn:
+                # Ensure table exists (lazy init or we could do it in _init_schema)
+                # Ideally _init_schema handles creation, but for this hot-patch we can add it here or rely on _init_schema update
+                # Let's add it to _init_schema properly, but here is the save logic.
+                await conn.execute(
+                    """
+                    INSERT INTO account_balances (exchange, asset, total, available, margin_used, equity, last_update)
+                    VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)
+                    ON CONFLICT (exchange, asset) DO UPDATE SET
+                        total = EXCLUDED.total,
+                        available = EXCLUDED.available,
+                        margin_used = EXCLUDED.margin_used,
+                        equity = EXCLUDED.equity,
+                        last_update = CURRENT_TIMESTAMP
+                    """,
+                    balance.exchange,
+                    balance.asset,
+                    balance.total,
+                    balance.available,
+                    balance.margin_used,
+                    balance.equity,
+                )
+        except Exception as e:
+            logger.error(f"Failed to save balance: {e}")
+
+    async def get_latest_balances(self) -> List[Any]:
+        if not self.pool:
+            return []
+        try:
+            from ...domain.entities import (
+                Balance,
+            )  # Deferred import to avoid circular dependency
+
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT exchange, asset, total, available, margin_used, equity
+                    FROM account_balances
+                    """
+                )
+                return [
+                    Balance(
+                        exchange=r["exchange"],
+                        asset=r["asset"],
+                        total=r["total"],
+                        available=r["available"],
+                        margin_used=r["margin_used"],
+                        equity=r["equity"],
+                    )
+                    for r in rows
+                ]
+        except Exception as e:
+            logger.error(f"Failed to fetch latest balances: {e}")
             return []

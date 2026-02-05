@@ -51,7 +51,10 @@ class HyperliquidAdapter(BaseExchangeAdapter):
         self.meta: Dict = {}
 
         self._msg_loop_task: Optional[asyncio.Task] = None
+        self._msg_loop_task: Optional[asyncio.Task] = None
+        self._balance_task: Optional[asyncio.Task] = None
         self._time_offset_ms: int = 0
+        self.balance_callback: Optional[Callable] = None
 
     @property
     def name(self) -> str:
@@ -98,12 +101,15 @@ class HyperliquidAdapter(BaseExchangeAdapter):
         self._msg_loop_task = asyncio.create_task(self._msg_loop())
 
         await self._subscribe_user_events()
+        self._balance_task = asyncio.create_task(self._balance_loop())
         logger.info("Hyperliquid Adapter connected.")
 
     async def disconnect(self):
         self.connected = False
         if self._msg_loop_task:
             self._msg_loop_task.cancel()
+        if self._balance_task:
+            self._balance_task.cancel()
         if self.ws:
             await self.ws.close()
         if self.session:
@@ -336,3 +342,41 @@ class HyperliquidAdapter(BaseExchangeAdapter):
                     entry_price = float(p.get("entryPx", 0))
                     return Position(symbol, amount, entry_price, exchange=self.name)
         return Position(symbol, 0.0, 0.0, exchange=self.name)
+
+    async def _balance_loop(self):
+        while self.connected:
+            try:
+                url = f"{self.base_url}/info"
+                async with self.session.post(
+                    url, json={"type": "userState", "user": self.address}
+                ) as resp:
+                    data = await resp.json()
+                    margin_summary = data.get("marginSummary", {})
+                    account_value = float(margin_summary.get("accountValue", 0.0))
+                    total_margin_used = float(
+                        margin_summary.get("totalMarginUsed", 0.0)
+                    )
+                    total_ncn = float(margin_summary.get("totalNtlPos", 0.0))
+                    withdrawable = float(data.get("withdrawable", 0.0))
+
+                    from ...domain.entities import Balance
+
+                    bal = Balance(
+                        exchange=self.name,
+                        asset="USDC",  # Hyperliquid uses USDC
+                        total=account_value,
+                        available=withdrawable,
+                        margin_used=total_margin_used,
+                        equity=account_value,
+                    )
+
+                    if self.balance_callback:
+                        await self.balance_callback(bal)
+
+            except Exception as e:
+                logger.error(f"Hyperliquid balance polling error: {e}")
+
+            await asyncio.sleep(5)  # Poll every 5 seconds
+
+    def set_balance_callback(self, callback: Callable):
+        self.balance_callback = callback

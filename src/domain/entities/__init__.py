@@ -138,3 +138,14 @@ class Portfolio:
 
     def all_positions(self) -> List[Position]:
         return list(self.positions.values())
+
+
+@dataclass(slots=True)
+class Balance:
+    exchange: str
+    asset: str
+    total: float
+    available: float
+    margin_used: float = 0.0
+    equity: float = 0.0
+    timestamp: float = field(default_factory=time.time)

@@ -90,6 +90,7 @@ class ThalexAdapter(ExchangeGateway):
         self.trade_callback: Optional[Callable] = None
         self.order_callback: Optional[Callable] = None
         self.position_callback: Optional[Callable] = None
+        self.balance_callback: Optional[Callable] = None
 
         self.positions: Dict[str, Position] = {}
         self.orders: Dict[str, Order] = {}
@@ -206,6 +207,9 @@ class ThalexAdapter(ExchangeGateway):
 
     def set_position_callback(self, callback: Callable):
         self.position_callback = callback
+
+    def set_balance_callback(self, callback: Callable):
+        self.balance_callback = callback
 
     def set_sequence_callback(self, callback: Callable):
         self.sequence_callback = callback
@@ -338,7 +342,8 @@ class ThalexAdapter(ExchangeGateway):
             )
             # Try private subscribe for orders and portfolio
             await self._rpc_request(
-                self.client.private_subscribe, channels=[orders_channel, "portfolio"]
+                self.client.private_subscribe,
+                channels=[orders_channel, "portfolio", "account"],
             )
         except Exception as e:
             logger.error(f"Subscription failed: {e}")
@@ -718,6 +723,30 @@ class ThalexAdapter(ExchangeGateway):
 
                         if self.position_callback:
                             await self.position_callback(symbol, amount, entry_price)
+
+            elif channel == "account":
+                # Handle account/balance updates
+                acc_data = data if isinstance(data, list) else [data]
+                from ...domain.entities import Balance
+
+                for acc in acc_data:
+                    # Map fields - adjusting based on assumed Thalex API response for account
+                    # total_equity, available_funds, etc.
+                    # Fallback if specific fields aren't found, log for debugging
+                    total = float(acc.get("equity", 0.0))
+                    available = float(acc.get("available_funds", 0.0))
+                    margin_used = float(acc.get("margin_used", 0.0))
+
+                    bal = Balance(
+                        exchange=self.name,
+                        asset="USD",  # Defaulting to USD/USDC for Thalex usually
+                        total=total,
+                        available=available,
+                        margin_used=margin_used,
+                        equity=total,
+                    )
+                    if self.balance_callback:
+                        await self.balance_callback(bal)
             return
 
         # Fallback to old format (if any)

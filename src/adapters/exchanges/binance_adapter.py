@@ -45,7 +45,9 @@ class BinanceAdapter(BaseExchangeAdapter):
         self.listen_key: Optional[str] = None
 
         self.positions: Dict[str, Position] = {}
+        self.positions: Dict[str, Position] = {}
         self.orders: Dict[str, Order] = {}
+        self.balance_callback: Optional[Callable] = None
 
         self._msg_loop_task: Optional[asyncio.Task] = None
         self._keepalive_task: Optional[asyncio.Task] = None
@@ -194,6 +196,36 @@ class BinanceAdapter(BaseExchangeAdapter):
 
                 if self.position_callback:
                     await self.position_callback(symbol, amount, entry_price)
+
+        balances_data = data.get("B", [])
+        from ...domain.entities import Balance
+
+        for b in balances_data:
+            asset = b.get("a")
+            wallet_balance = float(b.get("wb", 0))
+            cross_wallet = float(b.get("cw", 0))
+            # available logic might need more fields like 'bc' (Balance Change) or fetch from GET /account
+            # But 'cw' is cross wallet balance.
+            # Assuming equity ~ wallet_balance for now if PnL not strictly added here.
+            # Binance sends 'up' (Unrealized PnL) in 'a' section but that's for positions?
+            # Actually ACCOUNT_UPDATE 'a' has 'm' (margin balance), 'up' (unrealized pnl)??
+            # No, 'a' is just event cause.
+            # We use 'wb' as total.
+
+            # Simple mapping
+            bal = Balance(
+                exchange=self.name,
+                asset=asset,
+                total=wallet_balance,
+                available=cross_wallet,  # Approx
+                margin_used=wallet_balance - cross_wallet,
+                equity=wallet_balance,  # Ideally + unrealized PnL if available
+            )
+            if self.balance_callback:
+                await self.balance_callback(bal)
+
+    def set_balance_callback(self, callback: Callable):
+        self.balance_callback = callback
 
     async def place_order(self, order: Order) -> Order:
         mapped_symbol = InstrumentService.get_exchange_symbol(order.symbol, self.name)
