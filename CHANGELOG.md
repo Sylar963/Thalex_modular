@@ -2,7 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Current State] - 2026-02-04
+## [Current State] - 2026-02-05
+
+### Refactored (Technical Debt)
+- **Centralized Rate Limiting**: Moved `TokenBucket` to `base_adapter.py` to provide a shared utility for all exchange adapters, reducing code duplication.
+- **Environment Variable Standardization**: Standardized database connection parameters across the entire system (`DATABASE_HOST`, `DATABASE_PORT`, `DATABASE_USER`, `DATABASE_NAME`, `DATABASE_PASSWORD`).
+- **Adapter Cleanup**: Fixed redundant task and variable initializations in `BybitAdapter`, `BinanceAdapter`, and `HyperliquidAdapter`.
+- **Logic Consolidation**: Removed redundant `RegimeDetector` class in favor of the more robust `MultiWindowRegimeAnalyzer`.
+- **Robustness**: Fixed `NameError` in Bybit adapter and restored missing imports/logger in Thalex adapter.
+
+## [Previous State] - 2026-02-04
 
 ### Added
 - **High-Fidelity Alpha Simulation**: 

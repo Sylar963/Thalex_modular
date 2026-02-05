@@ -79,11 +79,12 @@ Adjusts strategy parameters based on real-time market conditions.
 - **SSE Streams**: Live equity curves and fills are broadcasted via SSE to the dashboard.
 
 ### 5. **Data Infrastructure & Persistence**
-- **ThalexAdapter**: High-performance JSON-RPC client with Token Bucket rate limiting.
+- **BaseExchangeAdapter**: Provides a common interface and shared utilities, including the centralized `TokenBucket` for rate limiting.
+- **ThalexAdapter**: High-performance JSON-RPC client utilizing the shared `TokenBucket` with support for COD (Cancel on Disconnect).
 - **TimescaleDB**:
   - **Hypertables**: Efficient storage of 1m OHLCV, ticks, and trades.
-  - **Hybrid History**: Automatically serves chart data from Tickers (Quotes) if Trades (Tape) are missing, ensuring high availability.
-  - **Bot Executions**: Dedicated `bot_executions` table for precise fill tracking separate from public data.
+  - **Standardized Configuration**: All persistence components now use a unified environment variable naming convention (`DATABASE_HOST`, etc.).
+  - **Hybrid History**: Automatically serves chart data from Tickers (Quotes) if Trades (Tape) are missing.
 
 ### 6. **Multi-Exchange Architecture** (NEW)
 
@@ -119,10 +120,10 @@ If `strategy_params` is omitted, the venue uses the global `strategy.params`.
 #### Exchange Adapters
 | Adapter | Features |
 |---------|----------|
-| **ThalexAdapter** | COD, Token Bucket rate limiting, batch orders |
-| **BybitAdapter** | Time sync, dynamic tick_size fetch, REST+WS |
-| **BinanceAdapter** | Futures API, listenKey auth |
-| **HyperliquidAdapter** | EIP-712 signing, L1 order book |
+| **ThalexAdapter** | COD, Shared Token Bucket, batch orders |
+| **BybitAdapter** | Time sync, shared infrastructure, REST+WS |
+| **BinanceAdapter** | Futures API, standardized initialization |
+| **HyperliquidAdapter** | EIP-712 signing, L1 order book, modular cleanup |
 
 #### Data Flow (Multi-Venue)
 ```

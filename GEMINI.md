@@ -29,6 +29,7 @@
 - [x] Initial FastAPI boilerplate implementation.
 - [x] Portfolio data persistence & API integration.
 - [x] API Rate Limiting (Token Bucket + Cancel On Disconnect).
+- [x] Technical Debt Refactoring (Standardized Env Vars + Shared Utils).
 - [/] Scaling simulation engine for high-resolution data.
 
 ### Scaling & Data Strategy
@@ -44,10 +45,10 @@ To support 1-minute resolution simulations:
 Used for high-resolution (1m) market data storage and historical backfills.
 - **Connection**: Managed via `asyncpg`.
 - **Environment Variables**:
-  - `DATABASE_HOST`
-  - `DATABASE_PORT`
-  - `DATABASE_USER`
-  - `DATABASE_PASSWORD`
+  - `DATABASE_HOST` (e.g., localhost)
+  - `DATABASE_PORT` (e.g., 5432)
+  - `DATABASE_USER` (e.g., postgres)
+  - `DATABASE_PASSWORD` (e.g., password)
   - `DATABASE_NAME` (default: `thalex_trading`)
 - **Core Tables (Hypertables)**:
   - `market_tickers`: `time`, `symbol`, `bid`, `ask`, `last`, `volume`
@@ -60,19 +61,22 @@ The system leverages TimescaleDB as a "Single Source of Truth":
 
 ## V. Critical Technical Knowledge & Lessons Learned
 
-### API & Modular Architecture
-- **Environment Loading**: In a modular FastAPI project, `load_dotenv()` MUST be called in the entry point (`src/api/main.py`) BEFORE importing any dependencies that utilize environment variables.
-- **Relative Imports**: Ensure consistent relative import depth in `dependencies.py` (e.g., `..adapters` vs `.repositories`) to avoid `ImportError` when running as a module.
+### Curated Bugs & Architectural Pitfalls
+- **Import Shadowing & NameErrors**: Never assume a service or entity is available in a modular file without explicit import.
+  - *Case Study (Bybit)*: Missing `InstrumentService` import led to `NameError` during live trading startup.
+  - *Case Study (Thalex)*: Truncated import blocks during refactoring caused immediate `SyntaxError`.
+- **Environment Variable Divergence**: Standardize env var names system-wide early.
+  - *Fix*: Migrated all components (`src/api`, `data_ingestion`, `main.py`) to `DATABASE_HOST`, `DATABASE_PORT` etc., eliminating connection failures in dashboard and ingestion pipelines.
+- **Instrument Mapping Resolution**: Historical data loaders must match the precise string format of the exchange.
+  - *Thalex Tip*: Dates must be uppercase (e.g., `28MAR24`) for historical mark price lookups.
+- **Redundant Logic Drift**: Periodically audit for overlapping components.
+  - *Refactor*: Removed `RegimeDetector` in favor of `MultiWindowRegimeAnalyzer` to prevent conflicting market signals.
 
-### Thalex API Rate Limiting
-- **Message Rates**: Matching engine limit is 10/s by default, boosted to **50/s** if `private/set_cancel_on_disconnect` is enabled.
-- **Implementation**: Use a **Token Bucket** algorithm targeting 90% (45/s for ME, 900/s for cancels) to avoid hard lockouts.
-- **COD Safety**: Enabling `set_cancel_on_disconnect` ensures all orders are cleared if the bot loses connection, providing a critical safety net for high-frequency quoting.
-
-### System Operations
-- **Background Execution**: Use `screen` for production deployments to keep sessions active without an open terminal.
-  - Trading Bot: `screen -S thalex-bot`
-  - API: `screen -S thalex-api`
+### Memory & Learning Log
+- **Token Bucket algorithm**: Centralized in `base_adapter.py` to ensure consistent rate-limiting across all venues without repeating logic.
+- **Port Consistency**: Standardized on port `5432` for TimescaleDB across all services, removing the legacy `5433` fallback which caused confusion between local and containerized setups.
+- **FastAPI Dependency Injection**: Always call `load_dotenv()` in `main.py` before any repository initializations to ensure DB parameters are hydrated.
+- **Screen Session Strategy**: Use `screen -S <name>` for long-running bot instances to ensure persistence through SSH disconnects.
 
 ---
 *This document is a living record of project directives and should be updated as the roadmap evolves.*
