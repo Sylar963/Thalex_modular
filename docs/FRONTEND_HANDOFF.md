@@ -65,6 +65,23 @@ This document outlines the frontend features needed for the Thalex Modular Tradi
 
 ---
 
+### 6. High-Fidelity Alpha Simulation
+**Purpose**: Run backtests with exchange-specific data and measure alpha decay.
+
+**Requirements**:
+- **Simulation Launcher**: UI to select `symbol`, `venue` (Thalex, Bybit, etc.), and `date range`.
+- **Alpha Dashboard**: Visualize the following metrics from the simulation result:
+  - **Edge**: Profit vs mid-price at fill time.
+  - **Adverse Selection**: 5s, 30s, and 60s Mark-to-Market decay.
+- **Equity/Fill Charts**: Plot the `equity_curve` and mark `fills` on the price chart.
+
+**API Endpoints**:
+- `POST /api/v1/simulation/start`: Start a new backtest (include `venue`).
+- `GET /api/v1/simulation/{run_id}/stats`: Fetch alpha metrics.
+- `GET /api/v1/simulation/{run_id}/fills`: Fetch fill details for charting.
+
+---
+
 ## Available API Endpoints
 
 | Endpoint | Method | Description |
@@ -73,7 +90,7 @@ This document outlines the frontend features needed for the Thalex Modular Tradi
 | `/api/v1/portfolio/summary` | GET | Account summary |
 | `/api/v1/market/history` | GET | OHLCV candles for charting |
 | `/api/v1/market/ticker` | GET | Current ticker data |
-| `/api/v1/simulation/results` | GET | Backtest results |
+| `/api/v1/simulation/runs` | GET | List of backtest runs |
 | `/api/v1/signals/history` | GET | Historical signal data |
 
 ---

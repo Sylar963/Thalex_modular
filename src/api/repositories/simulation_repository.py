@@ -25,16 +25,28 @@ class SimulationRepository(BaseRepository):
         ]
 
     async def start_simulation(self, params: Dict) -> Dict:
+        from ...adapters.storage.bybit_history_adapter import BybitHistoryAdapter
+
         strategy = AvellanedaStoikovStrategy()
         strategy.setup(params.get("strategy_config", {}))
 
         risk = BasicRiskManager()
         risk.setup(params.get("risk_config", {}))
 
-        engine = SimulationEngine(strategy, risk, self.storage)
+        # Initialize modular components
+        # Note: We assume self.storage is the TimescaleDBAdapter instance
+        history_provider = BybitHistoryAdapter(self.storage)
+
+        engine = SimulationEngine(
+            strategy=strategy,
+            risk_manager=risk,
+            data_provider=history_provider,
+            history_db=self.storage,
+        )
 
         result = await engine.run_simulation(
             symbol=params.get("symbol", "BTC-PERPETUAL"),
+            venue=params.get("venue", "bybit"),
             start_time=float(params["start_date"]),
             end_time=float(params["end_date"]),
         )

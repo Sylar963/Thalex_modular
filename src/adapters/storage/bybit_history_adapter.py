@@ -2,7 +2,7 @@ import asyncio
 import aiohttp
 import logging
 import time
-from typing import AsyncGenerator, List, Dict, Any
+from typing import AsyncGenerator, List, Dict, Any, Optional
 from datetime import datetime
 
 from ...domain.history_provider import IHistoryProvider
@@ -27,7 +27,7 @@ class BybitHistoryAdapter(IHistoryProvider):
         return self.session
 
     async def get_tickers(self, config: HistoryConfig) -> AsyncGenerator[Ticker, None]:
-        rows = await self.db.get_recent_tickers(config.symbol, limit=1000)
+        rows = await self.db.get_recent_tickers(config.symbol, limit=2000)
         for r in sorted(rows, key=lambda x: x.timestamp):
             if config.start_time <= r.timestamp <= config.end_time:
                 yield r
@@ -58,42 +58,50 @@ class BybitHistoryAdapter(IHistoryProvider):
         session = await self._get_session()
         url = f"{self.BASE_URL}/v5/market/kline"
 
-        start_ms = int(config.start_time * 1000)
+        current_start = int(config.start_time * 1000)
         end_ms = int(config.end_time * 1000)
+        total_count = 0
 
-        params = {
-            "category": self.CATEGORY,
-            "symbol": config.symbol,
-            "interval": "1",
-            "start": start_ms,
-            "end": end_ms,
-            "limit": 1000,
-        }
+        while current_start < end_ms:
+            params = {
+                "category": self.CATEGORY,
+                "symbol": config.symbol,
+                "interval": "1",
+                "start": current_start,
+                "end": end_ms,
+                "limit": 1000,
+            }
 
-        count = 0
-        async with session.get(url, params=params) as resp:
-            data = await resp.json()
-            if data.get("retCode") == 0:
-                list_data = data.get("result", {}).get("list", [])
-                for item in list_data:
-                    ts = float(item[0]) / 1000.0
-                    ticker = Ticker(
-                        symbol=config.symbol,
-                        bid=float(item[2]),
-                        ask=float(item[3]),
-                        bid_size=0.0,
-                        ask_size=0.0,
-                        last=float(item[4]),
-                        volume=float(item[5]),
-                        timestamp=ts,
-                        exchange="bybit",
-                    )
-                    await self.db.save_ticker(ticker)
-                    count += 1
-            else:
-                logger.error(f"Bybit fetch error: {data}")
+            async with session.get(url, params=params) as resp:
+                data = await resp.json()
+                if data.get("retCode") == 0:
+                    list_data = data.get("result", {}).get("list", [])
+                    if not list_data:
+                        break
 
-        return count
+                    for item in list_data:
+                        ts = float(item[0]) / 1000.0
+                        ticker = Ticker(
+                            symbol=config.symbol,
+                            bid=float(item[2]),
+                            ask=float(item[3]),
+                            bid_size=0.0,
+                            ask_size=0.0,
+                            last=float(item[4]),
+                            volume=float(item[5]),
+                            timestamp=ts,
+                            exchange="bybit",
+                        )
+                        await self.db.save_ticker(ticker)
+                        total_count += 1
+
+                    last_ts = int(list_data[-1][0])
+                    current_start = last_ts + 60000
+                else:
+                    logger.error(f"Bybit fetch error: {data}")
+                    break
+
+        return total_count
 
     async def close(self):
         if self.session:

@@ -12,6 +12,7 @@ router = APIRouter()
 
 class SimulationConfig(BaseModel):
     symbol: str = "BTC-PERPETUAL"
+    venue: str = "bybit"
     start_date: float
     end_date: float
     strategy_config: Dict = {}
