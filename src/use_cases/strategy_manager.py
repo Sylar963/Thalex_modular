@@ -169,11 +169,18 @@ class MultiExchangeStrategyManager:
 
     def _make_trade_callback(self, exchange: str) -> Callable:
         async def callback(trade: Trade):
+            # Ensure trade has correct exchange context
+            trade = replace(trade, exchange=exchange)
+
             if self.signal_engine:
                 self.signal_engine.update_trade(trade)
+
             logger.debug(
                 f"[{exchange}] Trade: {trade.side.value} {trade.size} @ {trade.price}"
             )
+
+            if self.storage and not self.dry_run:
+                asyncio.create_task(self.storage.save_trade(trade))
 
         return callback
 

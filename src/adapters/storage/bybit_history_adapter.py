@@ -9,6 +9,7 @@ from ...domain.history_provider import IHistoryProvider
 from ...domain.entities.history import HistoryConfig
 from ...domain.entities import Ticker, Trade, OrderSide
 from .timescale_adapter import TimescaleDBAdapter
+from ...services.instrument_service import InstrumentService
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,9 @@ class BybitHistoryAdapter(IHistoryProvider):
         session = await self._get_session()
         url = f"{self.BASE_URL}/v5/market/kline"
 
+        # Map symbol using centralized service
+        mapped_symbol = InstrumentService.get_exchange_symbol(config.symbol, "bybit")
+
         current_start = int(config.start_time * 1000)
         end_ms = int(config.end_time * 1000)
         total_count = 0
@@ -65,7 +69,7 @@ class BybitHistoryAdapter(IHistoryProvider):
         while current_start < end_ms:
             params = {
                 "category": self.CATEGORY,
-                "symbol": config.symbol,
+                "symbol": mapped_symbol,
                 "interval": "1",
                 "start": current_start,
                 "end": end_ms,

@@ -15,6 +15,7 @@ except ImportError:
     )
 
 from .base_adapter import BaseExchangeAdapter
+from ...services.instrument_service import InstrumentService
 from ...domain.entities import (
     Order,
     OrderSide,
@@ -195,8 +196,9 @@ class BinanceAdapter(BaseExchangeAdapter):
                     await self.position_callback(symbol, amount, entry_price)
 
     async def place_order(self, order: Order) -> Order:
+        mapped_symbol = InstrumentService.get_exchange_symbol(order.symbol, self.name)
         params = {
-            "symbol": order.symbol,
+            "symbol": mapped_symbol,
             "side": "BUY" if order.side == OrderSide.BUY else "SELL",
             "type": "LIMIT" if order.type == OrderType.LIMIT else "MARKET",
             "quantity": order.size,
@@ -229,8 +231,9 @@ class BinanceAdapter(BaseExchangeAdapter):
         if not order:
             return False
 
+        mapped_symbol = InstrumentService.get_exchange_symbol(order.symbol, self.name)
         params = {
-            "symbol": order.symbol,
+            "symbol": mapped_symbol,
             "orderId": int(order_id),
             "timestamp": self._get_timestamp(),
         }
@@ -259,7 +262,8 @@ class BinanceAdapter(BaseExchangeAdapter):
         return results
 
     async def subscribe_ticker(self, symbol: str):
-        stream = f"{symbol.lower()}@bookTicker"
+        mapped_symbol = InstrumentService.get_exchange_symbol(symbol, self.name)
+        stream = f"{mapped_symbol.lower()}@bookTicker"
         ws_url = f"{self.ws_base_url}/ws/{stream}"
         asyncio.create_task(self._ticker_stream(ws_url, symbol))
 

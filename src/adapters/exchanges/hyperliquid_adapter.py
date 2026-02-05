@@ -14,6 +14,7 @@ except ImportError:
     )
 
 from .base_adapter import BaseExchangeAdapter
+from ...services.instrument_service import InstrumentService
 from ...domain.entities import (
     Order,
     OrderSide,
@@ -218,7 +219,8 @@ class HyperliquidAdapter(BaseExchangeAdapter):
         return signed.signature.hex()
 
     async def place_order(self, order: Order) -> Order:
-        asset_index = self._get_asset_index(order.symbol)
+        mapped_symbol = InstrumentService.get_exchange_symbol(order.symbol, self.name)
+        asset_index = self._get_asset_index(mapped_symbol)
         nonce = self._get_timestamp()
 
         action = {
@@ -273,7 +275,8 @@ class HyperliquidAdapter(BaseExchangeAdapter):
         if not order:
             return False
 
-        asset_index = self._get_asset_index(order.symbol)
+        mapped_symbol = InstrumentService.get_exchange_symbol(order.symbol, self.name)
+        asset_index = self._get_asset_index(mapped_symbol)
         nonce = self._get_timestamp()
 
         action = {
@@ -313,9 +316,10 @@ class HyperliquidAdapter(BaseExchangeAdapter):
         asyncio.create_task(self._ticker_stream(symbol))
 
     async def _ticker_stream(self, symbol: str):
+        mapped_symbol = InstrumentService.get_exchange_symbol(symbol, self.name)
         sub_msg = {
             "method": "subscribe",
-            "subscription": {"type": "l2Book", "coin": symbol},
+            "subscription": {"type": "l2Book", "coin": mapped_symbol},
         }
         await self.ws.send_json(sub_msg)
 
