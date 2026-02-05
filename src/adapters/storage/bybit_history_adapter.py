@@ -81,13 +81,16 @@ class BybitHistoryAdapter(IHistoryProvider):
 
                     for item in list_data:
                         ts = float(item[0]) / 1000.0
+                        last_price = float(item[4])
+                        # Heuristic: slight spread around last price since we don't have BBO history in klines
+                        # item[2] is High, item[3] is Low - DO NOT use for bid/ask
                         ticker = Ticker(
                             symbol=config.symbol,
-                            bid=float(item[2]),
-                            ask=float(item[3]),
+                            bid=last_price * 0.9999,
+                            ask=last_price * 1.0001,
                             bid_size=0.0,
                             ask_size=0.0,
-                            last=float(item[4]),
+                            last=last_price,
                             volume=float(item[5]),
                             timestamp=ts,
                             exchange="bybit",

@@ -5,6 +5,7 @@ from ...use_cases.sim_state_manager import sim_state_manager
 from ...domain.strategies.avellaneda import AvellanedaStoikovStrategy
 from ...domain.risk.basic_manager import BasicRiskManager
 from ...domain.entities.pnl import EquitySnapshot
+from dataclasses import asdict
 
 
 class SimulationRepository(BaseRepository):
@@ -57,14 +58,14 @@ class SimulationRepository(BaseRepository):
         return {
             "run_id": result.run_id,
             "status": "completed",
-            "stats": result.stats.__dict__ if result.stats else {},
+            "stats": asdict(result.stats) if result.stats else {},
         }
 
     async def get_equity_curve(self, run_id: str) -> List[Dict]:
         result = self.runs.get(run_id)
         if not result:
             return []
-        return [snapshot.__dict__ for snapshot in result.equity_curve]
+        return [asdict(snapshot) for snapshot in result.equity_curve]
 
     async def get_fills(self, run_id: str) -> List[Dict]:
         result = self.runs.get(run_id)
@@ -88,7 +89,7 @@ class SimulationRepository(BaseRepository):
         result = self.runs.get(run_id)
         if not result or not result.stats:
             return {}
-        return result.stats.__dict__
+        return asdict(result.stats)
 
     def get_live_status(self) -> Dict:
         return sim_state_manager.get_status()
