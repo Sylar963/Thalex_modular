@@ -10,11 +10,11 @@ import numpy as np
 from typing import List, Dict, Tuple, Optional
 
 # Configuration
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_NAME = os.getenv("DB_NAME", "thalex_trading")
-DB_USER = os.getenv("DB_USER", "postgres")
-DB_PASS = os.getenv("DB_PASS", "password")
-DB_PORT = os.getenv("DB_PORT", "5433")
+DB_HOST = os.getenv("DATABASE_HOST", "localhost")
+DB_NAME = os.getenv("DATABASE_NAME", "thalex_trading")
+DB_USER = os.getenv("DATABASE_USER", "postgres")
+DB_PASS = os.getenv("DATABASE_PASSWORD", "password")
+DB_PORT = os.getenv("DATABASE_PORT", "5432")
 
 THALEX_API_URL = "https://thalex.com/api/v2"  # Verify base URL
 

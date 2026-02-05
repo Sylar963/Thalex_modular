@@ -45,7 +45,6 @@ class BinanceAdapter(BaseExchangeAdapter):
         self.listen_key: Optional[str] = None
 
         self.positions: Dict[str, Position] = {}
-        self.positions: Dict[str, Position] = {}
         self.orders: Dict[str, Order] = {}
         self.balance_callback: Optional[Callable] = None
 

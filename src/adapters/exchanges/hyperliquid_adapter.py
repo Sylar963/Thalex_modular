@@ -51,7 +51,6 @@ class HyperliquidAdapter(BaseExchangeAdapter):
         self.meta: Dict = {}
 
         self._msg_loop_task: Optional[asyncio.Task] = None
-        self._msg_loop_task: Optional[asyncio.Task] = None
         self._balance_task: Optional[asyncio.Task] = None
         self._time_offset_ms: int = 0
         self.balance_callback: Optional[Callable] = None

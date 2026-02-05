@@ -55,8 +55,6 @@ class BybitAdapter(BaseExchangeAdapter):
 
         self._msg_loop_task: Optional[asyncio.Task] = None
         self._ping_task: Optional[asyncio.Task] = None
-        self._msg_loop_task: Optional[asyncio.Task] = None
-        self._ping_task: Optional[asyncio.Task] = None
         self._time_offset_ms: int = 0
         self.balance_callback: Optional[Callable] = None
 
