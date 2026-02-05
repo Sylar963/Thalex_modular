@@ -130,11 +130,31 @@ class RiskManager(ABC):
         pass
 
     @abstractmethod
+    def update_position(self, position: Position) -> None:
+        """Update internal position state for risk tracking."""
+        pass
+
+    @abstractmethod
     def check_position_limits(self, position) -> bool:
         pass
 
     @abstractmethod
     def can_trade(self) -> bool:
+        pass
+
+    @abstractmethod
+    def has_breached(self) -> bool:
+        """Check if a risk limit has been breached."""
+        pass
+
+    @abstractmethod
+    def get_risk_state(self) -> Dict[str, Any]:
+        """Return the current state of risk management."""
+        pass
+
+    @abstractmethod
+    def reset_breach(self) -> None:
+        """Manually reset the risk breach status."""
         pass
 
 

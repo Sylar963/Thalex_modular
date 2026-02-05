@@ -345,11 +345,26 @@ class BybitAdapter(BaseExchangeAdapter):
             url, data=payload_str, headers=self._get_headers(payload_str)
         ) as resp:
             data = await resp.json()
-            if data.get("retCode") == 0:
+            ret_code = data.get("retCode")
+            if ret_code == 0:
                 self.orders[order_id] = replace(
                     self.orders[order_id], status=OrderStatus.CANCELLED
                 )
                 return True
+
+            if ret_code == 110001:
+                logger.warning(
+                    f"Bybit order {order_id} not found or too late to cancel. Treating as cancelled."
+                )
+                self.orders[order_id] = replace(
+                    self.orders[order_id], status=OrderStatus.CANCELLED
+                )
+                if self.order_callback:
+                    await self.order_callback(
+                        order_id, OrderStatus.CANCELLED, order.filled_size, 0.0
+                    )
+                return True
+
             logger.error(f"Bybit cancel error: {data}")
             return False
 

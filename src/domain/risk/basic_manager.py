@@ -12,6 +12,8 @@ class BasicRiskManager(RiskManager):
         self.max_order_size = max_order_size
         self.enabled = True
         self.venue_limits: Dict[str, float] = {}
+        self._breached = False
+        self._positions: Dict[str, Position] = {}
 
     def setup(self, config: Dict[str, Any]):
         self.max_position = config.get("max_position", 10.0)
@@ -68,9 +70,17 @@ class BasicRiskManager(RiskManager):
                 f"Order REJECTED: Projected {projected_total:.4f} exceeds limit {max_limit}. "
                 f"(Curr: {current_exposure} + Active: {active_exposure_change} + New: {new_impact})"
             )
+            self._breached = True
             return False
 
         return True
+
+    def update_position(self, position: Position) -> None:
+        self._positions[position.exchange] = position
+        if abs(position.size) > self.venue_limits.get(
+            position.exchange, self.max_position
+        ):
+            self._breached = True
 
     def _get_limit_for_order(self, order: Order) -> float:
         exchange = getattr(order, "exchange", "")
@@ -96,4 +106,21 @@ class BasicRiskManager(RiskManager):
         return abs(position.size) <= self.max_position
 
     def can_trade(self) -> bool:
-        return self.enabled
+        return self.enabled and not self._breached
+
+    def has_breached(self) -> bool:
+        return self._breached
+
+    def get_risk_state(self) -> Dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "breached": self._breached,
+            "max_position": self.max_position,
+            "max_order_size": self.max_order_size,
+            "venue_limits": self.venue_limits,
+            "positions": {k: p.size for k, p in self._positions.items()},
+        }
+
+    def reset_breach(self) -> None:
+        self._breached = False
+        logger.info("Risk breach status reset manually.")
