@@ -3,7 +3,7 @@ import logging
 import time
 import hmac
 import hashlib
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Callable
 from dataclasses import replace
 
 try:
@@ -14,6 +14,7 @@ except ImportError:
     )
 
 from .base_adapter import BaseExchangeAdapter
+from ...services.instrument_service import InstrumentService
 from ...domain.entities import (
     Order,
     OrderSide,
@@ -21,7 +22,6 @@ from ...domain.entities import (
     OrderStatus,
     Position,
     Ticker,
-    Trade,
 )
 
 logger = logging.getLogger(__name__)

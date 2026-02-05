@@ -71,11 +71,20 @@ Thalex_modular/
 
 ## 🏃 Running the System
 
+Always ensure your virtual environment is active before running commands:
+```bash
+source venv/bin/activate
+```
+
 ### 1. Multi-Exchange Trading Bot
 To run live or shadow quoting on multiple venues concurrently:
 
 ```bash
-python src/main.py --multi-venue
+# Live Mode (Real orders)
+python src/main.py --multi-venue --mode live
+
+# Shadow Mode (Simulated fills - RECOMMENDED FOR TESTING)
+python src/main.py --multi-venue --mode shadow
 ```
 
 ### 2. High-Fidelity Simulation / Backtesting
@@ -84,6 +93,9 @@ Simulate alpha metrics on historical Bybit/Thalex data:
 ```bash
 # Handled via API/Dashboard or CLI test scripts
 python scripts/test_sim_endpoints.py
+
+# Validate .env configuration
+python scripts/validate_env.py
 ```
 
 ### 3. Start the Backend API
@@ -103,7 +115,7 @@ For long-running sessions, use `screen` to keep the bot and API active:
 ```bash
 screen -S thalex-bot
 source venv/bin/activate
-python src/main.py --multi-venue
+python src/main.py --multi-venue --mode live
 ```
 
 ### 2. API Session

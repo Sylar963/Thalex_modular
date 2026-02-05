@@ -61,10 +61,14 @@ async def get_tick_bars(
     symbol: str,
     tick_count: int = 2500,
     limit: int = 100,
-    exchange: str = "thalex",
+    venue: str = "thalex",
     repo: MarketRepository = Depends(get_market_repo),
 ):
-    return await repo.get_tick_bars(symbol, tick_count, limit, exchange)
+    """
+    Get aggregated tick bars (OHLCV) based on trade counts.
+    Supports any crypto exchange (venue) stored in the DB.
+    """
+    return await repo.get_tick_bars(symbol, tick_count, limit, exchange=venue)
 
 
 @router.get("/signals/history/{symbol}", response_model=List[Dict])
