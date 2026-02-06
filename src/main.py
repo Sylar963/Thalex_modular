@@ -208,99 +208,13 @@ async def main():
         )
         from src.domain.tracking.sync_engine import SyncEngine
 
-        venues_config = bot_config.get("venues", {})
-        exchange_configs = []
+        from src.infrastructure.config_factory import ConfigFactory
 
-        for venue_name, venue_cfg in venues_config.items():
-            if not venue_cfg.get("enabled", False):
-                continue
+        # Use shared factory to create exchange configurations
+        exchange_configs = ConfigFactory.create_exchange_configs(bot_config)
 
-            venue_testnet = venue_cfg.get("testnet", True)
-            venue_symbols = venue_cfg.get("symbols", [])
-            venue_tick_size = venue_cfg.get("tick_size", 0.5)
-
-            if venue_name == "thalex":
-                from src.adapters.exchanges.thalex_adapter import ThalexAdapter
-
-                thalex_key = (
-                    os.getenv("THALEX_TEST_API_KEY_ID")
-                    if venue_testnet
-                    else os.getenv("THALEX_PROD_API_KEY_ID")
-                )
-                thalex_secret = (
-                    os.getenv("THALEX_TEST_PRIVATE_KEY")
-                    if venue_testnet
-                    else os.getenv("THALEX_PROD_PRIVATE_KEY")
-                )
-                gw = ThalexAdapter(thalex_key, thalex_secret, testnet=venue_testnet)
-            elif venue_name == "bybit":
-                from src.adapters.exchanges.bybit_adapter import BybitAdapter
-
-                bybit_key = os.getenv("BYBIT_API_KEY")
-                bybit_secret = os.getenv("BYBIT_API_SECRET")
-                gw = BybitAdapter(bybit_key, bybit_secret, testnet=venue_testnet)
-            elif venue_name == "binance":
-                from src.adapters.exchanges.binance_adapter import BinanceAdapter
-
-                binance_key = os.getenv("BINANCE_API_KEY")
-                binance_secret = os.getenv("BINANCE_API_SECRET")
-                gw = BinanceAdapter(binance_key, binance_secret, testnet=venue_testnet)
-            elif venue_name == "hyperliquid":
-                from src.adapters.exchanges.hyperliquid_adapter import (
-                    HyperliquidAdapter,
-                )
-
-                hl_key = os.getenv("HYPERLIQUID_PRIVATE_KEY")
-                gw = HyperliquidAdapter(hl_key, testnet=venue_testnet)
-            else:
-                logger.warning(f"Unknown venue: {venue_name}")
-                continue
-
-            for sym in venue_symbols:
-                venue_strategy = None
-                venue_strategy_params = venue_cfg.get("strategy_params")
-                if venue_strategy_params:
-                    venue_strategy = AvellanedaStoikovStrategy()
-                    merged_params = {
-                        "gamma": venue_strategy_params.get(
-                            "gamma", strategy_params.get("gamma", 0.5)
-                        ),
-                        "volatility": venue_strategy_params.get(
-                            "volatility", strategy_params.get("volatility", 0.05)
-                        ),
-                        "position_limit": venue_strategy_params.get(
-                            "position_limit",
-                            strategy_params.get("position_limit", 0.01),
-                        ),
-                        "min_spread": venue_strategy_params.get(
-                            "min_spread", strategy_params.get("min_spread", 20)
-                        ),
-                        "quote_levels": venue_strategy_params.get(
-                            "quote_levels", strategy_params.get("quote_levels", 3)
-                        ),
-                        "level_spacing_factor": venue_strategy_params.get(
-                            "level_spacing_factor",
-                            strategy_params.get("level_spacing_factor", 0.5),
-                        ),
-                        "order_size": venue_strategy_params.get(
-                            "order_size", strategy_params.get("order_size", 0.001)
-                        ),
-                    }
-                    venue_strategy.setup(merged_params)
-                    logger.info(
-                        f"Created venue-specific strategy for {venue_name}/{sym}"
-                    )
-
-                exchange_configs.append(
-                    ExchangeConfig(
-                        gateway=gw,
-                        symbol=sym,
-                        enabled=True,
-                        tick_size=venue_tick_size,
-                        strategy=venue_strategy,
-                    )
-                )
-                logger.info(f"Configured {venue_name} for {sym}")
+        for cfg in exchange_configs:
+            logger.info(f"Configured {cfg.gateway.name} for {cfg.symbol}")
 
         sync_engine = SyncEngine()
         multi_service = MultiExchangeStrategyManager(

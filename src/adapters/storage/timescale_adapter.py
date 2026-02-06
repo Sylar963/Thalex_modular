@@ -184,6 +184,15 @@ class TimescaleDBAdapter(StorageGateway):
                 except Exception as e:
                     logger.warning(f"Migration for bot_executions UNIQUE: {e}")
 
+                # MIGRATION: Market Trades Unique Constraint (required for ON CONFLICT in save_trade)
+                try:
+                    await conn.execute("""
+                        CREATE UNIQUE INDEX IF NOT EXISTS market_trades_time_exchange_trade_id_idx 
+                        ON market_trades (time, exchange, trade_id);
+                    """)
+                except Exception as e:
+                    logger.warning(f"Migration for market_trades UNIQUE: {e}")
+
                 await conn.execute("""
                     CREATE TABLE IF NOT EXISTS market_signals (
                         time TIMESTAMPTZ NOT NULL,
@@ -370,7 +379,7 @@ class TimescaleDBAdapter(StorageGateway):
                     """
                     INSERT INTO market_trades (time, symbol, exchange, price, size, side, trade_id)
                     VALUES (to_timestamp($1), $2, $3, $4, $5, $6, $7)
-                    ON CONFLICT (trade_id, exchange) DO NOTHING
+                    ON CONFLICT (time, exchange, trade_id) DO NOTHING
                     """,
                     trade.timestamp,
                     trade.symbol,
