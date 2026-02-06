@@ -79,6 +79,18 @@ class ThalexAdapter(ExchangeGateway):
             capacity=int(cancel_rate_limit * 1.1), fill_rate=cancel_rate_limit
         )
 
+    def _safe_float(self, value, default: float = 0.0) -> float:
+        if value is None:
+            return default
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                return default
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            return default
+
     @property
     def name(self) -> str:
         return "thalex"
@@ -200,7 +212,7 @@ class ThalexAdapter(ExchangeGateway):
             if "result" in response:
                 res = response["result"]
                 # Assuming 'tick_size' exists in the instrument result
-                self.tick_size = float(res.get("tick_size", 0.5))
+                self.tick_size = self._safe_float(res.get("tick_size", 0.5))
                 logger.info(f"Fetched tick size for {symbol}: {self.tick_size}")
         except Exception as e:
             logger.error(f"Failed to fetch instrument details: {e}")
@@ -215,9 +227,9 @@ class ThalexAdapter(ExchangeGateway):
                 response = await self._rpc_request(self.client.get_account_summary)
                 if "result" in response:
                     res = response["result"]
-                    total = float(res.get("equity", 0.0))
-                    available = float(res.get("available_funds", 0.0))
-                    margin_used = float(res.get("margin_used", 0.0))
+                    total = self._safe_float(res.get("equity", 0.0))
+                    available = self._safe_float(res.get("available_funds", 0.0))
+                    margin_used = self._safe_float(res.get("margin_used", 0.0))
 
                     bal = Balance(
                         exchange=self.name,
@@ -563,7 +575,9 @@ class ThalexAdapter(ExchangeGateway):
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Error in msg loop: {e}")
+                import traceback
+
+                logger.error(f"Error in msg loop: {e}\n{traceback.format_exc()}")
                 if self.connected:
                     await self._attempt_reconnect()
                 await asyncio.sleep(1)
@@ -667,8 +681,8 @@ class ThalexAdapter(ExchangeGateway):
                     elif status_str in ["rejected"]:
                         status = OrderStatus.REJECTED
 
-                    filled_size = float(o_data.get("amount_filled", 0.0))
-                    avg_price = float(o_data.get("average_price", 0.0))
+                    filled_size = self._safe_float(o_data.get("amount_filled", 0.0))
+                    avg_price = self._safe_float(o_data.get("average_price", 0.0))
 
                     if exchange_id in self.orders:
                         self.orders[exchange_id] = replace(
@@ -691,13 +705,15 @@ class ThalexAdapter(ExchangeGateway):
                 for p_data in positions_data:
                     symbol = p_data.get("instrument_name")
                     if symbol:
-                        amount = float(p_data.get("amount", 0.0))
-                        entry_price = float(p_data.get("average_price", 0.0))
-                        mark_price = float(p_data.get("mark_price", 0.0))
-                        unrealized_pnl = float(p_data.get("floating_profit_loss", 0.0))
-                        delta = float(p_data.get("delta", 0.0))
-                        gamma = float(p_data.get("gamma", 0.0))
-                        theta = float(p_data.get("theta", 0.0))
+                        amount = self._safe_float(p_data.get("amount", 0.0))
+                        entry_price = self._safe_float(p_data.get("average_price", 0.0))
+                        mark_price = self._safe_float(p_data.get("mark_price", 0.0))
+                        unrealized_pnl = self._safe_float(
+                            p_data.get("floating_profit_loss", 0.0)
+                        )
+                        delta = self._safe_float(p_data.get("delta", 0.0))
+                        gamma = self._safe_float(p_data.get("gamma", 0.0))
+                        theta = self._safe_float(p_data.get("theta", 0.0))
 
                         self.positions[symbol] = Position(
                             symbol=symbol,
@@ -723,9 +739,9 @@ class ThalexAdapter(ExchangeGateway):
                     # Map fields - adjusting based on assumed Thalex API response for account
                     # total_equity, available_funds, etc.
                     # Fallback if specific fields aren't found, log for debugging
-                    total = float(acc.get("equity", 0.0))
-                    available = float(acc.get("available_funds", 0.0))
-                    margin_used = float(acc.get("margin_used", 0.0))
+                    total = self._safe_float(acc.get("equity", 0.0))
+                    available = self._safe_float(acc.get("available_funds", 0.0))
+                    margin_used = self._safe_float(acc.get("margin_used", 0.0))
 
                     bal = Balance(
                         exchange=self.name,
@@ -778,23 +794,23 @@ class ThalexAdapter(ExchangeGateway):
                 logger.warning("No messages for 60s. Potential stale connection.")
 
     def _map_ticker(self, symbol: str, data: Dict) -> Ticker:
-        ts = float(data.get("timestamp", time.time()))
+        ts = self._safe_float(data.get("timestamp", time.time()))
         if ts > 1e11:
             ts /= 1000.0
 
         return Ticker(
             symbol=symbol,
-            bid=float(data.get("best_bid_price", 0)),
-            ask=float(data.get("best_ask_price", 0)),
-            bid_size=float(data.get("best_bid_amount", 0)),
-            ask_size=float(data.get("best_ask_amount", 0)),
-            last=float(data.get("last_price", 0)),
-            volume=float(data.get("volume_24h", 0)),
+            bid=self._safe_float(data.get("best_bid_price", 0)),
+            ask=self._safe_float(data.get("best_ask_price", 0)),
+            bid_size=self._safe_float(data.get("best_bid_amount", 0)),
+            ask_size=self._safe_float(data.get("best_ask_amount", 0)),
+            last=self._safe_float(data.get("last_price", 0)),
+            volume=self._safe_float(data.get("volume_24h", 0)),
             timestamp=ts,
         )
 
     def _map_trade(self, symbol: str, data: Dict) -> Trade:
-        ts = float(data.get("timestamp", time.time()))
+        ts = self._safe_float(data.get("timestamp", time.time()))
         if ts > 1e11:
             ts /= 1000.0
 
@@ -805,8 +821,8 @@ class ThalexAdapter(ExchangeGateway):
             side=OrderSide.BUY
             if data.get("direction", data.get("side")) == "buy"
             else OrderSide.SELL,
-            price=float(data.get("price", 0)),
-            size=float(data.get("amount", 0)),
+            price=self._safe_float(data.get("price", 0)),
+            size=self._safe_float(data.get("amount", 0)),
             timestamp=ts,
         )
 

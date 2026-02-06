@@ -178,6 +178,7 @@ class BybitHistoryAdapter(IHistoryProvider):
                         trades.append(
                             Trade(
                                 id=item.get("execId"),
+                                order_id="",  # Public trade, no order ID
                                 symbol=symbol,  # Use internal symbol
                                 price=float(item.get("price")),
                                 size=float(item.get("size")),

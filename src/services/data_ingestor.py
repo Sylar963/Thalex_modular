@@ -118,3 +118,9 @@ class DataIngestor:
 
     async def close(self):
         await self.bybit_adapter.close()
+        # history_adapter is a separate instance, must be closed too
+        if (
+            hasattr(self, "history_adapter")
+            and self.history_adapter != self.bybit_adapter
+        ):
+            await self.history_adapter.close()
