@@ -223,8 +223,8 @@ class ThalexAdapter(ExchangeGateway):
             # Since Thalex lib might not expose get_account_summary directly if not defined,
             # check availability. Assuming it exists or we can rely on msg stream updates.
             # But let's try calling it.
-            if hasattr(self.client, "get_account_summary"):
-                response = await self._rpc_request(self.client.get_account_summary)
+            if hasattr(self.client, "account_summary"):
+                response = await self._rpc_request(self.client.account_summary)
                 if "result" in response:
                     res = response["result"]
                     total = self._safe_float(res.get("equity", 0.0))

@@ -13,7 +13,7 @@ from ..adapters.storage.timescale_adapter import TimescaleDBAdapter
 # Singleton instance holder
 class GlobalState:
     db_adapter: Optional[TimescaleDBAdapter] = None
-    data_manager: Optional["DataStreamManager"] = None
+    market_feed: Optional["MarketFeedService"] = None
 
 
 _state = GlobalState()
@@ -49,44 +49,22 @@ async def init_dependencies():
         )
         raise e
 
-    # --- Data Engine Initialization ---
+    # --- Market Feed Service Initialization ---
     try:
-        from src.infrastructure.config_factory import ConfigFactory
-        from src.use_cases.data_stream_manager import DataStreamManager
+        from src.services.market_feed import MarketFeedService
 
-        # Load Config
-        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-        config_path = os.path.join(project_root, "config.json")
-        bot_config = ConfigFactory.load_config(config_path)
-
-        # Create Adapters in Monitor Mode (force enabled=True for data, strategy=None)
-        exchange_configs = ConfigFactory.create_exchange_configs(
-            bot_config, force_monitor_mode=True
-        )
-
-        if exchange_configs:
-            print(
-                f"Initializing Data Stream Manager for {len(exchange_configs)} venues..."
-            )
-            _state.data_manager = DataStreamManager(exchange_configs, _state.db_adapter)
-            # Start in background task? The lifespan handler in main.py awaits this.
-            # But await start() blocks until everything is connected. That's fine.
-            # However, DataStreamManager.start() currently just launches tasks and returns.
-            # Make sure it doesn't block forever.
-            await _state.data_manager.start()
-        else:
-            print("No valid exchange configurations found for Data Engine.")
+        _state.market_feed = MarketFeedService(db_dsn)
+        await _state.market_feed.start()
+        print("Market Feed Service started.")
 
     except Exception as e:
-        print(f"Failed to start Data Engine: {e}")
-        # We process without it if it fails, or should we crash?
-        # For now, print error but allow API to start (dashboard might just be empty)
+        print(f"Failed to start Market Feed Service: {e}")
 
 
 async def close_dependencies():
     """Cleanup global dependencies."""
-    if _state.data_manager:
-        await _state.data_manager.stop()
+    if _state.market_feed:
+        await _state.market_feed.stop()
     if _state.db_adapter:
         await _state.db_adapter.disconnect()
 

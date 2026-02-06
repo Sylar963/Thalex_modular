@@ -23,6 +23,7 @@ from ...domain.entities import (
     Position,
     Ticker,
     Balance,
+    Trade,
 )
 
 logger = logging.getLogger(__name__)
@@ -56,6 +57,8 @@ class BybitAdapter(BaseExchangeAdapter):
 
         self._msg_loop_task: Optional[asyncio.Task] = None
         self._ping_task: Optional[asyncio.Task] = None
+        self._public_loop_task: Optional[asyncio.Task] = None
+        self.ws_public: Optional[aiohttp.ClientWebSocketResponse] = None
         self._time_offset_ms: int = 0
         self.balance_callback: Optional[Callable] = None
 
@@ -435,40 +438,111 @@ class BybitAdapter(BaseExchangeAdapter):
         return [await self.cancel_order(oid) for oid in order_ids]
 
     async def subscribe_ticker(self, symbol: str):
-        asyncio.create_task(self._ticker_stream(symbol))
-
-    async def _ticker_stream(self, symbol: str):
+        """Subscribe to orderbook stream."""
+        await self._ensure_public_conn()
         mapped_symbol = InstrumentService.get_exchange_symbol(symbol, self.name)
-        async with self.session.ws_connect(self.ws_public_url) as ws:
-            sub_msg = {"op": "subscribe", "args": [f"orderbook.1.{mapped_symbol}"]}
-            await ws.send_json(sub_msg)
+        topic = f"orderbook.1.{mapped_symbol}"
+        if self.ws_public and not self.ws_public.closed:
+            await self.ws_public.send_json({"op": "subscribe", "args": [topic]})
+            logger.info(f"Subscribed to {topic}")
 
-            while self.connected:
-                try:
-                    msg = await asyncio.wait_for(ws.receive_json(), timeout=5.0)
-                    if msg.get("topic", "").startswith("orderbook"):
-                        # logger.info(msg) # Too spammy, maybe log first bid?
-                        data = msg.get("data", {})
-                        bids = data.get("b", [[0, 0]])
-                        asks = data.get("a", [[0, 0]])
-                        ticker = Ticker(
-                            symbol=symbol,
-                            bid=self._safe_float(bids[0][0]) if bids else 0.0,
-                            ask=self._safe_float(asks[0][0]) if asks else 0.0,
-                            bid_size=self._safe_float(bids[0][1]) if bids else 0.0,
-                            ask_size=self._safe_float(asks[0][1]) if asks else 0.0,
-                            last=0.0,
-                            volume=0.0,
-                            exchange=self.name,
-                            timestamp=time.time(),
-                        )
-                        if self.ticker_callback:
-                            await self.ticker_callback(ticker)
-                except asyncio.TimeoutError:
-                    continue
-                except Exception as e:
-                    logger.error(f"Bybit ticker stream error: {e}")
-                    break
+    async def subscribe_trades(self, symbol: str):
+        """Subscribe to public trade stream."""
+        await self._ensure_public_conn()
+        mapped_symbol = InstrumentService.get_exchange_symbol(symbol, self.name)
+        topic = f"publicTrade.{mapped_symbol}"
+        if self.ws_public and not self.ws_public.closed:
+            await self.ws_public.send_json({"op": "subscribe", "args": [topic]})
+            logger.info(f"Subscribed to {topic}")
+
+    async def _ensure_public_conn(self):
+        if self.ws_public is None or self.ws_public.closed:
+            if not self._public_loop_task or self._public_loop_task.done():
+                self._public_loop_task = asyncio.create_task(self._public_msg_loop())
+                # Wait for connection
+                for _ in range(10):
+                    if self.ws_public and not self.ws_public.closed:
+                        break
+                    await asyncio.sleep(0.5)
+
+    async def _public_msg_loop(self):
+        """Unified loop for public topics (Ticker, Trades)."""
+        while self.connected:
+            try:
+                # Reconnect logic
+                async with self.session.ws_connect(self.ws_public_url) as ws:
+                    self.ws_public = ws
+                    logger.info("Connected to Bybit Public WS")
+
+                    while not ws.closed and self.connected:
+                        try:
+                            msg = await asyncio.wait_for(ws.receive_json(), timeout=5.0)
+                            if not msg:
+                                continue
+                            topic = msg.get("topic", "")
+                            if topic.startswith("orderbook"):
+                                await self._handle_orderbook_msg(msg)
+                            elif topic.startswith("publicTrade"):
+                                await self._handle_public_trade_msg(msg)
+                        except asyncio.TimeoutError:
+                            # Send Ping
+                            await ws.send_json({"op": "ping"})
+                            continue
+
+            except Exception as e:
+                logger.error(f"Bybit Public WS Error: {e}")
+                await asyncio.sleep(2.0)
+            finally:
+                self.ws_public = None
+
+    async def _handle_orderbook_msg(self, msg: Dict):
+        symbol = msg.get("topic", "").split(".")[-1]  # orderbook.1.BTCUSDT
+        # We need to map back to our symbol if needed, or just pipe it thru
+        # Ideally we map back. But for now let's use the symbol from topic if plausible.
+
+        data = msg.get("data", {})
+        bids = data.get("b", [])
+        asks = data.get("a", [])
+
+        # safely handle empty lists
+        best_bid = bids[0] if bids else [0, 0]
+        best_ask = asks[0] if asks else [0, 0]
+
+        ticker = Ticker(
+            symbol=symbol,
+            bid=self._safe_float(best_bid[0]),
+            ask=self._safe_float(best_ask[0]),
+            bid_size=self._safe_float(best_bid[1]),
+            ask_size=self._safe_float(best_ask[1]),
+            last=0.0,
+            volume=0.0,
+            exchange=self.name,
+            timestamp=time.time(),
+        )
+        if self.ticker_callback:
+            await self.ticker_callback(ticker)
+
+    async def _handle_public_trade_msg(self, msg: Dict):
+        # topic: publicTrade.BTCUSDT
+        data = msg.get("data", [])
+        # publicTrade data is a list of trades
+        for item in data:
+            # "T": 1672304486866, "s": "BTCUSDT", "S": "Buy", "v": "0.001", "p": "16578.50", ...
+            ts_ms = item.get("T")
+            timestamp = ts_ms / 1000.0 if ts_ms else time.time()
+
+            trade = Trade(
+                id=item.get("i", ""),
+                order_id="",  # Public trade has no order_id for us
+                symbol=item.get("s"),
+                side=OrderSide.BUY if item.get("S") == "Buy" else OrderSide.SELL,
+                price=self._safe_float(item.get("p")),
+                size=self._safe_float(item.get("v")),
+                exchange=self.name,
+                timestamp=timestamp,
+            )
+            if self.trade_callback:
+                asyncio.create_task(self.trade_callback(trade))
 
     async def get_position(self, symbol: str) -> Position:
         return self.positions.get(
