@@ -59,6 +59,14 @@ class BybitAdapter(BaseExchangeAdapter):
         self._time_offset_ms: int = 0
         self.balance_callback: Optional[Callable] = None
 
+    def _safe_float(self, value, default: float = 0.0) -> float:
+        if value is None or value == "":
+            return default
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            return default
+
     @property
     def name(self) -> str:
         return "bybit"
@@ -164,11 +172,11 @@ class BybitAdapter(BaseExchangeAdapter):
 
             if items:
                 info = items[0]
-                self.tick_size = float(
-                    info.get("priceFilter", {}).get("tickSize", 0.01)
+                self.tick_size = self._safe_float(
+                    info.get("priceFilter", {}).get("tickSize"), 0.01
                 )
-                self.lot_size = float(
-                    info.get("lotSizeFilter", {}).get("minOrderQty", 0.001)
+                self.lot_size = self._safe_float(
+                    info.get("lotSizeFilter", {}).get("minOrderQty"), 0.001
                 )
                 logger.info(
                     f"Fetched {symbol} tick_size={self.tick_size}, lot_size={self.lot_size}"
@@ -202,9 +210,9 @@ class BybitAdapter(BaseExchangeAdapter):
                         coins = account_data.get("coin", [])
                         for c in coins:
                             coin_name = c.get("coin")
-                            wallet_bal = float(c.get("walletBalance", 0))
-                            available = float(c.get("availableToWithdraw", 0))
-                            equity = float(c.get("equity", 0))
+                            wallet_bal = self._safe_float(c.get("walletBalance"))
+                            available = self._safe_float(c.get("availableToWithdraw"))
+                            equity = self._safe_float(c.get("equity"))
 
                             bal = Balance(
                                 exchange=self.name,
@@ -290,8 +298,8 @@ class BybitAdapter(BaseExchangeAdapter):
             "PartiallyFilled": OrderStatus.PARTIALLY_FILLED,
         }
         status = status_map.get(data.get("orderStatus"), OrderStatus.PENDING)
-        filled_size = float(data.get("cumExecQty", 0))
-        avg_price = float(data.get("avgPrice", 0))
+        filled_size = self._safe_float(data.get("cumExecQty"))
+        avg_price = self._safe_float(data.get("avgPrice"))
 
         if exchange_id in self.orders:
             self.orders[exchange_id] = replace(
@@ -304,8 +312,8 @@ class BybitAdapter(BaseExchangeAdapter):
     async def _handle_position_update(self, data: Dict):
         symbol = data.get("symbol")
         if symbol:
-            amount = float(data.get("size", 0))
-            entry_price = float(data.get("entryPrice", 0))
+            amount = self._safe_float(data.get("size"))
+            entry_price = self._safe_float(data.get("entryPrice"))
             self.positions[symbol] = Position(
                 symbol, amount, entry_price, exchange=self.name
             )
@@ -317,9 +325,9 @@ class BybitAdapter(BaseExchangeAdapter):
         coins = data.get("coin", [])
         for coin_data in coins:
             coin = coin_data.get("coin", "USD")
-            equity = float(coin_data.get("equity", 0))
-            wallet_balance = float(coin_data.get("walletBalance", 0))
-            available = float(coin_data.get("availableToWithdraw", 0))
+            equity = self._safe_float(coin_data.get("equity"))
+            wallet_balance = self._safe_float(coin_data.get("walletBalance"))
+            available = self._safe_float(coin_data.get("availableToWithdraw"))
             # Bybit Unified Account: totalEquity, etc. might be in different fields
             # For standard account or UTA, 'equity' usually present.
             # margin used = equity - available (approx) or totalMargin
@@ -437,10 +445,10 @@ class BybitAdapter(BaseExchangeAdapter):
                         asks = data.get("a", [[0, 0]])
                         ticker = Ticker(
                             symbol=symbol,
-                            bid=float(bids[0][0]) if bids else 0.0,
-                            ask=float(asks[0][0]) if asks else 0.0,
-                            bid_size=float(bids[0][1]) if bids else 0.0,
-                            ask_size=float(asks[0][1]) if asks else 0.0,
+                            bid=self._safe_float(bids[0][0]) if bids else 0.0,
+                            ask=self._safe_float(asks[0][0]) if asks else 0.0,
+                            bid_size=self._safe_float(bids[0][1]) if bids else 0.0,
+                            ask_size=self._safe_float(asks[0][1]) if asks else 0.0,
                             last=0.0,
                             volume=0.0,
                             exchange=self.name,

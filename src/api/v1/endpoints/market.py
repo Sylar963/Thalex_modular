@@ -50,10 +50,11 @@ async def get_volume_bars(
     symbol: str,
     threshold: float = 0.1,
     limit: int = 100,
+    venue: str = "thalex",
     repo: MarketRepository = Depends(get_market_repo),
 ):
     """Get OHLCV candles aggregated by volume threshold (e.g., 0.1 BTC per candle)."""
-    return await repo.get_volume_bars(symbol, threshold, limit)
+    return await repo.get_volume_bars(symbol, threshold, limit, exchange=venue)
 
 
 @router.get("/chart/{symbol}/tick-bars", response_model=List[Dict])

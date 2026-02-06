@@ -370,6 +370,7 @@ class TimescaleDBAdapter(StorageGateway):
                     """
                     INSERT INTO market_trades (time, symbol, exchange, price, size, side, trade_id)
                     VALUES (to_timestamp($1), $2, $3, $4, $5, $6, $7)
+                    ON CONFLICT (trade_id, exchange) DO NOTHING
                     """,
                     trade.timestamp,
                     trade.symbol,
@@ -684,7 +685,11 @@ class TimescaleDBAdapter(StorageGateway):
             return []
 
     async def get_volume_bars(
-        self, symbol: str, volume_threshold: float = 0.1, limit: int = 100
+        self,
+        symbol: str,
+        volume_threshold: float = 0.1,
+        limit: int = 100,
+        exchange: str = "thalex",
     ) -> List[Dict]:
         if not self.pool:
             return []
@@ -700,7 +705,7 @@ class TimescaleDBAdapter(StorageGateway):
                             side,
                             SUM(size) OVER (ORDER BY time) as cumulative_volume
                         FROM market_trades
-                        WHERE symbol = $1
+                        WHERE symbol = $1 AND LOWER(exchange) = LOWER($4)
                         ORDER BY time DESC
                         LIMIT 50000
                     ),
@@ -729,6 +734,7 @@ class TimescaleDBAdapter(StorageGateway):
                     symbol,
                     volume_threshold,
                     limit,
+                    exchange,
                 )
                 return [
                     {
@@ -770,7 +776,7 @@ class TimescaleDBAdapter(StorageGateway):
                             side,
                             ROW_NUMBER() OVER (ORDER BY time) as row_num
                         FROM market_trades
-                        WHERE symbol = $1 AND exchange = $4
+                        WHERE symbol = $1 AND LOWER(exchange) = LOWER($4)
                         ORDER BY time DESC
                         LIMIT 250000
                     ),

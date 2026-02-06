@@ -48,12 +48,14 @@ class MarketRepository(BaseRepository):
         ]
 
     async def get_volume_bars(
-        self, symbol: str, volume_threshold: float, limit: int
+        self, symbol: str, volume_threshold: float, limit: int, exchange: str = "thalex"
     ) -> List[Dict]:
         if not self.storage:
             return []
         if hasattr(self.storage, "get_volume_bars"):
-            return await self.storage.get_volume_bars(symbol, volume_threshold, limit)
+            return await self.storage.get_volume_bars(
+                symbol, volume_threshold, limit, exchange
+            )
         return []
 
     async def get_tick_bars(

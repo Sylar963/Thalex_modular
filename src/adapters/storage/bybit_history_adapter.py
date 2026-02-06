@@ -151,6 +151,51 @@ class BybitHistoryAdapter(IHistoryProvider):
 
         return total_count
 
+    async def fetch_recent_trades(self, symbol: str, limit: int = 1000) -> List[Trade]:
+        """
+        Fetch recent public trades from Bybit.
+        Note: Bybit public API limits this to 1000 recent trades.
+        """
+        session = await self._get_session()
+        url = f"{self.BASE_URL}/v5/market/recent-trade"
+
+        # Map symbol
+        mapped_symbol = InstrumentService.get_exchange_symbol(symbol, "bybit")
+
+        params = {"category": self.CATEGORY, "symbol": mapped_symbol, "limit": limit}
+
+        trades = []
+        try:
+            async with session.get(url, params=params) as resp:
+                data = await resp.json()
+                if data.get("retCode") == 0:
+                    list_data = data.get("result", {}).get("list", [])
+
+                    for item in list_data:
+                        # item format: {'execId': '...', 'symbol': '...', 'price': '...', 'size': '...', 'side': 'Buy', 'time': '...', 'isBlockTrade': False}
+                        ts_ms = float(item.get("time", 0))
+
+                        trades.append(
+                            Trade(
+                                id=item.get("execId"),
+                                symbol=symbol,  # Use internal symbol
+                                price=float(item.get("price")),
+                                size=float(item.get("size")),
+                                side=OrderSide.BUY
+                                if item.get("side").lower() == "buy"
+                                else OrderSide.SELL,
+                                timestamp=ts_ms / 1000.0,
+                                exchange="bybit",
+                                fee=0.0,  # Public trades don't have fee info
+                            )
+                        )
+                else:
+                    logger.error(f"Bybit recent trades fetch error: {data}")
+        except Exception as e:
+            logger.error(f"Failed to fetch recent trades from Bybit: {e}")
+
+        return trades
+
     async def close(self):
         if self.session:
             await self.session.close()
