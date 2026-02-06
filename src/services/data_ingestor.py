@@ -16,8 +16,48 @@ class DataIngestor:
     def __init__(self, db_adapter: TimescaleDBAdapter):
         self.db = db_adapter
         self.bybit_adapter = BybitHistoryAdapter(db_adapter)
+        self.history_adapter = BybitHistoryAdapter(
+            db_adapter
+        )  # Renamed from bybit_adapter
 
-    async def sync_symbol(
+    async def sync_trades(self, symbol: str, limit: int = 1000):
+        """
+        Sync recent trades for a symbol to support Volume/Tick bars.
+        """
+        logger.info(f"Syncing recent trades for {symbol}...")
+
+        # 1. Fetch from Adapter
+        trades = []
+        if isinstance(self.history_adapter, BybitHistoryAdapter):
+            trades = await self.history_adapter.fetch_recent_trades(symbol, limit)
+
+        if not trades:
+            logger.info(f"No recent trades found for {symbol}")
+            return
+
+        logger.info(f"Fetched {len(trades)} trades. Saving to DB...")
+
+        # 2. Persist
+        saved_count = 0
+        for trade in trades:
+            await self.db.save_trade(trade)
+            saved_count += 1
+
+        logger.info(f"Successfully saved {saved_count} trades for {symbol}")
+
+    async def sync_symbol(self, symbol: str, lookback_days: int = 7):
+        """
+        Full sync for a symbol:
+        1. Sync Klines (for time-based charts)
+        2. Sync Recent Trades (for volume/tick charts)
+        """
+        # 1. Sync Recent Trades (Immediate Tick Data)
+        await self.sync_trades(symbol)
+
+        # 2. Sync Klines (Existing Logic)
+        await self._sync_klines(symbol, venue="bybit", lookback_days=lookback_days)
+
+    async def _sync_klines(
         self, symbol: str, venue: str = "bybit", lookback_days: int = 1
     ):
         """

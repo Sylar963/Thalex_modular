@@ -60,8 +60,12 @@ class BybitAdapter(BaseExchangeAdapter):
         self.balance_callback: Optional[Callable] = None
 
     def _safe_float(self, value, default: float = 0.0) -> float:
-        if value is None or value == "":
+        if value is None:
             return default
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                return default
         try:
             return float(value)
         except (ValueError, TypeError):
@@ -274,7 +278,9 @@ class BybitAdapter(BaseExchangeAdapter):
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Error in Bybit msg loop: {e}")
+                import traceback
+
+                logger.error(f"Error in Bybit msg loop: {e}\n{traceback.format_exc()}")
 
     async def _handle_message(self, msg: Dict):
         topic = msg.get("topic")
@@ -322,6 +328,7 @@ class BybitAdapter(BaseExchangeAdapter):
                 await self.position_callback(symbol, amount, entry_price)
 
     async def _handle_wallet_update(self, data: Dict):
+        logger.info(f"raw wallet data: {data}")
         coins = data.get("coin", [])
         for coin_data in coins:
             coin = coin_data.get("coin", "USD")
@@ -440,6 +447,7 @@ class BybitAdapter(BaseExchangeAdapter):
                 try:
                     msg = await asyncio.wait_for(ws.receive_json(), timeout=5.0)
                     if msg.get("topic", "").startswith("orderbook"):
+                        # logger.info(msg) # Too spammy, maybe log first bid?
                         data = msg.get("data", {})
                         bids = data.get("b", [[0, 0]])
                         asks = data.get("a", [[0, 0]])
