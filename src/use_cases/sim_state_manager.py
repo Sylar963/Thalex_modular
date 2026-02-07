@@ -1,9 +1,15 @@
 import asyncio
 import time
+import uuid
 import logging
 from typing import List, Dict, Optional, AsyncGenerator
 from dataclasses import dataclass, field
 from ..domain.entities.pnl import EquitySnapshot, FillEffect
+from ..domain.entities import Ticker, MarketState, Position, Order, Trade, OrderSide
+from ..domain.lob_match_engine import LOBMatchEngine
+from ..domain.strategies.avellaneda import AvellanedaStoikovStrategy
+from ..domain.risk.basic_manager import BasicRiskManager
+from ..domain.interfaces import StorageGateway
 
 logger = logging.getLogger(__name__)
 
@@ -30,8 +36,22 @@ class SimStateManager:
         self._subscribers: List[asyncio.Queue] = []
         self._lock = asyncio.Lock()
 
+        # Modular Components
+        self.match_engine: Optional[LOBMatchEngine] = None
+        self.strategy: Optional[AvellanedaStoikovStrategy] = None
+        self.risk_manager: Optional[BasicRiskManager] = None
+        self.storage: Optional[StorageGateway] = None
+        self._loop_task: Optional[asyncio.Task] = None
+
+    def set_storage(self, storage: StorageGateway):
+        self.storage = storage
+
     async def start(self, symbol: str, initial_balance: float, mode: str = "shadow"):
         async with self._lock:
+            if self.state.running:
+                logger.warning("Live Simulation already running")
+                return
+
             self.state = LiveSimState(
                 running=True,
                 mode=mode,
@@ -45,6 +65,24 @@ class SimStateManager:
                 fills=[],
                 last_price=0.0,
             )
+
+            # Initialize Engines
+            self.match_engine = LOBMatchEngine()
+            self.match_engine.balance = initial_balance
+            self.match_engine.fill_callback = self.record_fill
+
+            self.strategy = AvellanedaStoikovStrategy()
+            # Default config, should ideally come from params
+            self.strategy.setup(
+                {"gamma": 0.5, "volatility": 0.01, "position_limit": 5.0}
+            )
+
+            self.risk_manager = BasicRiskManager()
+            self.risk_manager.setup({"max_position": 5.0})
+
+            # Start the processing loop
+            self._loop_task = asyncio.create_task(self._simulation_loop())
+
             logger.info(
                 f"SimStateManager started: {symbol} with {initial_balance} balance in {mode} mode"
             )
@@ -52,43 +90,123 @@ class SimStateManager:
     async def stop(self):
         async with self._lock:
             self.state.running = False
+            if self._loop_task:
+                self._loop_task.cancel()
+                try:
+                    await self._loop_task
+                except asyncio.CancelledError:
+                    pass
+                self._loop_task = None
+
             for q in self._subscribers:
                 await q.put(None)
             self._subscribers.clear()
             logger.info("SimStateManager stopped")
 
-    async def update_price(self, price: float):
-        async with self._lock:
-            self.state.last_price = price
+    async def _simulation_loop(self):
+        """
+        Main loop to verify liveliness.
+        """
+        logger.info("Live Simulation Loop Started")
+        try:
+            while self.state.running:
+                await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            logger.info("Live Simulation Loop Cancelled")
+        except Exception as e:
+            logger.error(f"Error in Live Simulation Loop: {e}")
 
-    async def update_position(self, size: float, entry_price: float, balance: float):
+    async def on_ticker(self, ticker: Ticker):
+        """
+        Called by MarketFeedService when a new ticker arrives.
+        This drives the simulation.
+        """
+        if not self.state.running or ticker.symbol != self.state.symbol:
+            return
+
         async with self._lock:
-            self.state.position_size = size
-            self.state.position_entry_price = entry_price
-            self.state.current_balance = balance
+            # 1. Update Market State
+            self.state.last_price = ticker.last
+            self.match_engine.on_ticker(ticker)
+
+            # 2. Strategy Logic
+            market_state = MarketState(ticker=ticker, timestamp=ticker.timestamp)
+            pos = Position(
+                self.state.symbol,
+                self.match_engine.position_size,
+                self.match_engine.position_entry_price,
+            )
+
+            quotes = self.strategy.calculate_quotes(market_state, pos)
+
+            # 3. Submit Orders to Match Engine
+            self.match_engine.bid_book.clear()
+            self.match_engine.ask_book.clear()
+
+            for q in quotes:
+                if self.risk_manager.validate_order(q, pos):
+                    self.match_engine.submit_order(q, ticker.timestamp)
+
+            # 4. Update Equity Snapshot
+            current_equity = self.match_engine.get_equity((ticker.bid + ticker.ask) / 2)
+            snapshot = EquitySnapshot(
+                timestamp=ticker.timestamp,
+                balance=self.match_engine.balance,
+                position_value=0,  # Simplified
+                equity=current_equity,
+                unrealized_pnl=current_equity - self.match_engine.balance,
+            )
+
+            # Update internal state (lighter update)
+            self.state.position_size = self.match_engine.position_size
+            self.state.position_entry_price = self.match_engine.position_entry_price
+            self.state.current_balance = self.match_engine.balance
+
+            await self.record_equity_snapshot(snapshot)
 
     async def record_fill(self, fill: FillEffect):
-        async with self._lock:
-            self.state.fills.append(fill)
-            self.state.current_balance = fill.balance_after
+        """
+        Callback from LOBMatchEngine.
+        Persists fill as a mock Trade in bot_executions.
+        """
+        self.state.fills.append(fill)
+        self.state.current_balance = fill.balance_after
 
-            if len(self.state.fills) > self.max_history:
-                self.state.fills = self.state.fills[-self.max_history :]
+        if len(self.state.fills) > self.max_history:
+            self.state.fills = self.state.fills[-self.max_history :]
+
+        logger.info(f"Live Sim Fill: {fill.side} {fill.size} @ {fill.price}")
+
+        # Persist to DB if storage is available
+        if self.storage:
+            try:
+                # Map FillEffect to Trade
+                trade = Trade(
+                    id=str(uuid.uuid4()),
+                    order_id=str(uuid.uuid4()),  # Mock Order ID
+                    symbol=fill.symbol,
+                    price=fill.price,
+                    size=fill.size,
+                    side=OrderSide(fill.side),
+                    timestamp=fill.timestamp,
+                    exchange=f"sim_{self.state.mode}",  # Distinguish from real fills
+                    fee=fill.fee,
+                )
+                asyncio.create_task(self.storage.save_execution(trade))
+            except Exception as e:
+                logger.error(f"Failed to persist sim execution: {e}")
 
     async def record_equity_snapshot(self, snapshot: EquitySnapshot):
-        async with self._lock:
-            self.state.equity_history.append(snapshot)
+        self.state.equity_history.append(snapshot)
 
-            if len(self.state.equity_history) > self.max_history:
-                self.state.equity_history = self.state.equity_history[
-                    -self.max_history :
-                ]
+        if len(self.state.equity_history) > self.max_history:
+            self.state.equity_history = self.state.equity_history[-self.max_history :]
 
-            for q in self._subscribers:
-                try:
-                    q.put_nowait(snapshot)
-                except asyncio.QueueFull:
-                    pass
+        for q in self._subscribers:
+            try:
+                q.put_nowait(snapshot)
+            except asyncio.QueueFull:
+                pass
 
     def get_status(self) -> Dict:
         s = self.state

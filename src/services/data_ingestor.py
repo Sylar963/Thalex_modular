@@ -9,8 +9,9 @@ from typing import List, Dict, Optional
 from ..adapters.storage.timescale_adapter import TimescaleDBAdapter
 from ..adapters.exchanges.bybit_adapter import BybitAdapter
 from ..adapters.exchanges.thalex_adapter import ThalexAdapter
-from ..domain.entities import Trade
+from ..domain.entities import Trade, Ticker
 from ..domain.signals.open_range import OpenRangeSignalEngine
+from ..use_cases.sim_state_manager import sim_state_manager
 
 logger = logging.getLogger("DataIngestor")
 
@@ -45,6 +46,10 @@ class DataIngestionService:
         try:
             await self.storage.connect()
             logger.info("Connected to TimescaleDB")
+
+            # Inject Storage into SimStateManager for persistence
+            sim_state_manager.set_storage(self.storage)
+
         except Exception as e:
             logger.error(f"Failed to connect to DB: {e}")
             return
@@ -77,6 +82,7 @@ class DataIngestionService:
                         thalex_key, thalex_secret, testnet=is_testnet
                     )
                     thalex.set_trade_callback(self.on_trade)
+                    thalex.set_ticker_callback(self.on_ticker)  # Wire Ticker Callback
                     await thalex.connect()
                     self.adapters.append(thalex)
 
@@ -98,14 +104,16 @@ class DataIngestionService:
                 try:
                     bybit = BybitAdapter(bybit_key, bybit_secret, testnet=is_testnet)
                     bybit.set_trade_callback(self.on_trade)
+                    bybit.set_ticker_callback(self.on_ticker)  # Wire Ticker Callback
                     await bybit.connect()
                     self.adapters.append(bybit)
 
                     # Subscribe
                     for sym in bybit_source.get("symbols", []):
-                        # Simple Mapping for Bybit topics
+                        # Subscribe to tickers as well for simulation
+                        await bybit.subscribe_ticker(sym)
                         await bybit.subscribe_trades(sym)
-                        logger.info(f"Subscribed to {sym} on Bybit")
+                        logger.info(f"Subscribed to {sym} on Bybit (Ticker+Trades)")
                 except Exception as e:
                     logger.error(f"Failed to init Bybit ingestion: {e}")
 
@@ -223,3 +231,17 @@ class DataIngestionService:
             asyncio.create_task(self.storage.save_balance(balance))
         except Exception as e:
             logger.error(f"Failed to process balance: {e}")
+
+    async def on_ticker(self, ticker: Ticker):
+        # 1. Persist Ticker
+        try:
+            # We can optionally sample decimation here if needed
+            asyncio.create_task(self.storage.save_ticker(ticker))
+        except Exception as e:
+            logger.error(f"Failed to save ticker: {e}")
+
+        # 2. Forward to Live Simulation
+        try:
+            await sim_state_manager.on_ticker(ticker)
+        except Exception as e:
+            logger.error(f"Failed to update Live Sim with ticker: {e}")

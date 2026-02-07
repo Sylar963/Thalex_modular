@@ -15,7 +15,7 @@
                 "volatility": 0.08,
                 "position_limit": 2.0,
                 "min_spread": 15,
-                "quote_levels": 1,
+                "quote_levels": 3,
                 "level_spacing_factor": 0.5,
                 "order_size": 0.5
             }
@@ -63,7 +63,7 @@
         "max_order_size": 1.0,
         "venue_limits": {
             "thalex": 1.0,
-            "bybit": 1.0,
+            "bybit": 5.0,
             "binance": 1.0,
             "hyperliquid": 1.0
         }
