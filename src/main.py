@@ -290,6 +290,13 @@ async def main():
 
 if __name__ == "__main__":
     try:
+        import uvloop
+
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    except ImportError:
+        pass  # Fallback to default loop if uvloop not installed
+
+    try:
         asyncio.run(main())
     except KeyboardInterrupt:
         pass

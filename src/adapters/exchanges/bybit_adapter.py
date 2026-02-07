@@ -368,9 +368,7 @@ class BybitAdapter(BaseExchangeAdapter):
             "timeInForce": "PostOnly" if order.post_only else "GTC",
             "orderLinkId": order.id,
         }
-        import json
-
-        payload_str = json.dumps(payload)
+        payload_str = self._fast_json_encode(payload)
 
         url = f"{self.base_url}/v5/order/create"
         async with self.session.post(
@@ -397,11 +395,7 @@ class BybitAdapter(BaseExchangeAdapter):
         if not order:
             return False
 
-        import json
-
-        mapped_symbol = InstrumentService.get_exchange_symbol(order.symbol, self.name)
-        payload = {"category": "linear", "symbol": mapped_symbol, "orderId": order_id}
-        payload_str = json.dumps(payload)
+        payload_str = self._fast_json_encode(payload)
 
         url = f"{self.base_url}/v5/order/cancel"
         async with self.session.post(

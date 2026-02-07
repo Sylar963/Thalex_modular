@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import json
 import time
 import os
 from typing import Dict, Optional, Callable, List, Any
@@ -14,7 +13,7 @@ except ImportError:
     raise ImportError("Thalex package not found. Ensure 'thalex' is in PYTHONPATH.")
 
 from ...domain.interfaces import ExchangeGateway
-from .base_adapter import TokenBucket
+from .base_adapter import TokenBucket, BaseExchangeAdapter
 from ...domain.entities import (
     Order,
     OrderSide,
@@ -29,7 +28,7 @@ from ...domain.entities import (
 logger = logging.getLogger(__name__)
 
 
-class ThalexAdapter(ExchangeGateway):
+class ThalexAdapter(BaseExchangeAdapter):
     """
     Adapter for the Thalex exchange using the official python library.
     Implements robust connection handling, heartbeat monitoring, and RPC correlation.
@@ -404,7 +403,7 @@ class ThalexAdapter(ExchangeGateway):
             # Send requests individually (Pipelining)
             # Thalex might not support JSON-RPC Batch Arrays. Pipelining achieves similar throughput.
             for payload in batch_payload:
-                req_str = json.dumps(payload)
+                req_str = self._fast_json_encode(payload)
                 logger.debug(f"TX PIPE: {req_str}")
                 await self.client.ws.send(req_str)
 
@@ -562,8 +561,8 @@ class ThalexAdapter(ExchangeGateway):
 
                 if isinstance(msg, str):
                     try:
-                        msg = json.loads(msg)
-                    except json.JSONDecodeError:
+                        msg = self._fast_json_decode(msg)
+                    except ValueError:
                         logger.warning(f"Received invalid JSON: {msg}")
                         continue
 

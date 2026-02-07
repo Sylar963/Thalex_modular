@@ -1,7 +1,13 @@
 from abc import abstractmethod
-from typing import Optional, Callable
+from typing import Optional, Callable, Any, Union
 import time
 import asyncio
+
+try:
+    import orjson
+except ImportError:
+    import json as orjson  # Fallback for type hinting/mocking, though functionality differs
+
 from ...domain.interfaces import ExchangeGateway
 
 
@@ -72,3 +78,11 @@ class BaseExchangeAdapter(ExchangeGateway):
 
     def set_position_callback(self, callback: Callable):
         self.position_callback = callback
+
+    def _fast_json_encode(self, data: Any) -> str:
+        # orjson dumps to bytes. fast and correct.
+        # We decode to utf-8 str because some libs (like thalex py) expect str.
+        return orjson.dumps(data).decode("utf-8")
+
+    def _fast_json_decode(self, data: Union[str, bytes]) -> Any:
+        return orjson.loads(data)
