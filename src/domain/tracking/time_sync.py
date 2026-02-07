@@ -14,12 +14,22 @@ class MultiVenueTimeSyncService(TimeSyncManager):
     without constant REST overhead.
     """
 
-    def __init__(self, exchanges: List[ExchangeGateway], sync_interval: int = 300):
-        self.exchanges = {ex.name: ex for ex in exchanges}
+    def __init__(
+        self,
+        exchanges: Optional[List[ExchangeGateway]] = None,
+        sync_interval: int = 300,
+    ):
+        self.exchanges: Dict[str, ExchangeGateway] = (
+            {ex.name: ex for ex in exchanges} if exchanges else {}
+        )
         self.offsets: Dict[str, int] = {}  # exchange_name -> offset_ms
         self.sync_interval = sync_interval
         self._sync_task: Optional[asyncio.Task] = None
         self._running = False
+
+    def add_venue(self, gate: ExchangeGateway):
+        """Dynamically add a venue to the sync manager."""
+        self.exchanges[gate.name] = gate
 
     def get_timestamp(self, exchange: str) -> int:
         """Standardized method to get exchange-aligned timestamp in milliseconds."""

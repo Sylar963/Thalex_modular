@@ -14,6 +14,7 @@ except ImportError:
     )
 
 from .base_adapter import BaseExchangeAdapter
+from ...domain.interfaces import TimeSyncManager
 from ...services.instrument_service import InstrumentService
 from ...domain.entities import (
     Order,
