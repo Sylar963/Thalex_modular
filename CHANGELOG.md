@@ -2,7 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Current State] - 2026-02-05
+## [Current State] - 2026-02-06
+
+### Architectural Improvements
+- **Decoupled Data Ingestion**: Separated the "Charting/Market Data" feed from the "Trading Engine" (Quoting).
+    - Introduced `DataIngestionService` (`src/services/data_ingestor.py`) to handle public data streams independently of the bot's trading status.
+    - Added `data_ingestion` block to `config.json` for managing a "Watchlist" of symbols to ingest (e.g., `ETHUSDT` for charting only).
+    - Updated `dependencies.py` to initialize `DataIngestionService` instead of the legacy `MarketFeedService`.
+    - ** Benefit**: Users can now chart any symbol without the bot having to trade it, and the system is more modular.
+
+### Technical Debt Remediation
+- **Security**: Removed hardcoded database credentials and blocking `psycopg2` driver from `historical_options_loader.py`. It now uses `TimescaleDBAdapter` (asyncpg) and environment variables.
+- **Performance**: Added `save_tickers_bulk` and `save_options_metrics_bulk` to `TimescaleDBAdapter` for efficient batch ingestion.
+- **Configuration**: Fixed incorrect Bybit symbol mapping (`HYPEUSDT` -> `BTCUSDT`) in `config.json`.
+- **Reliability**: Extended `MarketFeedService` warmup period to 48 hours to ensure `OpenRangeSignalEngine` has sufficient data even with weekend gaps.
 
 ### Refactored (Technical Debt)
 - **Centralized Rate Limiting**: Moved `TokenBucket` to `base_adapter.py` to provide a shared utility for all exchange adapters, reducing code duplication.
