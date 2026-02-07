@@ -9,12 +9,14 @@ from .repositories import (
 )
 from ..adapters.storage.timescale_adapter import TimescaleDBAdapter
 from src.services.market_feed import MarketFeedService
+from src.domain.signals.open_range import OpenRangeSignalEngine
 
 
 # Singleton instance holder
 class GlobalState:
     db_adapter: Optional[TimescaleDBAdapter] = None
     market_feed: Optional[MarketFeedService] = None
+    or_engine: Optional[OpenRangeSignalEngine] = None
 
 
 _state = GlobalState()
@@ -47,9 +49,17 @@ async def init_dependencies():
         )
         raise e
 
+    # --- Signal Engines ---
+    try:
+        # Defaults match config.json
+        _state.or_engine = OpenRangeSignalEngine()
+        print("Initialized OpenRangeEngine.")
+    except Exception as e:
+        print(f"Failed to init Signal Engines: {e}")
+
     # --- Market Feed Service Initialization ---
     try:
-        _state.market_feed = MarketFeedService(db_dsn)
+        _state.market_feed = MarketFeedService(db_dsn, _state.or_engine)
         await _state.market_feed.start()
         print("Market Feed Service started.")
 
@@ -73,7 +83,7 @@ def get_db_adapter() -> Optional[TimescaleDBAdapter]:
 
 
 def get_market_repo() -> MarketRepository:
-    return MarketRepository(get_db_adapter())
+    return MarketRepository(get_db_adapter(), _state.or_engine)
 
 
 def get_portfolio_repo() -> PortfolioRepository:

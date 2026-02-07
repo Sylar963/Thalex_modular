@@ -13,9 +13,10 @@ logger = logging.getLogger("MarketFeed")
 
 
 class MarketFeedService:
-    def __init__(self, db_url: str):
+    def __init__(self, db_url: str, or_engine=None):
         self.db_url = db_url
         self.storage = TimescaleDBAdapter(db_url)
+        self.or_engine = or_engine
         self.adapters: List = []
         self.running = False
         self.tasks: List[asyncio.Task] = []
@@ -138,6 +139,11 @@ class MarketFeedService:
         try:
             # logger.debug(f"Saving trade {trade}")
             asyncio.create_task(self.storage.save_trade(trade))
+
+            # Update Signal Engine
+            if self.or_engine:
+                self.or_engine.update_trade(trade)
+
         except Exception as e:
             logger.error(f"Failed to save trade: {e}")
 

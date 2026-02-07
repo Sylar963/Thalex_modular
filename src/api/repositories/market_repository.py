@@ -4,6 +4,10 @@ from ...domain.entities import Ticker
 
 
 class MarketRepository(BaseRepository):
+    def __init__(self, storage, or_engine=None):
+        super().__init__(storage)
+        self._or_engine = or_engine
+
     async def trigger_sync(self, symbol: str, venue: str = "bybit") -> dict:
         from ...services.data_ingestor import DataIngestor
 
