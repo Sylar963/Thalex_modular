@@ -223,7 +223,6 @@ async def main():
             risk_manager=risk_manager,
             sync_engine=sync_engine,
             signal_engine=signal_engine,
-            signal_engine=signal_engine,
             storage=storage,
             safety_components=safety_components,
             dry_run=dry_run,

@@ -3,7 +3,7 @@ import logging
 import time
 import hmac
 import hashlib
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Callable
 from urllib.parse import urlencode
 from dataclasses import replace
 
@@ -51,7 +51,6 @@ class BinanceAdapter(BaseExchangeAdapter):
 
         self._msg_loop_task: Optional[asyncio.Task] = None
         self._keepalive_task: Optional[asyncio.Task] = None
-        self._time_offset_ms: int = 0
 
     @property
     def name(self) -> str:
@@ -71,11 +70,9 @@ class BinanceAdapter(BaseExchangeAdapter):
                         if self._time_offset_ms > 0
                         else f"Binance time offset: {self._time_offset_ms}ms (local ahead)"
                     )
+                    self._last_sync_time = time.time()
         except Exception as e:
             logger.warning(f"Failed to sync Binance server time: {e}")
-
-    def _get_timestamp(self) -> int:
-        return int(time.time() * 1000) + self._time_offset_ms
 
     def _sign(self, params: Dict) -> str:
         query_string = urlencode(params)
@@ -182,13 +179,16 @@ class BinanceAdapter(BaseExchangeAdapter):
         filled_size = float(data.get("z", 0))
         avg_price = float(data.get("ap", 0))
 
+        local_id = data.get("c")
+
         if exchange_id in self.orders:
             self.orders[exchange_id] = replace(
                 self.orders[exchange_id], status=status, filled_size=filled_size
             )
 
-        if self.order_callback:
-            await self.order_callback(exchange_id, status, filled_size, avg_price)
+        await self.notify_order_update(
+            exchange_id, status, filled_size, avg_price, local_id
+        )
 
     async def _handle_account_update(self, data: Dict):
         positions_data = data.get("P", [])

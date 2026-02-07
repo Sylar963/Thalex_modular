@@ -78,18 +78,6 @@ class ThalexAdapter(BaseExchangeAdapter):
             capacity=int(cancel_rate_limit * 1.1), fill_rate=cancel_rate_limit
         )
 
-    def _safe_float(self, value, default: float = 0.0) -> float:
-        if value is None:
-            return default
-        if isinstance(value, str):
-            value = value.strip()
-            if not value:
-                return default
-        try:
-            return float(value)
-        except (ValueError, TypeError):
-            return default
-
     @property
     def name(self) -> str:
         return "thalex"
@@ -754,6 +742,7 @@ class ThalexAdapter(BaseExchangeAdapter):
 
                     filled_size = self._safe_float(o_data.get("amount_filled", 0.0))
                     avg_price = self._safe_float(o_data.get("average_price", 0.0))
+                    label = str(o_data.get("label", ""))
 
                     if exchange_id in self.orders:
                         self.orders[exchange_id] = replace(
@@ -763,13 +752,12 @@ class ThalexAdapter(BaseExchangeAdapter):
                         )
                         self._order_timestamps[exchange_id] = time.time()
                         logger.info(
-                            f"Updated order {exchange_id} status to {status} from notification"
+                            f"Updated order {exchange_id} (label={label}) status to {status} from notification"
                         )
 
-                    if self.order_callback:
-                        await self.order_callback(
-                            exchange_id, status, filled_size, avg_price
-                        )
+                    await self.notify_order_update(
+                        exchange_id, status, filled_size, avg_price, local_id=label
+                    )
 
             elif channel == "portfolio":
                 positions_data = data if isinstance(data, list) else [data]

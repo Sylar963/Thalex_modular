@@ -185,17 +185,20 @@ class StateTracker:
         status: OrderStatus,
         filled_size: float = 0.0,
         avg_price: float = 0.0,
+        local_id: Optional[str] = None,
     ):
         """Unified entry point for exchange order notifications."""
+        # Race Condition Fix: If we receive a notification for a pending order
+        # that hasn't been ACKed by RPC yet, ACK it now using the local_id (label).
+        if local_id and local_id in self.pending_orders:
+            logger.info(
+                f"WS notification arrived before RPC ACK for {local_id}. Mapping to {exchange_id} now."
+            )
+            await self.on_order_ack(local_id, exchange_id)
+
         if status == OrderStatus.OPEN:
-            # We treat OPEN as an ACK for a pending order if exchange_id is new
-            if exchange_id not in self.confirmed_orders:
-                # Find the pending order that likely corresponds to this
-                # For Thalex, we usually know the label/local_id
-                # but if we only have exchange_id here, we might need more context
-                # Assuming the adapter/caller handles local_id to exchange_id mapping
-                # OR we just handle transitions if it already exists
-                pass
+            # If it's already confirmed, we don't need to do much unless we want to update filled_size/avg_price
+            pass
         elif status == OrderStatus.FILLED:
             await self.on_order_fill(
                 exchange_id, avg_price, filled_size, is_partial=False
@@ -203,8 +206,7 @@ class StateTracker:
         elif status == OrderStatus.CANCELLED:
             await self.on_order_cancel(exchange_id)
         elif status == OrderStatus.REJECTED:
-            # Rejects usually have local_id, but if it's exchange_id, handle it
-            await self.on_order_cancel(exchange_id)  # Treat as cancellation if known
+            await self.on_order_cancel(exchange_id)
 
     async def update_position(self, symbol: str, size: float, entry_price: float):
         async with self._lock:

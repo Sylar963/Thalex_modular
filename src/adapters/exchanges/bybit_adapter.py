@@ -59,20 +59,7 @@ class BybitAdapter(BaseExchangeAdapter):
         self._ping_task: Optional[asyncio.Task] = None
         self._public_loop_task: Optional[asyncio.Task] = None
         self.ws_public: Optional[aiohttp.ClientWebSocketResponse] = None
-        self._time_offset_ms: int = 0
         self.balance_callback: Optional[Callable] = None
-
-    def _safe_float(self, value, default: float = 0.0) -> float:
-        if value is None:
-            return default
-        if isinstance(value, str):
-            value = value.strip()
-            if not value:
-                return default
-        try:
-            return float(value)
-        except (ValueError, TypeError):
-            return default
 
     @property
     def name(self) -> str:
@@ -98,14 +85,14 @@ class BybitAdapter(BaseExchangeAdapter):
                         if self._time_offset_ms > 0
                         else f"Bybit time offset: {self._time_offset_ms}ms (local ahead)"
                     )
+                    self._last_sync_time = time.time()
         except Exception as e:
             logger.warning(f"Failed to sync Bybit server time: {e}")
-        self._last_sync_time = time.time()
 
     def _get_timestamp(self) -> int:
-        if time.time() - getattr(self, "_last_sync_time", 0) > 10:
+        if time.time() - self._last_sync_time > 10:
             asyncio.create_task(self._sync_server_time())
-        return int(time.time() * 1000) + self._time_offset_ms
+        return super()._get_timestamp()
 
     def _sign(self, timestamp: int, payload: str) -> str:
         recv_window = "10000"
@@ -310,13 +297,16 @@ class BybitAdapter(BaseExchangeAdapter):
         filled_size = self._safe_float(data.get("cumExecQty"))
         avg_price = self._safe_float(data.get("avgPrice"))
 
+        local_id = data.get("orderLinkId")
+
         if exchange_id in self.orders:
             self.orders[exchange_id] = replace(
                 self.orders[exchange_id], status=status, filled_size=filled_size
             )
 
-        if self.order_callback:
-            await self.order_callback(exchange_id, status, filled_size, avg_price)
+        await self.notify_order_update(
+            exchange_id, status, filled_size, avg_price, local_id
+        )
 
     async def _handle_position_update(self, data: Dict):
         symbol = data.get("symbol")
@@ -418,10 +408,9 @@ class BybitAdapter(BaseExchangeAdapter):
                 self.orders[order_id] = replace(
                     self.orders[order_id], status=OrderStatus.CANCELLED
                 )
-                if self.order_callback:
-                    await self.order_callback(
-                        order_id, OrderStatus.CANCELLED, order.filled_size, 0.0
-                    )
+                await self.notify_order_update(
+                    order_id, OrderStatus.CANCELLED, order.filled_size, 0.0, order.id
+                )
                 return True
 
             logger.error(f"Bybit cancel error: {data}")

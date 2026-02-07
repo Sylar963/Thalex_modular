@@ -61,6 +61,12 @@ class BaseExchangeAdapter(ExchangeGateway):
         self.trade_callback: Optional[Callable] = None
         self.order_callback: Optional[Callable] = None
         self.position_callback: Optional[Callable] = None
+        self._time_offset_ms: int = 0
+        self._last_sync_time: float = 0
+
+    def _get_timestamp(self) -> int:
+        """Standardized method to get exchange-aligned timestamp in milliseconds."""
+        return int(time.time() * 1000) + self._time_offset_ms
 
     @property
     @abstractmethod
@@ -78,6 +84,33 @@ class BaseExchangeAdapter(ExchangeGateway):
 
     def set_position_callback(self, callback: Callable):
         self.position_callback = callback
+
+    async def notify_order_update(
+        self,
+        exchange_id: str,
+        status: Any,
+        filled_size: float = 0.0,
+        avg_price: float = 0.0,
+        local_id: Optional[str] = None,
+    ):
+        """Standardized method to notify the system (StateTracker) of an order update."""
+        if self.order_callback:
+            await self.order_callback(
+                exchange_id, status, filled_size, avg_price, local_id
+            )
+
+    def _safe_float(self, value, default: float = 0.0) -> float:
+        """Standardized float conversion with safety handling."""
+        if value is None:
+            return default
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                return default
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            return default
 
     def _fast_json_encode(self, data: Any) -> str:
         # orjson dumps to bytes. fast and correct.

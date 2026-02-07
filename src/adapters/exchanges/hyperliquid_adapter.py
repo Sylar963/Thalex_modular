@@ -53,7 +53,6 @@ class HyperliquidAdapter(BaseExchangeAdapter):
 
         self._msg_loop_task: Optional[asyncio.Task] = None
         self._balance_task: Optional[asyncio.Task] = None
-        self._time_offset_ms: int = 0
         self.balance_callback: Optional[Callable] = None
 
     @property
@@ -82,9 +81,6 @@ class HyperliquidAdapter(BaseExchangeAdapter):
                     )
         except Exception as e:
             logger.warning(f"Failed to sync Hyperliquid server time: {e}")
-
-    def _get_timestamp(self) -> int:
-        return int(time.time() * 1000) + self._time_offset_ms
 
     async def connect(self):
         logger.info(
@@ -199,13 +195,12 @@ class HyperliquidAdapter(BaseExchangeAdapter):
         if exchange_id in self.orders:
             self.orders[exchange_id] = replace(self.orders[exchange_id], status=status)
 
-        if self.order_callback:
-            await self.order_callback(
-                exchange_id,
-                status,
-                float(data.get("filledSz", 0)),
-                float(data.get("avgPx", 0)),
-            )
+        await self.notify_order_update(
+            exchange_id,
+            status,
+            float(data.get("filledSz", 0)),
+            float(data.get("avgPx", 0)),
+        )
 
     def _sign_action(self, action: Dict, nonce: int) -> str:
         typed_data = {
