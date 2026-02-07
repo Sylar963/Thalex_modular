@@ -10,7 +10,10 @@ from ..domain.interfaces import (
     Strategy,
     RiskManager,
     StorageGateway,
+    RiskManager,
+    StorageGateway,
     SignalEngine,
+    SafetyComponent,
 )
 from ..domain.market.trend_service import HistoricalTrendService
 from ..domain.tracking.sync_engine import SyncEngine, GlobalState
@@ -57,6 +60,7 @@ class MultiExchangeStrategyManager:
         signal_engine: Optional[SignalEngine] = None,
         or_engine: Optional[SignalEngine] = None,
         storage: Optional[StorageGateway] = None,
+        safety_components: Optional[List[SafetyComponent]] = None,
         dry_run: bool = False,
     ):
         self.venues: Dict[str, VenueContext] = {}
@@ -66,9 +70,9 @@ class MultiExchangeStrategyManager:
         self.strategy = strategy
         self.risk_manager = risk_manager
         self.sync_engine = sync_engine
-        self.signal_engine = signal_engine
         self.or_engine = or_engine
         self.storage = storage
+        self.safety_components = safety_components or []
         self.dry_run = dry_run
 
         self.trend_service = HistoricalTrendService(storage) if storage else None
@@ -201,7 +205,30 @@ class MultiExchangeStrategyManager:
             if self.storage and not self.dry_run:
                 asyncio.create_task(self.storage.save_ticker(ticker))
 
-            await self._run_strategy_for_venue(venue)
+            # --- Safety Checks ---
+            safety_context = {"timestamp": ticker.timestamp, "ticker": ticker}
+            is_healthy = True
+            for component in self.safety_components:
+                if not component.check_health(safety_context):
+                    component.record_failure()
+                    logger.warning(
+                        f"Safety Check FAILED: {component.__class__.__name__}. skipping cycle."
+                    )
+                    is_healthy = False
+                    # Don't break immediately, let all record failure if needed?
+                    # Or break to fail fast? Fail fast is better for latency.
+                    break
+                else:
+                    # Only record success if we actually passed?
+                    # Circuit breaker needs explicit success to reset/heal.
+                    # We should probably do this at end of successful cycle, or here if check passed?
+                    # If we record success here, it might be granular.
+                    # For CB, success means "Time passed without failure" or "Operation succeeded".
+                    # Let's simple record success if check passes for now.
+                    component.record_success()
+
+            if is_healthy:
+                await self._run_strategy_for_venue(venue)
 
         return callback
 

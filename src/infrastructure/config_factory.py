@@ -10,6 +10,9 @@ from src.adapters.exchanges.binance_adapter import BinanceAdapter
 from src.adapters.exchanges.hyperliquid_adapter import HyperliquidAdapter
 from src.use_cases.strategy_manager import ExchangeConfig
 from src.domain.strategies.avellaneda import AvellanedaStoikovStrategy
+from src.domain.interfaces import SafetyComponent
+from src.domain.safety.latency_monitor import LatencyMonitor
+from src.domain.safety.circuit_breaker import CircuitBreaker
 
 logger = logging.getLogger(__name__)
 
@@ -131,3 +134,36 @@ class ConfigFactory:
                 logger.error(f"Failed to configure {venue_name}: {e}")
 
         return exchange_configs
+
+    @staticmethod
+    def create_safety_components(bot_config: dict) -> List[SafetyComponent]:
+        """
+        Instantiates protection plugins based on 'safety' config section.
+        """
+        safety_config = bot_config.get("safety", {})
+        components = []
+
+        # 1. Latency Monitor
+        lat_conf = safety_config.get("latency_monitor", {})
+        if lat_conf.get("enabled", True):  # Default ON is safer
+            max_lat = lat_conf.get("max_latency", 1.0)
+            components.append(LatencyMonitor(max_latency=max_lat))
+            logger.info(f"Safety: LatencyMonitor enabled (max={max_lat}s).")
+
+        # 2. Circuit Breaker
+        cb_conf = safety_config.get("circuit_breaker", {})
+        if cb_conf.get("enabled", True):  # Default ON
+            threshold = cb_conf.get("failure_threshold", 5)
+            timeout = cb_conf.get("recovery_timeout", 60)
+            components.append(
+                CircuitBreaker(
+                    failure_threshold=threshold,
+                    recovery_timeout=timeout,
+                    name="GlobalCB",
+                )
+            )
+            logger.info(
+                f"Safety: CircuitBreaker enabled (thresh={threshold}, timeout={timeout}s)."
+            )
+
+        return components

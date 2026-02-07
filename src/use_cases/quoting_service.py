@@ -71,46 +71,98 @@ class QuotingService:
 
         logger.info(f"Starting Quoting Service for {symbol}")
 
-        # 1. Setup Callbacks
-        self.gateway.set_ticker_callback(self.on_ticker_update)
-        self.gateway.set_trade_callback(self.on_trade_update)
-        self.gateway.set_order_callback(self.state_tracker.on_order_update)
-        # Fix: Use wrapper to ensure persistence
-        self.gateway.set_position_callback(self.on_position_update)
-
-        # Wire reactive events
-        self.state_tracker.set_fill_callback(self.on_fill_event)
-        self.state_tracker.set_state_gap_callback(self.on_sequence_gap)
-
-        # Start state tracker
-        await self.state_tracker.start()
-
-        # 2. Connect
-        await self.gateway.connect()
-
-        # 2.5 Clean Slate: Cancel all existing orders and clear local state
-        if hasattr(self.gateway, "cancel_all_orders"):
-            logger.info("Cancelling all existing orders on startup for clean state...")
-            await self.gateway.cancel_all_orders(symbol)
-            self.state_tracker.pending_orders.clear()
-            self.state_tracker.confirmed_orders.clear()
-            logger.info("StateTracker order state cleared.")
-
-        # 3. Initial State Fetch & Sync
         try:
-            initial_pos = await self.gateway.get_position(symbol)
-            await self.state_tracker.update_position(
-                symbol, initial_pos.size, initial_pos.entry_price
-            )
-            if self.storage:
-                await self.storage.save_position(initial_pos)
-            logger.info(f"Initial Position: {initial_pos}")
-        except Exception as e:
-            logger.warning(f"Could not fetch initial position: {e}")
+            # 1. Setup Callbacks
+            self.gateway.set_ticker_callback(self.on_ticker_update)
+            self.gateway.set_trade_callback(self.on_trade_update)
+            self.gateway.set_order_callback(self.state_tracker.on_order_update)
+            # Fix: Use wrapper to ensure persistence
+            self.gateway.set_position_callback(self.on_position_update)
 
-        # 4. Subscribe
-        await self.gateway.subscribe_ticker(symbol)
-        logger.info(f"Subscribed to {symbol}")
+            # Wire reactive events
+            self.state_tracker.set_fill_callback(self.on_fill_event)
+            self.state_tracker.set_state_gap_callback(self.on_sequence_gap)
+
+            # Start state tracker
+            await self.state_tracker.start()
+
+            # 2. Connect
+            await self.gateway.connect()
+
+            # 2.5 Clean Slate: Robust "Detect & Destroy" Strategy
+            if hasattr(self.gateway, "cancel_all_orders"):
+                logger.info("Cancelling all existing orders on startup...")
+                cancel_success = await self.gateway.cancel_all_orders(symbol)
+
+                if not cancel_success:
+                    logger.warning(
+                        "Bulk cancel failed. Attempting individual cleanup (Detect & Destroy)..."
+                    )
+                    try:
+                        open_orders = await self.gateway.get_open_orders(symbol)
+                        if open_orders:
+                            logger.info(
+                                f"Found {len(open_orders)} stale orders. Cancelling individually..."
+                            )
+                            tasks = [
+                                self.gateway.cancel_order(o.exchange_id)
+                                for o in open_orders
+                                if o.exchange_id
+                            ]
+                            results = await asyncio.gather(
+                                *tasks, return_exceptions=True
+                            )
+
+                            # Verify cleanup
+                            failed_cleanups = [
+                                r
+                                for r in results
+                                if isinstance(r, Exception) or r is False
+                            ]
+                            if failed_cleanups:
+                                logger.error(
+                                    f"Failed to clean up {len(failed_cleanups)} orders."
+                                )
+                                # Final check
+                                remaining = await self.gateway.get_open_orders(symbol)
+                                if remaining:
+                                    raise RuntimeError(
+                                        f"Startup aborted: Unable to clean {len(remaining)} stale orders."
+                                    )
+                        else:
+                            logger.info(
+                                "No stale orders found after bulk cancel failure."
+                            )
+                    except Exception as e:
+                        logger.error(f"Detect & Destroy failed: {e}")
+                        raise RuntimeError(
+                            "Startup aborted: Failed to ensure clean state."
+                        ) from e
+
+                self.state_tracker.pending_orders.clear()
+                self.state_tracker.confirmed_orders.clear()
+                logger.info("StateTracker order state cleared.")
+
+            # 3. Initial State Fetch & Sync
+            try:
+                initial_pos = await self.gateway.get_position(symbol)
+                await self.state_tracker.update_position(
+                    symbol, initial_pos.size, initial_pos.entry_price
+                )
+                if self.storage:
+                    await self.storage.save_position(initial_pos)
+                logger.info(f"Initial Position: {initial_pos}")
+            except Exception as e:
+                logger.warning(f"Could not fetch initial position: {e}")
+
+            # 4. Subscribe
+            await self.gateway.subscribe_ticker(symbol)
+            logger.info(f"Subscribed to {symbol}")
+
+        except Exception as e:
+            logger.error(f"Failed to start QuotingService: {e}")
+            self.running = False
+            raise e
 
     async def stop(self):
         logger.info("Stopping Quoting Service...")
