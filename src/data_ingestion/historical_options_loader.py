@@ -4,19 +4,32 @@ import os
 import aiohttp
 import json
 from datetime import datetime, timedelta, timezone
-import psycopg2
-from psycopg2.extras import execute_batch
-import numpy as np
 from typing import List, Dict, Tuple, Optional
 
-# Configuration
+# Add src to path
+import sys
+
+# Get absolute path to project root (2 levels up from src/data_ingestion)
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+sys.path.append(project_root)
+
+# Import Adapter
+try:
+    from src.adapters.storage.timescale_adapter import TimescaleDBAdapter
+except ImportError:
+    # If run from root
+    from src.adapters.storage.timescale_adapter import TimescaleDBAdapter
+
+# Configuration from ENV
 DB_HOST = os.getenv("DATABASE_HOST", "localhost")
 DB_NAME = os.getenv("DATABASE_NAME", "thalex_trading")
 DB_USER = os.getenv("DATABASE_USER", "postgres")
 DB_PASS = os.getenv("DATABASE_PASSWORD", "password")
 DB_PORT = os.getenv("DATABASE_PORT", "5433")
 
-THALEX_API_URL = "https://thalex.com/api/v2"  # Verify base URL
+DB_DSN = f"postgres://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+
+THALEX_API_URL = "https://thalex.com/api/v2"
 
 # Logger Setup
 logging.basicConfig(
@@ -27,25 +40,14 @@ logger = logging.getLogger("HistoricalLoader")
 
 class HistoricalOptionsLoader:
     def __init__(self):
-        self.conn = None
+        self.db = TimescaleDBAdapter(DB_DSN)
         self.session = None
 
-    def connect_db(self):
-        try:
-            logger.info(
-                f"Connecting to DB: host={DB_HOST} port={DB_PORT} user={DB_USER} db={DB_NAME}"
-            )
-            self.conn = psycopg2.connect(
-                host=DB_HOST,
-                database=DB_NAME,
-                user=DB_USER,
-                password="password",
-                port=DB_PORT,
-            )
-            logger.info("Connected to TimescaleDB")
-        except Exception as e:
-            logger.error(f"Database connection failed: {e}")
-            raise
+    async def connect(self):
+        await self.db.connect()
+
+    async def disconnect(self):
+        await self.db.disconnect()
 
     async def _fetch_list(self, endpoint: str, params: Dict) -> List:
         url = f"{THALEX_API_URL}/{endpoint}"
@@ -123,39 +125,9 @@ class HistoricalOptionsLoader:
         """Formats date as DDMMMYY (e.g. 29MAR24)"""
         return date.strftime("%d%b%y").upper()
 
-    def batch_insert_metrics(self, metrics: List[Tuple]):
-        if not metrics:
-            return
-        cursor = self.conn.cursor()
-        execute_batch(
-            cursor,
-            """
-            INSERT INTO options_live_metrics 
-            (time, underlying, strike, expiry_date, days_to_expiry, call_mark_price, put_mark_price, straddle_price, implied_vol, expected_move_pct)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT DO NOTHING
-            """,
-            metrics,
-        )
-        self.conn.commit()
-
-    def batch_insert_tickers(self, tickers: List[Tuple]):
-        if not tickers:
-            return
-        cursor = self.conn.cursor()
-        execute_batch(
-            cursor,
-            """
-            INSERT INTO market_tickers (time, symbol, exchange, bid, ask, last, volume)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT DO NOTHING
-            """,
-            tickers,
-        )
-        self.conn.commit()
-
     async def run(self, days_back: int = 30):
-        self.connect_db()
+        # Establish Connections
+        await self.connect()
         self.session = aiohttp.ClientSession()
 
         try:
@@ -316,10 +288,6 @@ class HistoricalOptionsLoader:
                             ts = point[0]
                             close_price = float(point[4])
 
-                            # Use close price for bid/ask/last proxy to maintain history visual
-                            # Note: Real bid/ask might be in metadata but API strictness varies.
-                            # We stick to robust Close price.
-
                             tickers_to_insert.append(
                                 (
                                     datetime.fromtimestamp(ts, tz=timezone.utc),
@@ -328,23 +296,24 @@ class HistoricalOptionsLoader:
                                     close_price,  # bid proxy
                                     close_price,  # ask proxy
                                     close_price,  # last
-                                    0,  # volume (market_tickers volume usually from trades, keeping 0 for now as it's mark price)
+                                    0,  # volume
                                 )
                             )
 
-                # Batch Insert
-                self.batch_insert_metrics(metrics_to_insert)
-                self.batch_insert_tickers(tickers_to_insert)
+                # Batch Insert via Adapter
+                await self.db.save_options_metrics_bulk(metrics_to_insert)
+                await self.db.save_tickers_bulk(tickers_to_insert)
 
                 logger.info(f"Inserted {len(metrics_to_insert)} records for chunk.")
                 current_start += chunk_size
-                # Be nice to API
                 await asyncio.sleep(0.5)
 
         except Exception as e:
             logger.error(f"Loader failed: {e}", exc_info=True)
         finally:
-            await self.session.close()
+            if self.session:
+                await self.session.close()
+            await self.disconnect()
 
 
 if __name__ == "__main__":

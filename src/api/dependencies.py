@@ -8,14 +8,14 @@ from .repositories import (
     ConfigRepository,
 )
 from ..adapters.storage.timescale_adapter import TimescaleDBAdapter
-from src.services.market_feed import MarketFeedService
+from src.services.data_ingestor import DataIngestionService
 from src.domain.signals.open_range import OpenRangeSignalEngine
 
 
 # Singleton instance holder
 class GlobalState:
     db_adapter: Optional[TimescaleDBAdapter] = None
-    market_feed: Optional[MarketFeedService] = None
+    data_ingestor: Optional[DataIngestionService] = None
     or_engine: Optional[OpenRangeSignalEngine] = None
 
 
@@ -51,26 +51,47 @@ async def init_dependencies():
 
     # --- Signal Engines ---
     try:
-        # Defaults match config.json
-        _state.or_engine = OpenRangeSignalEngine()
-        print("Initialized OpenRangeEngine.")
+        import json
+
+        config_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "config.json"
+        )
+        with open(config_path, "r") as f:
+            config = json.load(f)
+
+        or_config = config.get("signals", {}).get("open_range", {})
+
+        _state.or_engine = OpenRangeSignalEngine(
+            session_start_utc=or_config.get("session_start_utc", "20:00"),
+            session_end_utc=or_config.get("session_end_utc", "20:15"),
+            target_pct_from_mid=or_config.get("target_pct_from_mid", 1.49),
+            subsequent_target_pct_of_range=or_config.get(
+                "subsequent_target_pct_of_range", 220
+            ),
+            timezone=or_config.get("timezone", "UTC"),
+        )
+        print(
+            f"Initialized OpenRangeEngine with session: {or_config.get('session_start_utc')} - {or_config.get('session_end_utc')} {or_config.get('timezone')}"
+        )
     except Exception as e:
         print(f"Failed to init Signal Engines: {e}")
+        # Fallback to defaults
+        _state.or_engine = OpenRangeSignalEngine()
 
-    # --- Market Feed Service Initialization ---
+    # --- Data Ingestion Service Initialization ---
     try:
-        _state.market_feed = MarketFeedService(db_dsn, _state.or_engine)
-        await _state.market_feed.start()
-        print("Market Feed Service started.")
+        _state.data_ingestor = DataIngestionService(db_dsn, _state.or_engine)
+        await _state.data_ingestor.start()
+        print("Data Ingestion Service started.")
 
     except Exception as e:
-        print(f"Failed to start Market Feed Service: {e}")
+        print(f"Failed to start Data Ingestion Service: {e}")
 
 
 async def close_dependencies():
     """Cleanup global dependencies."""
-    if _state.market_feed:
-        await _state.market_feed.stop()
+    if _state.data_ingestor:
+        await _state.data_ingestor.stop()
     if _state.db_adapter:
         await _state.db_adapter.disconnect()
 

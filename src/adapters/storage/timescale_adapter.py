@@ -323,6 +323,47 @@ class TimescaleDBAdapter(StorageGateway):
         except Exception as e:
             logger.error(f"Failed to save signal: {e}")
 
+    async def save_tickers_bulk(self, tickers: List[Tuple]):
+        """
+        Batch insert tickers.
+        Expected tuple: (time, symbol, exchange, bid, ask, last, volume)
+        """
+        if not self.pool or not tickers:
+            return
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.executemany(
+                    """
+                    INSERT INTO market_tickers (time, symbol, exchange, bid, ask, last, volume)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    ON CONFLICT DO NOTHING
+                    """,
+                    tickers,
+                )
+        except Exception as e:
+            logger.error(f"Failed to save tickers bulk: {e}")
+
+    async def save_options_metrics_bulk(self, metrics: List[Tuple]):
+        """
+        Batch insert options metrics.
+        Expected tuple: (time, underlying, strike, expiry_date, days_to_expiry, call_mark_price, put_mark_price, straddle_price, implied_vol, expected_move_pct)
+        """
+        if not self.pool or not metrics:
+            return
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.executemany(
+                    """
+                    INSERT INTO options_live_metrics 
+                    (time, underlying, strike, expiry_date, days_to_expiry, call_mark_price, put_mark_price, straddle_price, implied_vol, expected_move_pct)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                    ON CONFLICT DO NOTHING
+                    """,
+                    metrics,
+                )
+        except Exception as e:
+            logger.error(f"Failed to save options metrics bulk: {e}")
+
     async def get_signal_history(
         self, symbol: str, start: float, end: float, signal_type: Optional[str] = None
     ) -> List[Dict]:

@@ -138,9 +138,9 @@ class MarketFeedService:
         """Load historical data to prime the engine."""
         try:
             # Since MarketFeedService has self.storage (TimescaleDBAdapter), we can use it.
-            # Fetch last 24h
+            # Fetch last 48h to ensure we capture at least one full session even with gaps
             end = time.time()
-            start = end - 86400
+            start = end - 172800
 
             # Which symbol? iterating all enabled.
             # For now hardcoded or primary

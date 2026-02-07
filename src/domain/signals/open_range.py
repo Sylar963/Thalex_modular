@@ -1,7 +1,8 @@
 import time
 import logging
-from datetime import datetime, timezone
-from typing import Dict, Optional, List
+from datetime import datetime, timezone as dt_timezone
+import zoneinfo
+from typing import Dict, Optional, List, Any
 from dataclasses import dataclass, field
 from ..interfaces import SignalEngine
 from ..entities import Ticker, Trade
@@ -24,6 +25,7 @@ class OpenRangeState:
     session_start_minute: int = 0
     session_end_hour: int = 20
     session_end_minute: int = 15
+    timezone: str = "UTC"
     target_pct_from_mid: float = 0.0149
     subsequent_target_pct_of_range: float = 2.2
 
@@ -36,6 +38,7 @@ class OpenRangeState:
     or_sesh: bool = False
     or_token: bool = False
     session_date: Optional[str] = None
+    session_start_timestamp: Optional[float] = None
 
     first_up_target: float = 0.0
     first_down_target: float = 0.0
@@ -59,6 +62,11 @@ class OpenRangeState:
     hst: float = 0.0
     lst: float = 0.0
 
+    # Session MA
+    session_ma: float = 0.0
+    bars_since_start: int = 0
+    ma_length: int = 20
+
 
 class OpenRangeSignalEngine(SignalEngine):
     def __init__(
@@ -67,6 +75,7 @@ class OpenRangeSignalEngine(SignalEngine):
         session_end_utc: str = "20:15",
         target_pct_from_mid: float = 1.49,
         subsequent_target_pct_of_range: float = 220,
+        timezone: str = "UTC",
         use_bias: bool = False,
     ):
         self._config = {
@@ -78,6 +87,7 @@ class OpenRangeSignalEngine(SignalEngine):
             "session_end_minute": int(session_end_utc.split(":")[1])
             if ":" in session_end_utc
             else 0,
+            "timezone": timezone,
             "target_pct_from_mid": target_pct_from_mid / 100.0,
             "subsequent_target_pct_of_range": subsequent_target_pct_of_range / 100.0,
         }
@@ -95,15 +105,17 @@ class OpenRangeSignalEngine(SignalEngine):
         return self.states[symbol]
 
     def _is_in_session(self, ts: float, state: OpenRangeState) -> bool:
-        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+        tz = zoneinfo.ZoneInfo(state.timezone)
+        dt = datetime.fromtimestamp(ts, tz=tz)
         current_minutes = dt.hour * 60 + dt.minute
         start_minutes = state.session_start_hour * 60 + state.session_start_minute
         end_minutes = state.session_end_hour * 60 + state.session_end_minute
 
         return start_minutes <= current_minutes < end_minutes
 
-    def _get_session_date(self, ts: float) -> str:
-        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    def _get_session_date(self, ts: float, state: OpenRangeState) -> str:
+        tz = zoneinfo.ZoneInfo(state.timezone)
+        dt = datetime.fromtimestamp(ts, tz=tz)
         return dt.strftime("%Y-%m-%d")
 
     def _on_or_start(self, symbol: str, date: str, high: float, low: float):
@@ -117,6 +129,30 @@ class OpenRangeSignalEngine(SignalEngine):
         state.orh = high
         state.orl = low
         state.session_date = date
+        # Capture precise start time if available?
+        # But date is just YYYY-MM-DD.
+        # We need the timestamp of the start of the session.
+        # Ideally passed in. But _on_or_start signature is (symbol, date, high, low).
+        # We can calculate it from date + config time.
+
+        # Construct localized start time
+        try:
+            tz = zoneinfo.ZoneInfo(state.timezone)
+            # Parse YYYY-MM-DD
+            d = datetime.strptime(date, "%Y-%m-%d")
+            # Set time
+            session_start = d.replace(
+                hour=state.session_start_hour,
+                minute=state.session_start_minute,
+                second=0,
+                microsecond=0,
+                tzinfo=tz,
+            )
+            state.session_start_timestamp = session_start.timestamp()
+        except Exception as e:
+            logger.error(f"Failed to calculate session timestamp: {e}")
+            state.session_start_timestamp = None
+
         state.up_count = 0
         state.down_count = 0
         state.up_check = True
@@ -279,6 +315,24 @@ class OpenRangeSignalEngine(SignalEngine):
             state.breakout_direction = "UP"
             logger.info(f"Bullish breakout signal for {symbol} at {close:.2f}")
 
+    def _update_session_ma(self, state: OpenRangeState, price: float):
+        # Pine Script logic:
+        # bs_nd = fz(ta.barssince(_start)) -> bars since start (1-based)
+        # v_len = bs_nd < l ? bs_nd : l -> min(bars, length)
+        # EMA: k = 2/(v_len + 1)
+        # ma := (s*k) + (nz(ma[1])*(1-k))
+
+        length = min(state.bars_since_start, state.ma_length)
+        if length == 0:
+            length = 1
+
+        k = 2 / (length + 1)
+
+        if state.session_ma == 0.0:
+            state.session_ma = price
+        else:
+            state.session_ma = (price * k) + (state.session_ma * (1 - k))
+
     def _get_1up(self, val: float) -> int:
         frac = val - int(val)
         if frac > 0:
@@ -326,18 +380,24 @@ class OpenRangeSignalEngine(SignalEngine):
         self._last_closes[symbol] = price
         self._session_just_completed = False
 
-        current_date = self._get_session_date(ts)
+        current_date = self._get_session_date(ts, state)
         was_in_session = state.or_sesh
         in_session = self._is_in_session(ts, state)
 
         or_start = in_session and not was_in_session
         or_end = was_in_session and not in_session
 
-        if current_date != state.session_date:
-            or_start = True
+        # if current_date != state.session_date:
+        #     or_start = True
 
         if or_start:
             self._on_or_start(symbol, current_date, high, low)
+            state.bars_since_start = 0
+            state.session_ma = 0.0
+
+        if or_start or (state.or_token and not or_start):
+            state.bars_since_start += 1
+            self._update_session_ma(state, price)
 
         if in_session:
             self._during_or_session(symbol, high, low)
@@ -415,5 +475,8 @@ class OpenRangeSignalEngine(SignalEngine):
             ],
             "up_signal": state.up_signal,
             "down_signal": state.down_signal,
+            "down_signal": state.down_signal,
             "session_active": state.or_sesh,
+            "session_ma": state.session_ma if state.session_ma > 0 else None,
+            "session_start_timestamp": state.session_start_timestamp,
         }

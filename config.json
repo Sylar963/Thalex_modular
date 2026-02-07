@@ -8,7 +8,7 @@
         },
         "bybit": {
             "enabled": true,
-            "symbols": ["HYPEUSDT"],
+            "symbols": ["BTCUSDT"],
             "testnet": false,
             "strategy_params": {
                 "gamma": 0.3,
@@ -26,10 +26,21 @@
             "testnet": false
         },
         "hyperliquid": {
-            "enabled": false,
-            "symbols": ["BTC"],
             "testnet": false
         }
+    },
+    "data_ingestion": {
+        "enabled": true,
+        "sources": [
+            {
+                "venue": "thalex",
+                "symbols": ["BTC-PERPETUAL"]
+            },
+            {
+                "venue": "bybit",
+                "symbols": ["BTCUSDT", "ETHUSDT"]
+            }
+        ]
     },
     "exchange": {
         "me_rate_limit": 45.0,
@@ -63,12 +74,12 @@
             "max_candles": 50
         },
         "open_range": {
-            "enabled": false,
+            "enabled": true,
             "session_start_utc": "20:00",
             "session_end_utc": "20:15",
             "target_pct_from_mid": 1.49,
             "subsequent_target_pct_of_range": 220,
-            "timezone": "UTC"
+            "timezone": "America/Tijuana"
         }
     },
     "throttling": {
