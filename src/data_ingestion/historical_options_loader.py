@@ -2,7 +2,11 @@ import asyncio
 import logging
 import os
 import aiohttp
-import json
+
+try:
+    import orjson
+except ImportError:
+    import json as orjson
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Tuple, Optional
 
@@ -55,7 +59,7 @@ class HistoricalOptionsLoader:
             if resp.status != 200:
                 logger.error(f"API Error {resp.status} for {url}: {await resp.text()}")
                 return []
-            data = await resp.json()
+            data = await resp.json(loads=orjson.loads)
             result = data.get("result", [])
 
             # If result is a dict, attempt to find the first list within it (e.g. 'index', 'mark')

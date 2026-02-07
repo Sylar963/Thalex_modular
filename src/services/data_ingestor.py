@@ -3,7 +3,11 @@ import logging
 import os
 import signal
 import time
-import json
+
+try:
+    import orjson
+except ImportError:
+    import json as orjson
 from typing import List, Dict, Optional
 
 from ..adapters.storage.timescale_adapter import TimescaleDBAdapter
@@ -31,8 +35,8 @@ class DataIngestionService:
         try:
             config_path = os.path.join(os.getcwd(), "config.json")
             if os.path.exists(config_path):
-                with open(config_path, "r") as f:
-                    return json.load(f)
+                with open(config_path, "rb") as f:
+                    return orjson.loads(f.read())
             return {}
         except Exception as e:
             logger.error(f"Failed to load config.json: {e}")
