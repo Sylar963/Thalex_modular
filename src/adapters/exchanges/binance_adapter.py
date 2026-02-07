@@ -47,7 +47,6 @@ class BinanceAdapter(BaseExchangeAdapter):
 
         self.positions: Dict[str, Position] = {}
         self.orders: Dict[str, Order] = {}
-        self.balance_callback: Optional[Callable] = None
 
         self._msg_loop_task: Optional[asyncio.Task] = None
         self._keepalive_task: Optional[asyncio.Task] = None
@@ -299,6 +298,15 @@ class BinanceAdapter(BaseExchangeAdapter):
         for oid in order_ids:
             results.append(await self.cancel_order(oid))
         return results
+
+    async def get_open_orders(self, symbol: str) -> List[Order]:
+        """Fetch all open orders for a specific symbol."""
+        return [
+            o
+            for o in self.orders.values()
+            if o.symbol == symbol
+            and o.status in [OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED]
+        ]
 
     async def subscribe_ticker(self, symbol: str):
         mapped_symbol = InstrumentService.get_exchange_symbol(symbol, self.name)

@@ -61,6 +61,7 @@ class BaseExchangeAdapter(ExchangeGateway):
         self.trade_callback: Optional[Callable] = None
         self.order_callback: Optional[Callable] = None
         self.position_callback: Optional[Callable] = None
+        self.balance_callback: Optional[Callable] = None
         self._time_offset_ms: int = 0
         self._last_sync_time: float = 0
 
@@ -84,6 +85,9 @@ class BaseExchangeAdapter(ExchangeGateway):
 
     def set_position_callback(self, callback: Callable):
         self.position_callback = callback
+
+    def set_balance_callback(self, callback: Callable):
+        self.balance_callback = callback
 
     async def notify_order_update(
         self,

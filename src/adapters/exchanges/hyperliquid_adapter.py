@@ -53,7 +53,6 @@ class HyperliquidAdapter(BaseExchangeAdapter):
 
         self._msg_loop_task: Optional[asyncio.Task] = None
         self._balance_task: Optional[asyncio.Task] = None
-        self.balance_callback: Optional[Callable] = None
 
     @property
     def name(self) -> str:
@@ -323,6 +322,15 @@ class HyperliquidAdapter(BaseExchangeAdapter):
 
     async def cancel_orders_batch(self, order_ids: List[str]) -> List[bool]:
         return [await self.cancel_order(oid) for oid in order_ids]
+
+    async def get_open_orders(self, symbol: str) -> List[Order]:
+        """Fetch all open orders for a specific symbol."""
+        return [
+            o
+            for o in self.orders.values()
+            if o.symbol == symbol
+            and o.status in [OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED]
+        ]
 
     async def subscribe_ticker(self, symbol: str):
         asyncio.create_task(self._ticker_stream(symbol))

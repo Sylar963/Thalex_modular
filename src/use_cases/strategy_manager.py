@@ -69,6 +69,7 @@ class MultiExchangeStrategyManager:
 
         self.strategy = strategy
         self.risk_manager = risk_manager
+        self.signal_engine = signal_engine
         self.sync_engine = sync_engine
         self.or_engine = or_engine
         self.storage = storage

@@ -48,11 +48,6 @@ class ThalexAdapter(BaseExchangeAdapter):
         self.client = Thalex(network=self.network)
 
         self.connected = False
-        self.ticker_callback: Optional[Callable] = None
-        self.trade_callback: Optional[Callable] = None
-        self.order_callback: Optional[Callable] = None
-        self.position_callback: Optional[Callable] = None
-        self.balance_callback: Optional[Callable] = None
 
         self.positions: Dict[str, Position] = {}
         self.orders: Dict[str, Order] = {}

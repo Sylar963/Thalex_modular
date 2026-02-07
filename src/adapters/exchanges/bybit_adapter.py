@@ -343,9 +343,6 @@ class BybitAdapter(BaseExchangeAdapter):
             if self.balance_callback:
                 await self.balance_callback(bal)
 
-    def set_balance_callback(self, callback: Callable):
-        self.balance_callback = callback
-
     async def place_order(self, order: Order) -> Order:
         mapped_symbol = InstrumentService.get_exchange_symbol(order.symbol, self.name)
         payload = {
@@ -421,6 +418,16 @@ class BybitAdapter(BaseExchangeAdapter):
 
     async def cancel_orders_batch(self, order_ids: List[str]) -> List[bool]:
         return [await self.cancel_order(oid) for oid in order_ids]
+
+    async def get_open_orders(self, symbol: str) -> List[Order]:
+        """Fetch all open orders for a specific symbol."""
+        # For now return local cache as a stub to satisfy interface
+        return [
+            o
+            for o in self.orders.values()
+            if o.symbol == symbol
+            and o.status in [OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED]
+        ]
 
     async def subscribe_ticker(self, symbol: str):
         """Subscribe to orderbook stream."""
