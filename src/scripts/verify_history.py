@@ -31,15 +31,28 @@ async def verify_history():
     )
 
     try:
-        history = await adapter.get_history(symbol, start, end, resolution="1m")
-        print(f"Returned {len(history)} candles.")
-        if len(history) > 0:
-            print(f"First: {history[0]}")
-            print(f"Last: {history[-1]}")
-        else:
-            print("No history found. Trying BTCUSDT...")
-            history = await adapter.get_history("BTCUSDT", start, end, resolution="1m")
-            print(f"Returned {len(history)} candles for BTCUSDT.")
+        # Test 1: Thalex only
+        print("\n--- Test 1: Venue = thalex ---")
+        history_thalex = await adapter.get_history(
+            symbol, start, end, resolution="1m", exchange="thalex"
+        )
+        print(f"Returned {len(history_thalex)} candles.")
+        if history_thalex:
+            print(f"First: {history_thalex[0]}")
+            print(f"Last: {history_thalex[-1]}")
+
+        # Test 2: ALL
+        print("\n--- Test 2: Venue = all ---")
+        history_all = await adapter.get_history(
+            symbol, start, end, resolution="1m", exchange="all"
+        )
+        print(f"Returned {len(history_all)} candles.")
+        if history_all:
+            print(f"First: {history_all[0]}")
+            print(f"Last: {history_all[-1]}")
+
+        # Comparison
+        print(f"\nDifference in count: {len(history_all) - len(history_thalex)}")
 
     except Exception as e:
         print(f"Error: {e}")

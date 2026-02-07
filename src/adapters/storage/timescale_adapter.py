@@ -566,18 +566,22 @@ class TimescaleDBAdapter(StorageGateway):
             return []
 
     async def get_history(
-        self, symbol: str, start: float, end: float, resolution: str = "1m"
+        self,
+        symbol: str,
+        start: float,
+        end: float,
+        resolution: str = "1m",
+        exchange: str = "thalex",
     ) -> List[Dict]:
         """
         Fetch OHLCV history for a symbol.
-        Hybrid Strategy:
-        1. Attempt to aggregate from 'market_trades' (Standard OHLCV).
-        2. If result is empty, fallback to 'market_tickers' (Last Price Candles).
+        - If exchange='all': Aggregates market_trades (e.g. Bybit) AND market_tickers (e.g. Thalex).
+        - Otherwise: Tries market_trades first, falls back to market_tickers.
         """
         if not self.pool:
             return []
 
-        # rudimentary interval mapping
+        # Interval mapping
         interval_map = {
             "1m": timedelta(minutes=1),
             "5m": timedelta(minutes=5),
@@ -586,84 +590,104 @@ class TimescaleDBAdapter(StorageGateway):
         }
         bucket_interval = interval_map.get(resolution, timedelta(minutes=1))
 
-        try:
+        # Determine Symbols and Exchange Filter
+        symbols = [symbol]
+        is_all = exchange and exchange.lower() == "all"
+
+        if is_all:
+            if "BTC" in symbol:
+                symbols = ["BTC-PERPETUAL", "BTCUSDT", "BTC-PERP"]
+                logger.info(f"Aggregating history for ALL venues: {symbols}")
+
+        # Core Query Builder for Candles
+        async def fetch_candles(table_name: str, price_col: str, vol_col: str):
+            placeholders = ",".join([f"${i + 4}" for i in range(len(symbols))])
+            query = f"""
+                SELECT
+                    time_bucket($1, time) AS bucket,
+                    FIRST({price_col}, time) as open,
+                    MAX({price_col}) as high,
+                    MIN({price_col}) as low,
+                    LAST({price_col}, time) as close,
+                    SUM({vol_col}) as volume
+                FROM {table_name}
+                WHERE symbol IN ({placeholders})
+                  AND time >= to_timestamp($2)
+                  AND time <= to_timestamp($3)
+            """
+            args = [bucket_interval, start, end] + symbols
+
+            # Add exchange filter if not ALL
+            # Note: For market_tickers, we skip exchange filter because legacy data might have NULL/Empty exchange
+            # and symbols like BTC-PERPETUAL are unique enough.
+            if not is_all and table_name == "market_trades":
+                idx = len(args) + 1
+                query += f" AND LOWER(exchange) = LOWER(${idx})"
+                args.append(exchange)
+
+            query += " GROUP BY bucket ORDER BY bucket ASC"
+
             async with self.pool.acquire() as conn:
-                # 1. Try Market Trades
-                trade_rows = await conn.fetch(
-                    """
-                    SELECT
-                        time_bucket($1, time) AS bucket,
-                        FIRST(price, time) as open,
-                        MAX(price) as high,
-                        MIN(price) as low,
-                        LAST(price, time) as close,
-                        SUM(size) as volume
-                    FROM market_trades
-                    WHERE symbol = $2
-                      AND time >= to_timestamp($3)
-                      AND time <= to_timestamp($4)
-                    GROUP BY bucket
-                    ORDER BY bucket ASC
-                    """,
-                    bucket_interval,
-                    symbol,
-                    start,
-                    end,
-                )
+                return await conn.fetch(query, *args)
 
+        try:
+            # 1. Fetch from Market Trades (Ticks/Trades)
+            trade_rows = await fetch_candles("market_trades", "price", "size")
+
+            # 2. Fetch from Market Tickers (Snapshots/Mark Price)
+            # Only needed if is_all=True OR if trade_rows is empty (fallback)
+            ticker_rows = []
+            if is_all or not trade_rows:
+                ticker_rows = await fetch_candles("market_tickers", "last", "volume")
+
+            # 3. Process Results
+            def to_dict(row):
+                return {
+                    "time": row["bucket"].timestamp(),
+                    "open": row["open"],
+                    "high": row["high"],
+                    "low": row["low"],
+                    "close": row["close"],
+                    "volume": float(row["volume"] or 0.0),
+                }
+
+            if not is_all:
+                # Standard Fallback Logic
                 if trade_rows:
-                    logger.info(
-                        f"Fetched {len(trade_rows)} candles from market_trades for {symbol}"
+                    return [to_dict(r) for r in trade_rows]
+                if ticker_rows:
+                    logger.warning(
+                        f"No trades found for {symbol} history. Falling back to market_tickers."
                     )
-                    return [
-                        {
-                            "time": r["bucket"].timestamp(),
-                            "open": r["open"],
-                            "high": r["high"],
-                            "low": r["low"],
-                            "close": r["close"],
-                            "volume": r["volume"] or 0.0,
-                        }
-                        for r in trade_rows
-                    ]
+                    return [to_dict(r) for r in ticker_rows]
+                return []
 
-                # 2. Fallback to Market Tickers
-                logger.warning(
-                    f"No trades found for {symbol} history. Falling back to market_tickers."
-                )
-                ticker_rows = await conn.fetch(
-                    """
-                    SELECT
-                        time_bucket($1, time) AS bucket,
-                        FIRST(last, time) as open,
-                        MAX(last) as high,
-                        MIN(last) as low,
-                        LAST(last, time) as close,
-                        SUM(volume) as volume
-                    FROM market_tickers
-                    WHERE symbol = $2
-                      AND time >= to_timestamp($3)
-                      AND time <= to_timestamp($4)
-                    GROUP BY bucket
-                    ORDER BY bucket ASC
-                    """,
-                    bucket_interval,
-                    symbol,
-                    start,
-                    end,
-                )
+            # 4. Merge Logic for ALL
+            # We need to combine candles by timestamp
+            merged = {}
 
-                return [
-                    {
-                        "time": r["bucket"].timestamp(),
-                        "open": r["open"],
-                        "high": r["high"],
-                        "low": r["low"],
-                        "close": r["close"],
-                        "volume": r["volume"] or 0.0,
-                    }
-                    for r in ticker_rows
-                ]
+            all_rows = list(trade_rows) + list(ticker_rows)
+            for r in all_rows:
+                ts = r["bucket"].timestamp()
+                d = to_dict(r)
+
+                if ts not in merged:
+                    merged[ts] = d
+                else:
+                    # Merge Logic
+                    existing = merged[ts]
+                    existing["volume"] += d["volume"]
+                    existing["high"] = max(existing["high"], d["high"])
+                    existing["low"] = min(existing["low"], d["low"])
+                    existing["open"] = (existing["open"] + d["open"]) / 2
+                    existing["close"] = (existing["close"] + d["close"]) / 2
+
+            # Sort by time
+            sorted_candles = sorted(merged.values(), key=lambda x: x["time"])
+            logger.info(
+                f"Merged {len(trade_rows)} trade candles and {len(ticker_rows)} ticker candles into {len(sorted_candles)} aggregate candles."
+            )
+            return sorted_candles
 
         except Exception as e:
             logger.error(f"Failed to fetch OHLCV history: {e}")
@@ -704,8 +728,17 @@ class TimescaleDBAdapter(StorageGateway):
             return []
         try:
             async with self.pool.acquire() as conn:
-                rows = await conn.fetch(
-                    """
+                # Dynamic Query Construction
+                symbols = [symbol]
+                if exchange and exchange.lower() == "all":
+                    if "BTC" in symbol:
+                        symbols = ["BTC-PERPETUAL", "BTCUSDT", "BTC-PERP"]
+
+                placeholders = ",".join([f"${i + 4}" for i in range(len(symbols))])
+
+                # We need to construct the query parts carefully
+                # Part 1: CTE
+                base_query = f"""
                     WITH trades_numbered AS (
                         SELECT 
                             time,
@@ -714,7 +747,20 @@ class TimescaleDBAdapter(StorageGateway):
                             side,
                             SUM(size) OVER (ORDER BY time) as cumulative_volume
                         FROM market_trades
-                        WHERE symbol = $1 AND LOWER(exchange) = LOWER($4)
+                        WHERE symbol IN ({placeholders})
+                """
+
+                # Build args list. Initial args are [None, volume_threshold, limit] + symbols
+                # We need to align the placeholders.
+                # placeholders use $4, $5 etc. which corresponds to symbols.
+                # So $1 is bucket (unused), $2 is volume_threshold, $3 is limit.
+
+                idx_exchange = len(symbols) + 4
+
+                if exchange and exchange.lower() != "all":
+                    base_query += f" AND LOWER(exchange) = LOWER(${idx_exchange})"
+
+                base_query += """
                         ORDER BY time DESC
                         LIMIT 50000
                     ),
@@ -739,12 +785,30 @@ class TimescaleDBAdapter(StorageGateway):
                     GROUP BY bar_id
                     ORDER BY bar_id DESC
                     LIMIT $3
-                    """,
-                    symbol,
-                    volume_threshold,
-                    limit,
-                    exchange,
-                )
+                """
+
+                # Construct arguments list
+                # Query expects: $1 (unused), $2 (vol_thresh), $3 (limit), $4..$N (symbols), $N+1 (exchange optional)
+                query_args = [None, volume_threshold, limit] + symbols
+                if exchange and exchange.lower() != "all":
+                    query_args.append(exchange)
+
+                rows = await conn.fetch(base_query, *query_args)
+                return [
+                    {
+                        "time": r["end_time"].timestamp(),
+                        "open": r["open"],
+                        "high": r["high"],
+                        "low": r["low"],
+                        "close": r["close"],
+                        "volume": r["volume"],
+                        "trade_count": r["trade_count"],
+                        "buy_volume": r["buy_volume"],
+                        "sell_volume": r["sell_volume"],
+                        "delta": (r["buy_volume"] or 0) - (r["sell_volume"] or 0),
+                    }
+                    for r in rows
+                ]
                 return [
                     {
                         "time": r["end_time"].timestamp(),
@@ -775,8 +839,16 @@ class TimescaleDBAdapter(StorageGateway):
             return []
         try:
             async with self.pool.acquire() as conn:
-                rows = await conn.fetch(
-                    """
+                # Dynamic Query Construction
+                symbols = [symbol]
+                if exchange and exchange.lower() == "all":
+                    if "BTC" in symbol:
+                        symbols = ["BTC-PERPETUAL", "BTCUSDT", "BTC-PERP"]
+
+                placeholders = ",".join([f"${i + 4}" for i in range(len(symbols))])
+
+                # Part 1: CTE
+                base_query = f"""
                     WITH trades_numbered AS (
                         SELECT 
                             time,
@@ -785,7 +857,15 @@ class TimescaleDBAdapter(StorageGateway):
                             side,
                             ROW_NUMBER() OVER (ORDER BY time) as row_num
                         FROM market_trades
-                        WHERE symbol = $1 AND LOWER(exchange) = LOWER($4)
+                        WHERE symbol IN ({placeholders})
+                """
+
+                idx_exchange = len(symbols) + 4
+
+                if exchange and exchange.lower() != "all":
+                    base_query += f" AND LOWER(exchange) = LOWER(${idx_exchange})"
+
+                base_query += """
                         ORDER BY time DESC
                         LIMIT 250000
                     ),
@@ -810,12 +890,15 @@ class TimescaleDBAdapter(StorageGateway):
                     GROUP BY bar_id
                     ORDER BY bar_id DESC
                     LIMIT $3
-                    """,
-                    symbol,
-                    tick_count,
-                    limit,
-                    exchange,
-                )
+                """
+
+                # Construct arguments list
+                # Query expects: $1 (unused), $2 (tick_count), $3 (limit), $4..$N (symbols), $N+1 (exchange optional)
+                query_args = [None, tick_count, limit] + symbols
+                if exchange and exchange.lower() != "all":
+                    query_args.append(exchange)
+
+                rows = await conn.fetch(base_query, *query_args)
                 return [
                     {
                         "time": r["end_time"].timestamp(),

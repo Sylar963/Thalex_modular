@@ -29,13 +29,20 @@ class MarketRepository(BaseRepository):
         return await self.storage.get_recent_tickers(symbol, limit)
 
     async def get_history(
-        self, symbol: str, start: float, end: float, resolution: str
+        self,
+        symbol: str,
+        start: float,
+        end: float,
+        resolution: str,
+        exchange: str = "thalex",
     ) -> List[Dict]:
         if not self.storage:
             return []
         # Assuming the storage adapter has this extended method (we added it)
         if hasattr(self.storage, "get_history"):
-            return await self.storage.get_history(symbol, start, end, resolution)
+            return await self.storage.get_history(
+                symbol, start, end, resolution, exchange
+            )
         return []
 
     async def get_regime_history(
@@ -82,7 +89,7 @@ class MarketRepository(BaseRepository):
             )
         return []
 
-    async def get_open_range_levels(self) -> Dict:
+    async def get_open_range_levels(self, symbol: str) -> Dict:
         if hasattr(self, "_or_engine") and self._or_engine:
             return self._or_engine.get_chart_levels()
         return {

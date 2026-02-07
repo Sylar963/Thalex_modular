@@ -19,10 +19,11 @@ async def get_history(
     start: float,
     end: float,
     resolution: str = "1m",
+    venue: str = "thalex",
     repo: MarketRepository = Depends(get_market_repo),
 ):
     """OHLCV / IV History for charting."""
-    return await repo.get_history(symbol, start, end, resolution)
+    return await repo.get_history(symbol, start, end, resolution, venue)
 
 
 @router.get("/ticker/{symbol}", response_model=List[Dict])
@@ -84,8 +85,12 @@ async def get_signal_history(
 
 
 @router.get("/signals/open-range/levels", response_model=Dict)
-async def get_open_range_levels(repo: MarketRepository = Depends(get_market_repo)):
-    return await repo.get_open_range_levels()
+async def get_open_range_levels(
+    symbol: str,
+    venue: str = "thalex",
+    repo: MarketRepository = Depends(get_market_repo),
+):
+    return await repo.get_open_range_levels(symbol)
 
 
 from pydantic import BaseModel
