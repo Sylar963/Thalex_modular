@@ -87,6 +87,18 @@ class HistoricalOptionsLoader:
         }
         return await self._fetch_list("public/mark_price_historical_data", params)
 
+    async def get_perpetual_history(self, start_ts: int, end_ts: int) -> List:
+        """Fetch historical data for BTC-PERPETUAL."""
+        return await self._fetch_list(
+            "public/mark_price_historical_data",
+            {
+                "instrument_name": "BTC-PERPETUAL",
+                "from": start_ts,
+                "to": end_ts,
+                "resolution": "1m",
+            },
+        )
+
     def _generate_expirations(
         self, start_date: datetime, end_date: datetime
     ) -> List[datetime]:
@@ -134,8 +146,8 @@ class HistoricalOptionsLoader:
         execute_batch(
             cursor,
             """
-            INSERT INTO market_tickers (time, symbol, bid, ask, last, volume)
-            VALUES (%s, %s, %s, %s, %s, 0)
+            INSERT INTO market_tickers (time, symbol, exchange, bid, ask, last, volume)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT DO NOTHING
             """,
             tickers,
@@ -162,12 +174,14 @@ class HistoricalOptionsLoader:
 
                 logger.info(f"Processing chunk: {current_start} to {current_end}")
 
-                # 1. Fetch Index History for chunk
+                # 1. Fetch Index History (for Options metrics)
                 index_history = await self.get_index_history("BTCUSD", start_ts, end_ts)
-                if not index_history:
-                    logger.warning(
-                        f"No index history for chunk {current_start}. Skipping."
-                    )
+
+                # 2. Fetch Perpetual History (for direct insertion)
+                perp_history = await self.get_perpetual_history(start_ts, end_ts)
+
+                if not index_history and not perp_history:
+                    logger.warning(f"No data for chunk {current_start}. Skipping.")
                     current_start += chunk_size
                     continue
 
@@ -175,7 +189,7 @@ class HistoricalOptionsLoader:
                     current_start, current_end + timedelta(days=60)
                 )
 
-                # 2. Identify unique pairs needed for this chunk
+                # 3. Identify unique pairs needed for Option Metrics
                 unique_pairs = set()
                 index_map = {}  # ts -> price
 
@@ -205,7 +219,7 @@ class HistoricalOptionsLoader:
 
                 logger.info(f"Chunk needs {len(unique_pairs)} instrument pairs.")
 
-                # 3. Fetch Instrument History concurrently
+                # 4. Fetch Instrument History concurrently
                 instrument_data = {}
 
                 tasks = []
@@ -239,10 +253,11 @@ class HistoricalOptionsLoader:
                         )
                         instrument_data[name] = data_map
 
-                # 4. Correlate and Prepare Batch Inserts
+                # 5. Prepare Batch Inserts
                 metrics_to_insert = []
                 tickers_to_insert = []
 
+                # A. Options Metrics
                 for ts, price in index_map.items():
                     current_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
 
@@ -293,15 +308,29 @@ class HistoricalOptionsLoader:
                             )
                         )
 
-                        tickers_to_insert.append(
-                            (
-                                datetime.fromtimestamp(ts, tz=timezone.utc),
-                                "BTC-PERP",
-                                price - 0.5,
-                                price + 0.5,
-                                price,
+                # B. Perpetual Tickers (REAL API DATA)
+                if perp_history:
+                    for point in perp_history:
+                        if isinstance(point, list):
+                            # [time, open, high, low, close, vol, (meta?)]
+                            ts = point[0]
+                            close_price = float(point[4])
+
+                            # Use close price for bid/ask/last proxy to maintain history visual
+                            # Note: Real bid/ask might be in metadata but API strictness varies.
+                            # We stick to robust Close price.
+
+                            tickers_to_insert.append(
+                                (
+                                    datetime.fromtimestamp(ts, tz=timezone.utc),
+                                    "BTC-PERPETUAL",
+                                    "thalex",
+                                    close_price,  # bid proxy
+                                    close_price,  # ask proxy
+                                    close_price,  # last
+                                    0,  # volume (market_tickers volume usually from trades, keeping 0 for now as it's mark price)
+                                )
                             )
-                        )
 
                 # Batch Insert
                 self.batch_insert_metrics(metrics_to_insert)

@@ -574,14 +574,15 @@ class TimescaleDBAdapter(StorageGateway):
         exchange: str = "thalex",
     ) -> List[Dict]:
         """
-        Fetch OHLCV history for a symbol.
-        - If exchange='all': Aggregates market_trades (e.g. Bybit) AND market_tickers (e.g. Thalex).
-        - Otherwise: Tries market_trades first, falls back to market_tickers.
+        Fetch OHLCV history for a symbol with Universal Aggregation.
+        - Maps symbol to all venue aliases (e.g. BTCUSDT, BTC-PERP).
+        - Fetches from BOTH market_trades (Recent) and market_tickers (Backfill).
+        - Aggregates for 'all', Unions for specific venue.
         """
         if not self.pool:
             return []
 
-        # Interval mapping
+        # 1. Interval mapping
         interval_map = {
             "1m": timedelta(minutes=1),
             "5m": timedelta(minutes=5),
@@ -590,13 +591,15 @@ class TimescaleDBAdapter(StorageGateway):
         }
         bucket_interval = interval_map.get(resolution, timedelta(minutes=1))
 
-        # Determine Symbols and Exchange Filter
+        # 2. Universal Symbol Mapping
         symbols = [symbol]
         is_all = exchange and exchange.lower() == "all"
+        is_btc = "BTC" in symbol.upper()
 
-        if is_all:
-            if "BTC" in symbol:
-                symbols = ["BTC-PERPETUAL", "BTCUSDT", "BTC-PERP"]
+        if is_all or is_btc:
+            # Expand to all known aliases to ensure we catch data from all venues
+            symbols = list(set([symbol, "BTC-PERPETUAL", "BTCUSDT", "BTC-PERP"]))
+            if is_all:
                 logger.info(f"Aggregating history for ALL venues: {symbols}")
 
         # Core Query Builder for Candles
@@ -617,13 +620,12 @@ class TimescaleDBAdapter(StorageGateway):
             """
             args = [bucket_interval, start, end] + symbols
 
-            # Add exchange filter if not ALL
-            # Note: For market_tickers, we skip exchange filter because legacy data might have NULL/Empty exchange
-            # and symbols like BTC-PERPETUAL are unique enough.
+            # Filter by exchange if not ALL
+            # Note: For market_tickers, we are lenient because legacy data might have NULL/Empty exchange
             if not is_all and table_name == "market_trades":
                 idx = len(args) + 1
                 query += f" AND LOWER(exchange) = LOWER(${idx})"
-                args.append(exchange)
+                args.append(exchange.lower())
 
             query += " GROUP BY bucket ORDER BY bucket ASC"
 
@@ -631,66 +633,58 @@ class TimescaleDBAdapter(StorageGateway):
                 return await conn.fetch(query, *args)
 
         try:
-            # 1. Fetch from Market Trades (Ticks/Trades)
+            # 4. Fetch from both sources
             trade_rows = await fetch_candles("market_trades", "price", "size")
+            ticker_rows = await fetch_candles("market_tickers", "last", "volume")
 
-            # 2. Fetch from Market Tickers (Snapshots/Mark Price)
-            # Only needed if is_all=True OR if trade_rows is empty (fallback)
-            ticker_rows = []
-            if is_all or not trade_rows:
-                ticker_rows = await fetch_candles("market_tickers", "last", "volume")
-
-            # 3. Process Results
-            def to_dict(row):
-                return {
-                    "time": row["bucket"].timestamp(),
-                    "open": row["open"],
-                    "high": row["high"],
-                    "low": row["low"],
-                    "close": row["close"],
-                    "volume": float(row["volume"] or 0.0),
-                }
-
-            if not is_all:
-                # Standard Fallback Logic
-                if trade_rows:
-                    return [to_dict(r) for r in trade_rows]
-                if ticker_rows:
-                    logger.warning(
-                        f"No trades found for {symbol} history. Falling back to market_tickers."
-                    )
-                    return [to_dict(r) for r in ticker_rows]
-                return []
-
-            # 4. Merge Logic for ALL
-            # We need to combine candles by timestamp
+            # 5. Merge Logic
             merged = {}
 
-            all_rows = list(trade_rows) + list(ticker_rows)
-            for r in all_rows:
-                ts = r["bucket"].timestamp()
-                d = to_dict(r)
+            def process_rows(rows, source_name):
+                for r in rows:
+                    t = r["bucket"].timestamp()
+                    data = {
+                        "time": t,
+                        "open": float(r["open"]),
+                        "high": float(r["high"]),
+                        "low": float(r["low"]),
+                        "close": float(r["close"]),
+                        "volume": float(r["volume"] or 0),
+                    }
 
-                if ts not in merged:
-                    merged[ts] = d
-                else:
-                    # Merge Logic
-                    existing = merged[ts]
-                    existing["volume"] += d["volume"]
-                    existing["high"] = max(existing["high"], d["high"])
-                    existing["low"] = min(existing["low"], d["low"])
-                    existing["open"] = (existing["open"] + d["open"]) / 2
-                    existing["close"] = (existing["close"] + d["close"]) / 2
+                    if t not in merged:
+                        merged[t] = data
+                    else:
+                        existing = merged[t]
+                        if is_all:
+                            # Aggregation Logic: SUM volumes, MAX High, MIN Low
+                            existing["volume"] += data["volume"]
+                            existing["high"] = max(existing["high"], data["high"])
+                            existing["low"] = min(existing["low"], data["low"])
+                            # For Open/Close in 'all', we take the one with higher volume as a proxy
+                            if data["volume"] > existing["volume"] * 0.5:
+                                existing["open"] = data["open"]
+                                existing["close"] = data["close"]
+                        else:
+                            # Specific Venue Logic: Prefer Ticks (trade_rows) over Snapshots (ticker_rows)
+                            if source_name == "trades":
+                                merged[t] = data
 
-            # Sort by time
-            sorted_candles = sorted(merged.values(), key=lambda x: x["time"])
-            logger.info(
-                f"Merged {len(trade_rows)} trade candles and {len(ticker_rows)} ticker candles into {len(sorted_candles)} aggregate candles."
-            )
-            return sorted_candles
+            process_rows(ticker_rows, "tickers")
+            process_rows(trade_rows, "trades")
+
+            # 6. Sort and Return
+            final_history = sorted(merged.values(), key=lambda x: x["time"])
+
+            if not final_history:
+                logger.warning(
+                    f"No history found for {symbol} ({exchange}) from {start} to {end}"
+                )
+
+            return final_history
 
         except Exception as e:
-            logger.error(f"Failed to fetch OHLCV history: {e}")
+            logger.error(f"Failed standard history fetch for {symbol}: {e}")
             return []
 
     async def get_regime_history(
@@ -730,13 +724,15 @@ class TimescaleDBAdapter(StorageGateway):
             async with self.pool.acquire() as conn:
                 # Dynamic Query Construction
                 symbols = [symbol]
-                if exchange and exchange.lower() == "all":
+                is_all = exchange and exchange.lower() == "all"
+                is_bybit = exchange and exchange.lower() == "bybit"
+
+                if is_all or is_bybit:
                     if "BTC" in symbol:
                         symbols = ["BTC-PERPETUAL", "BTCUSDT", "BTC-PERP"]
 
-                placeholders = ",".join([f"${i + 4}" for i in range(len(symbols))])
+                placeholders = ",".join([f"${i + 3}" for i in range(len(symbols))])
 
-                # We need to construct the query parts carefully
                 # Part 1: CTE
                 base_query = f"""
                     WITH trades_numbered AS (
@@ -750,14 +746,9 @@ class TimescaleDBAdapter(StorageGateway):
                         WHERE symbol IN ({placeholders})
                 """
 
-                # Build args list. Initial args are [None, volume_threshold, limit] + symbols
-                # We need to align the placeholders.
-                # placeholders use $4, $5 etc. which corresponds to symbols.
-                # So $1 is bucket (unused), $2 is volume_threshold, $3 is limit.
+                idx_exchange = len(symbols) + 3
 
-                idx_exchange = len(symbols) + 4
-
-                if exchange and exchange.lower() != "all":
+                if not is_all:
                     base_query += f" AND LOWER(exchange) = LOWER(${idx_exchange})"
 
                 base_query += """
@@ -766,7 +757,7 @@ class TimescaleDBAdapter(StorageGateway):
                     ),
                     trades_with_bar_id AS (
                         SELECT *,
-                            FLOOR(cumulative_volume / $2) as bar_id
+                            FLOOR(cumulative_volume / $1) as bar_id
                         FROM trades_numbered
                     )
                     SELECT 
@@ -784,13 +775,13 @@ class TimescaleDBAdapter(StorageGateway):
                     FROM trades_with_bar_id
                     GROUP BY bar_id
                     ORDER BY bar_id DESC
-                    LIMIT $3
+                    LIMIT $2
                 """
 
                 # Construct arguments list
-                # Query expects: $1 (unused), $2 (vol_thresh), $3 (limit), $4..$N (symbols), $N+1 (exchange optional)
-                query_args = [None, volume_threshold, limit] + symbols
-                if exchange and exchange.lower() != "all":
+                # Query expects: $1 (vol_thresh), $2 (limit), $3..$N (symbols), $N+1 (exchange optional)
+                query_args = [volume_threshold, limit] + symbols
+                if not is_all:
                     query_args.append(exchange)
 
                 rows = await conn.fetch(base_query, *query_args)
@@ -801,26 +792,12 @@ class TimescaleDBAdapter(StorageGateway):
                         "high": r["high"],
                         "low": r["low"],
                         "close": r["close"],
-                        "volume": r["volume"],
+                        "volume": float(r["volume"] or 0.0),
                         "trade_count": r["trade_count"],
-                        "buy_volume": r["buy_volume"],
-                        "sell_volume": r["sell_volume"],
-                        "delta": (r["buy_volume"] or 0) - (r["sell_volume"] or 0),
-                    }
-                    for r in rows
-                ]
-                return [
-                    {
-                        "time": r["end_time"].timestamp(),
-                        "open": r["open"],
-                        "high": r["high"],
-                        "low": r["low"],
-                        "close": r["close"],
-                        "volume": r["volume"],
-                        "trade_count": r["trade_count"],
-                        "buy_volume": r["buy_volume"],
-                        "sell_volume": r["sell_volume"],
-                        "delta": (r["buy_volume"] or 0) - (r["sell_volume"] or 0),
+                        "buy_volume": float(r["buy_volume"] or 0.0),
+                        "sell_volume": float(r["sell_volume"] or 0.0),
+                        "delta": (float(r["buy_volume"] or 0.0))
+                        - (float(r["sell_volume"] or 0.0)),
                     }
                     for r in rows
                 ]
@@ -841,11 +818,14 @@ class TimescaleDBAdapter(StorageGateway):
             async with self.pool.acquire() as conn:
                 # Dynamic Query Construction
                 symbols = [symbol]
-                if exchange and exchange.lower() == "all":
+                is_all = exchange and exchange.lower() == "all"
+                is_bybit = exchange and exchange.lower() == "bybit"
+
+                if is_all or is_bybit:
                     if "BTC" in symbol:
                         symbols = ["BTC-PERPETUAL", "BTCUSDT", "BTC-PERP"]
 
-                placeholders = ",".join([f"${i + 4}" for i in range(len(symbols))])
+                placeholders = ",".join([f"${i + 3}" for i in range(len(symbols))])
 
                 # Part 1: CTE
                 base_query = f"""
@@ -860,9 +840,9 @@ class TimescaleDBAdapter(StorageGateway):
                         WHERE symbol IN ({placeholders})
                 """
 
-                idx_exchange = len(symbols) + 4
+                idx_exchange = len(symbols) + 3
 
-                if exchange and exchange.lower() != "all":
+                if not is_all:
                     base_query += f" AND LOWER(exchange) = LOWER(${idx_exchange})"
 
                 base_query += """
@@ -871,7 +851,7 @@ class TimescaleDBAdapter(StorageGateway):
                     ),
                     trades_with_bar_id AS (
                         SELECT *,
-                            FLOOR((row_num - 1) / $2) as bar_id
+                            FLOOR((row_num - 1) / $1) as bar_id
                         FROM trades_numbered
                     )
                     SELECT 
@@ -889,13 +869,13 @@ class TimescaleDBAdapter(StorageGateway):
                     FROM trades_with_bar_id
                     GROUP BY bar_id
                     ORDER BY bar_id DESC
-                    LIMIT $3
+                    LIMIT $2
                 """
 
                 # Construct arguments list
-                # Query expects: $1 (unused), $2 (tick_count), $3 (limit), $4..$N (symbols), $N+1 (exchange optional)
-                query_args = [None, tick_count, limit] + symbols
-                if exchange and exchange.lower() != "all":
+                # Query expects: $1 (tick_count), $2 (limit), $3..$N (symbols), $N+1 (exchange optional)
+                query_args = [tick_count, limit] + symbols
+                if not is_all:
                     query_args.append(exchange)
 
                 rows = await conn.fetch(base_query, *query_args)
@@ -906,11 +886,12 @@ class TimescaleDBAdapter(StorageGateway):
                         "high": r["high"],
                         "low": r["low"],
                         "close": r["close"],
-                        "volume": r["volume"],
+                        "volume": float(r["volume"] or 0.0),
                         "trade_count": r["trade_count"],
-                        "buy_volume": r["buy_volume"],
-                        "sell_volume": r["sell_volume"],
-                        "delta": (r["buy_volume"] or 0) - (r["sell_volume"] or 0),
+                        "buy_volume": float(r["buy_volume"] or 0.0),
+                        "sell_volume": float(r["sell_volume"] or 0.0),
+                        "delta": (float(r["buy_volume"] or 0.0))
+                        - (float(r["sell_volume"] or 0.0)),
                     }
                     for r in rows
                 ]

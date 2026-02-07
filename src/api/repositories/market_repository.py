@@ -91,7 +91,7 @@ class MarketRepository(BaseRepository):
 
     async def get_open_range_levels(self, symbol: str) -> Dict:
         if hasattr(self, "_or_engine") and self._or_engine:
-            return self._or_engine.get_chart_levels()
+            return self._or_engine.get_chart_levels(symbol)
         return {
             "orh": None,
             "orl": None,

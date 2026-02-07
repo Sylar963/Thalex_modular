@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import signal
+import time
 from typing import List, Dict
 
 from ..adapters.storage.timescale_adapter import TimescaleDBAdapter
@@ -127,8 +128,77 @@ class MarketFeedService:
         # Adapters run in background
         logger.info("MarketFeedService started.")
 
+        # Warmup Signal Engine
+        if self.or_engine:
+            asyncio.create_task(self._warmup_engine())
+
+        self.loop_task = asyncio.create_task(self._run_loop())
+
+    async def _warmup_engine(self):
+        """Load historical data to prime the engine."""
+        try:
+            # Since MarketFeedService has self.storage (TimescaleDBAdapter), we can use it.
+            # Fetch last 24h
+            end = time.time()
+            start = end - 86400
+
+            # Which symbol? iterating all enabled.
+            # For now hardcoded or primary
+            symbol = os.getenv("TRADING_SYMBOL", "BTC-PERPETUAL")
+
+            # logger.info(f"Fetching history for {symbol} warmup...")
+            history = await self.storage.get_history(
+                symbol, start, end, resolution="1m"
+            )
+            if not history:
+                logger.warning(f"No history found for {symbol} warmup.")
+                return
+
+            logger.info(
+                f"Warming up OR Engine with {len(history)} candles for {symbol}"
+            )
+
+            for candle in history:
+                # Ensure we have floats and timestamp
+                # TimescaleDB usually returns dict with 'time' as datetime or valid string
+                ts = (
+                    candle["time"].timestamp()
+                    if hasattr(candle["time"], "timestamp")
+                    else candle["time"]
+                )
+
+                # If ts is datetime string, we might need parsing, but adapter should handle it.
+                # Assuming adapter returns proper python objects.
+
+                self.or_engine.update_candle(
+                    symbol=symbol,
+                    timestamp=float(ts),
+                    open_=float(candle["open"]),
+                    high=float(candle["high"]),
+                    low=float(candle["low"]),
+                    close=float(candle["close"]),
+                )
+
+            logger.info(
+                f"Warmup complete. ORB Levels: {self.or_engine.get_chart_levels(symbol)}"
+            )
+
+        except Exception as e:
+            logger.error(f"Warmup failed: {e}")
+
+    async def _run_loop(self):
+        while self.running:
+            await asyncio.sleep(1)
+
     async def stop(self):
         self.running = False
+        if hasattr(self, "loop_task"):
+            self.loop_task.cancel()
+            try:
+                await self.loop_task
+            except asyncio.CancelledError:
+                pass
+
         logger.info("Stopping MarketFeedService...")
         for adapter in self.adapters:
             await adapter.disconnect()
