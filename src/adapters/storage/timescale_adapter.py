@@ -62,6 +62,17 @@ class TimescaleDBAdapter(StorageGateway):
                         f"Hypertable creation skipped (might be standard Postgres): {e}"
                     )
 
+                # Uniqueness for Idempotency (Time + Symbol + Exchange)
+                try:
+                    await conn.execute("""
+                        CREATE UNIQUE INDEX IF NOT EXISTS market_tickers_time_symbol_exchange_idx 
+                        ON market_tickers (time, symbol, exchange);
+                    """)
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to create unique index on market_tickers: {e}"
+                    )
+
                 # 2. Trades Table
                 await conn.execute("""
                     CREATE TABLE IF NOT EXISTS market_trades (
@@ -393,12 +404,21 @@ class TimescaleDBAdapter(StorageGateway):
     async def save_ticker(self, ticker: Ticker):
         if not self.pool:
             return
+
+    async def save_ticker(self, ticker: Ticker):
+        if not self.pool:
+            return
         try:
             async with self.pool.acquire() as conn:
                 await conn.execute(
                     """
                     INSERT INTO market_tickers (time, symbol, exchange, bid, ask, last, volume)
                     VALUES (to_timestamp($1), $2, $3, $4, $5, $6, $7)
+                    ON CONFLICT (time, symbol, exchange) DO UPDATE SET
+                        bid = EXCLUDED.bid,
+                        ask = EXCLUDED.ask,
+                        last = EXCLUDED.last,
+                        volume = EXCLUDED.volume
                     """,
                     ticker.timestamp,
                     ticker.symbol,

@@ -42,6 +42,11 @@ class ExchangeGateway(ABC):
         pass
 
     @abstractmethod
+    async def get_open_orders(self, symbol: str) -> List[Order]:
+        """Fetch all open orders for a specific symbol."""
+        pass
+
+    @abstractmethod
     async def subscribe_ticker(self, symbol: str):
         """Subscribe to ticker updates for a symbol."""
         pass
@@ -213,4 +218,27 @@ class StorageGateway(ABC):
     @abstractmethod
     async def get_latest_balances(self) -> List[Any]:
         """Retrieve latest balances for all exchanges."""
+        pass
+
+
+class SafetyComponent(ABC):
+    """Abstract interface for safety plugins."""
+
+    @abstractmethod
+    def check_health(self, context: Dict[str, Any]) -> bool:
+        """
+        Check if the component allows trading to proceed.
+        Returns True if healthy, False if trading should stop.
+        Context dictionary provides necessary data (e.g., timestamps, prices).
+        """
+        pass
+
+    @abstractmethod
+    def record_failure(self) -> None:
+        """Record a failure event (e.g., API error, latency breach)."""
+        pass
+
+    @abstractmethod
+    def record_success(self) -> None:
+        """Record a success event (e.g., successful cycle)."""
         pass

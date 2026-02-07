@@ -540,6 +540,69 @@ class ThalexAdapter(BaseExchangeAdapter):
             logger.error(f"Failed to cancel all orders: {e}")
             return False
 
+    async def get_open_orders(self, symbol: str) -> List[Order]:
+        if not self.connected:
+            return []
+
+        try:
+            # Thalex API: private/get_open_orders
+            # params: { "instrument_name": symbol }
+            response = await self._rpc_request(
+                self.client.get_open_orders, instrument_name=symbol
+            )
+
+            if "result" in response:
+                orders_data = response["result"]
+                mapped_orders = []
+                for o_data in orders_data:
+                    # Map to Order entity
+                    # Thalex format:
+                    # {
+                    #   "order_id": ...,
+                    #   "instrument_name": ...,
+                    #   "direction": "buy"|"sell",
+                    #   "amount": ...,
+                    #   "price": ...,
+                    #   "label": ...,
+                    #   "status": ...
+                    # }
+
+                    # Safe float parsing
+                    price = self._safe_float(o_data.get("price"))
+                    size = self._safe_float(o_data.get("amount"))
+                    filled = self._safe_float(o_data.get("amount_filled"))
+
+                    side = (
+                        OrderSide.BUY
+                        if o_data.get("direction") == "buy"
+                        else OrderSide.SELL
+                    )
+                    exchange_id = str(o_data.get("order_id", ""))
+                    label = str(o_data.get("label", ""))
+
+                    # status mapping if needed, but get_open_orders implies OPEN or PARTIALLY_FILLED
+
+                    mapped_orders.append(
+                        Order(
+                            id=label
+                            if label
+                            else f"EXT_{exchange_id}",  # Use label as ID if available
+                            symbol=symbol,
+                            side=side,
+                            price=price,
+                            size=size,
+                            type=OrderType.LIMIT,  # Assumption for now, could be MARKET
+                            status=OrderStatus.OPEN,
+                            exchange_id=exchange_id,
+                            timestamp=time.time(),  # Approximation
+                        )
+                    )
+                return mapped_orders
+            return []
+        except Exception as e:
+            logger.error(f"Failed to fetch open orders: {e}")
+            return []
+
     async def get_position(self, symbol: str) -> Position:
         return self.positions.get(symbol, Position(symbol, 0.0, 0.0))
 

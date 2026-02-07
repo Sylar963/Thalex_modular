@@ -211,6 +211,7 @@ async def main():
 
         # Use shared factory to create exchange configurations
         exchange_configs = ConfigFactory.create_exchange_configs(bot_config)
+        safety_components = ConfigFactory.create_safety_components(bot_config)
 
         for cfg in exchange_configs:
             logger.info(f"Configured {cfg.gateway.name} for {cfg.symbol}")
@@ -222,7 +223,9 @@ async def main():
             risk_manager=risk_manager,
             sync_engine=sync_engine,
             signal_engine=signal_engine,
+            signal_engine=signal_engine,
             storage=storage,
+            safety_components=safety_components,
             dry_run=dry_run,
         )
 
