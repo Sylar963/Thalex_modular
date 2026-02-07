@@ -3,8 +3,13 @@
 All notable changes to this project will be documented in this file.
 
 ## [Current State] - 2026-02-06
+### Features
+- **Live Simulation Framework (Forward Testing)**:
+    - Implemented `LiveSimulationRunner` within `SimStateManager` to conduct "paper trading" simulations using live market data.
+    - Integrated `TimescaleHistoryProvider` as a fallback for historical data but prioritized live ticker feeds for forward testing.
+    - Added `bot_executions` persistence with `exchange='sim_shadow'` to strictly separate mock fills from real trading activity.
+    - Exposed API endpoints (`/api/v1/simulation/live/start`, `/status`, `/stop`) to control the simulation lifecycle remotely.
 
-### Architectural Improvements
 - **Decoupled Data Ingestion**: Separated the "Charting/Market Data" feed from the "Trading Engine" (Quoting).
     - Introduced `DataIngestionService` (`src/services/data_ingestor.py`) to handle public data streams independently of the bot's trading status.
     - Added `data_ingestion` block to `config.json` for managing a "Watchlist" of symbols to ingest (e.g., `ETHUSDT` for charting only).

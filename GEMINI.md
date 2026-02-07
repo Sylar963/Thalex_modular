@@ -77,6 +77,9 @@ The system leverages TimescaleDB as a "Single Source of Truth":
 - **Port Consistency**: Standardized on port `5432` for TimescaleDB across all services, removing the legacy `5433` fallback which caused confusion between local and containerized setups.
 - **FastAPI Dependency Injection**: Always call `load_dotenv()` in `main.py` before any repository initializations to ensure DB parameters are hydrated.
 - **Screen Session Strategy**: Use `screen -S <name>` for long-running bot instances to ensure persistence through SSH disconnects.
+- **Process Isolation (API vs Bot)**: The API server (`src/api/main.py`) and the Trading Bot (`src/main.py`) are separate processes. Shared services like `MarketFeed` must be initialized in *both* if they need to operate in both contexts (or preferably in the API for data serving).
+    - *Pitfall*: Running `src/main.py` when intending to start the API caused a confusion in service wiring.
+- **Service Injection**: `SimStateManager` needs access to the *active* data stream. Wiring it into `market_feed.py` is useless if the API uses `data_ingestor.py`. Check `dependencies.py` to confirm which service is actually being instantiated.
 
 ---
 *This document is a living record of project directives and should be updated as the roadmap evolves.*
