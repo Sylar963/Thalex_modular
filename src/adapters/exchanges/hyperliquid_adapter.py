@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any, Callable
 from dataclasses import replace
 
 try:
@@ -23,6 +23,7 @@ from ...domain.entities import (
     Position,
     Ticker,
     Trade,
+    Balance,
 )
 
 logger = logging.getLogger(__name__)
@@ -117,8 +118,11 @@ class HyperliquidAdapter(BaseExchangeAdapter):
 
     async def _fetch_meta(self):
         url = f"{self.base_url}/info"
-        async with self.session.post(url, json={"type": "meta"}) as resp:
-            self.meta = await resp.json()
+        async with self.session.post(
+            url, data=self._fast_json_encode({"type": "meta"})
+        ) as resp:
+            # Hyperliquid returns JSON, but we use our fast decoder on text/bytes
+            self.meta = self._fast_json_decode(await resp.read())
 
     def _get_asset_index(self, symbol: str) -> int:
         universe = self.meta.get("universe", [])
@@ -132,15 +136,23 @@ class HyperliquidAdapter(BaseExchangeAdapter):
             "method": "subscribe",
             "subscription": {"type": "userEvents", "user": self.address},
         }
-        await self.ws.send_json(sub_msg)
+        await self.ws.send_str(self._fast_json_encode(sub_msg))
 
     async def _msg_loop(self):
         while self.connected and self.ws:
             try:
-                msg = await asyncio.wait_for(self.ws.receive_json(), timeout=5.0)
-                if not msg:
-                    continue
-                await self._handle_message(msg)
+                # Use receive() to get raw message, then decode fast
+                msg_raw = await asyncio.wait_for(self.ws.receive(), timeout=5.0)
+                if msg_raw.type == aiohttp.WSMsgType.TEXT:
+                    msg = self._fast_json_decode(msg_raw.data)
+                    await self._handle_message(msg)
+                elif msg_raw.type == aiohttp.WSMsgType.BINARY:
+                    msg = self._fast_json_decode(msg_raw.data)
+                    await self._handle_message(msg)
+                elif msg_raw.type == aiohttp.WSMsgType.CLOSED:
+                    break
+                elif msg_raw.type == aiohttp.WSMsgType.ERROR:
+                    break
             except asyncio.TimeoutError:
                 continue
             except asyncio.CancelledError:
@@ -326,14 +338,39 @@ class HyperliquidAdapter(BaseExchangeAdapter):
             "method": "subscribe",
             "subscription": {"type": "l2Book", "coin": mapped_symbol},
         }
-        await self.ws.send_json(sub_msg)
+        await self.ws.send_str(self._fast_json_encode(sub_msg))
+
+    async def get_balances(self) -> List[Balance]:
+        url = f"{self.base_url}/info"
+        async with self.session.post(
+            url,
+            data=self._fast_json_encode({"type": "userState", "user": self.address}),
+        ) as resp:
+            data = self._fast_json_decode(await resp.read())
+            margin_summary = data.get("marginSummary", {})
+            account_value = float(margin_summary.get("accountValue", 0.0))
+            total_margin_used = float(margin_summary.get("totalMarginUsed", 0.0))
+            withdrawable = float(data.get("withdrawable", 0.0))
+
+            from ...domain.entities import Balance
+
+            bal = Balance(
+                exchange=self.name,
+                asset="USDC",
+                total=account_value,
+                available=withdrawable,
+                margin_used=total_margin_used,
+                equity=account_value,
+            )
+            return [bal]
 
     async def get_position(self, symbol: str) -> Position:
         url = f"{self.base_url}/info"
         async with self.session.post(
-            url, json={"type": "userState", "user": self.address}
+            url,
+            data=self._fast_json_encode({"type": "userState", "user": self.address}),
         ) as resp:
-            data = await resp.json()
+            data = self._fast_json_decode(await resp.read())
             for pos in data.get("assetPositions", []):
                 p = pos.get("position", {})
                 if p.get("coin") == symbol:
@@ -347,9 +384,12 @@ class HyperliquidAdapter(BaseExchangeAdapter):
             try:
                 url = f"{self.base_url}/info"
                 async with self.session.post(
-                    url, json={"type": "userState", "user": self.address}
+                    url,
+                    data=self._fast_json_encode(
+                        {"type": "userState", "user": self.address}
+                    ),
                 ) as resp:
-                    data = await resp.json()
+                    data = self._fast_json_decode(await resp.read())
                     margin_summary = data.get("marginSummary", {})
                     account_value = float(margin_summary.get("accountValue", 0.0))
                     total_margin_used = float(

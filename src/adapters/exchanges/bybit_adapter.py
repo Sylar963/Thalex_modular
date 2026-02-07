@@ -395,6 +395,8 @@ class BybitAdapter(BaseExchangeAdapter):
         if not order:
             return False
 
+        mapped_symbol = InstrumentService.get_exchange_symbol(order.symbol, self.name)
+        payload = {"category": "linear", "symbol": mapped_symbol, "orderId": order_id}
         payload_str = self._fast_json_encode(payload)
 
         url = f"{self.base_url}/v5/order/cancel"

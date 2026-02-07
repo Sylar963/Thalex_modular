@@ -20,6 +20,14 @@ from .v1.endpoints import market, portfolio, simulation, config, aggregated, sig
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Optimisation: Use uvloop for faster event loop
+    try:
+        import uvloop
+
+        uvloop.install()
+    except ImportError:
+        pass
+
     # Startup
     await init_dependencies()
     yield
