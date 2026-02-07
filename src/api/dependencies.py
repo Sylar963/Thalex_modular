@@ -1,6 +1,6 @@
 import os
 from typing import Optional
-from fastapi import Request
+from dotenv import load_dotenv
 from .repositories import (
     MarketRepository,
     PortfolioRepository,
@@ -8,18 +8,16 @@ from .repositories import (
     ConfigRepository,
 )
 from ..adapters.storage.timescale_adapter import TimescaleDBAdapter
+from src.services.market_feed import MarketFeedService
 
 
 # Singleton instance holder
 class GlobalState:
     db_adapter: Optional[TimescaleDBAdapter] = None
-    market_feed: Optional["MarketFeedService"] = None
+    market_feed: Optional[MarketFeedService] = None
 
 
 _state = GlobalState()
-
-
-from dotenv import load_dotenv
 
 
 async def init_dependencies():
@@ -51,8 +49,6 @@ async def init_dependencies():
 
     # --- Market Feed Service Initialization ---
     try:
-        from src.services.market_feed import MarketFeedService
-
         _state.market_feed = MarketFeedService(db_dsn)
         await _state.market_feed.start()
         print("Market Feed Service started.")

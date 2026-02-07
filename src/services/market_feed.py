@@ -7,7 +7,7 @@ from typing import List, Dict
 from ..adapters.storage.timescale_adapter import TimescaleDBAdapter
 from ..adapters.exchanges.bybit_adapter import BybitAdapter
 from ..adapters.exchanges.thalex_adapter import ThalexAdapter
-from ..domain.entities import Trade
+from ..domain.entities import Trade, Balance
 
 logger = logging.getLogger("MarketFeed")
 
@@ -76,7 +76,23 @@ class MarketFeedService:
         # Connect and Subscribe
         for adapter in self.adapters:
             try:
+                # Wire up callbacks
+                adapter.set_trade_callback(self.on_trade)
+                if hasattr(adapter, "set_balance_callback"):
+                    adapter.set_balance_callback(self.on_balance)
+
                 await adapter.connect()
+
+                # Initial Balance Fetch
+                if hasattr(adapter, "get_balances"):
+                    try:
+                        await adapter.get_balances()
+                        logger.info(f"Fetched initial balances for {adapter.name}")
+                    except Exception as e:
+                        logger.error(
+                            f"Failed to fetch initial balances for {adapter.name}: {e}"
+                        )
+
                 # Determine symbols
                 # For now hardcoded or from env.
                 symbols = os.getenv("MARKET_SYMBOLS", "BTC-PERPETUAL,BTCUSDT").split(
@@ -124,6 +140,13 @@ class MarketFeedService:
             asyncio.create_task(self.storage.save_trade(trade))
         except Exception as e:
             logger.error(f"Failed to save trade: {e}")
+
+    async def on_balance(self, balance: Balance):
+        try:
+            logger.info(f"Saving balance update: {balance}")
+            asyncio.create_task(self.storage.save_balance(balance))
+        except Exception as e:
+            logger.error(f"Failed to save balance: {e}")
 
 
 async def main():

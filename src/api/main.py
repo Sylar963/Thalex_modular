@@ -1,14 +1,16 @@
+import sys
+import os
+
+# Add project root and thalex_py to sys.path BEFORE local imports
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+sys.path.append(project_root)
+sys.path.append(os.path.join(project_root, "thalex_py"))
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from .dependencies import init_dependencies, close_dependencies
-import sys
-import os
-
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-sys.path.append(project_root)
-sys.path.append(os.path.join(project_root, "thalex_py"))
 
 # Load environment variables
 load_dotenv()
