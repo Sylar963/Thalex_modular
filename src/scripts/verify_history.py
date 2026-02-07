@@ -1,11 +1,6 @@
+# Imports should work natively now via pip install -e .
 import asyncio
 import os
-import sys
-from datetime import datetime, timedelta
-
-# Fix path
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-sys.path.append(project_root)
 
 from src.adapters.storage.timescale_adapter import TimescaleDBAdapter
 

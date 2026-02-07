@@ -1,11 +1,7 @@
+# Imports should work natively now via pip install -e .
 import sys
 import os
 import asyncio
-
-# Fix path
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-sys.path.append(project_root)
-sys.path.append(os.path.join(project_root, "thalex_py"))
 
 from src.services.market_feed import main
 

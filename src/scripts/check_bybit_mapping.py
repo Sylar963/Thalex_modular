@@ -1,10 +1,7 @@
+# Imports should work natively now via pip install -e .
 import asyncio
 import logging
 import os
-import sys
-
-# Add src to path
-sys.path.append(os.getcwd())
 
 from src.adapters.storage.timescale_adapter import TimescaleDBAdapter
 from datetime import datetime, timedelta, timezone

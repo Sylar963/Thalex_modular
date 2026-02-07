@@ -1,12 +1,8 @@
+# Imports should work natively now via pip install -e .
 import asyncio
-import os
-import sys
 import json
-
-# Fix path
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-sys.path.append(project_root)
-sys.path.append(os.path.join(project_root, "thalex_py"))
+import logging
+import os
 
 from thalex.thalex import Thalex, Network
 from dotenv import load_dotenv

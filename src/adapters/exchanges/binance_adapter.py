@@ -24,6 +24,7 @@ from ...domain.entities import (
     Position,
     Ticker,
     Trade,
+    Balance,
 )
 
 logger = logging.getLogger(__name__)
@@ -61,7 +62,7 @@ class BinanceAdapter(BaseExchangeAdapter):
         try:
             async with self.session.get(url) as resp:
                 if resp.status == 200:
-                    data = await resp.json()
+                    data = self._fast_json_decode(await resp.read())
                     server_time = data.get("serverTime", 0)
                     local_time = int(time.time() * 1000)
                     self._time_offset_ms = server_time - local_time
@@ -122,7 +123,7 @@ class BinanceAdapter(BaseExchangeAdapter):
         url = f"{self.base_url}/fapi/v1/listenKey"
         async with self.session.post(url) as resp:
             if resp.status == 200:
-                data = await resp.json()
+                data = self._fast_json_decode(await resp.read())
                 return data.get("listenKey")
             logger.error(f"Failed to create listenKey: {await resp.text()}")
             return None
@@ -143,10 +144,17 @@ class BinanceAdapter(BaseExchangeAdapter):
     async def _msg_loop(self):
         while self.connected and self.ws:
             try:
-                msg = await asyncio.wait_for(self.ws.receive_json(), timeout=5.0)
-                if not msg:
-                    continue
-                await self._handle_message(msg)
+                msg_raw = await asyncio.wait_for(self.ws.receive(), timeout=5.0)
+                if msg_raw.type == aiohttp.WSMsgType.TEXT:
+                    msg = self._fast_json_decode(msg_raw.data)
+                    await self._handle_message(msg)
+                elif msg_raw.type == aiohttp.WSMsgType.BINARY:
+                    msg = self._fast_json_decode(msg_raw.data)
+                    await self._handle_message(msg)
+                elif msg_raw.type == aiohttp.WSMsgType.CLOSED:
+                    break
+                elif msg_raw.type == aiohttp.WSMsgType.ERROR:
+                    break
             except asyncio.TimeoutError:
                 continue
             except asyncio.CancelledError:
@@ -243,7 +251,7 @@ class BinanceAdapter(BaseExchangeAdapter):
         url = f"{self.base_url}/fapi/v1/order"
         async with self.session.post(url, params=params) as resp:
             if resp.status == 200:
-                data = await resp.json()
+                data = self._fast_json_decode(await resp.read())
                 exchange_id = str(data.get("orderId", ""))
                 updated = replace(
                     order,
@@ -326,3 +334,34 @@ class BinanceAdapter(BaseExchangeAdapter):
         return self.positions.get(
             symbol, Position(symbol, 0.0, 0.0, exchange=self.name)
         )
+
+    async def get_balances(self) -> List[Balance]:
+        url = f"{self.base_url}/fapi/v2/account"
+        params = {"timestamp": self._get_timestamp()}
+        params["signature"] = self._sign(params)
+
+        async with self.session.get(url, params=params) as resp:
+            if resp.status == 200:
+                data = self._fast_json_decode(await resp.read())
+                balances = []
+                # Binance Futures returns 'assets' list
+                for b in data.get("assets", []):
+                    asset = b.get("asset")
+                    wallet_balance = float(b.get("walletBalance", 0))
+                    cross_wallet = float(b.get("crossWalletBalance", 0))
+                    # Available is roughly cross wallet for cross margin
+                    available = float(b.get("availableBalance", cross_wallet))
+
+                    bal = Balance(
+                        exchange=self.name,
+                        asset=asset,
+                        total=wallet_balance,
+                        available=available,
+                        margin_used=wallet_balance - available,
+                        equity=float(b.get("marginBalance", wallet_balance)),
+                    )
+                    balances.append(bal)
+                return balances
+            else:
+                logger.error(f"Binance get_balances error: {await resp.text()}")
+                return []

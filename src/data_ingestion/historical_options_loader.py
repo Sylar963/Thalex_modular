@@ -10,12 +10,7 @@ except ImportError:
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Tuple, Optional
 
-# Add src to path
-import sys
-
-# Get absolute path to project root (2 levels up from src/data_ingestion)
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-sys.path.append(project_root)
+# Imports work natively now via pip install -e .
 
 # Import Adapter
 try:

@@ -1,11 +1,7 @@
+# Imports should work natively now via pip install -e .
 import asyncio
+import logging
 import os
-import sys
-
-# Fix path
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-sys.path.append(project_root)
-sys.path.append(os.path.join(project_root, "thalex_py"))
 
 from src.adapters.exchanges.thalex_adapter import ThalexAdapter
 from dotenv import load_dotenv
