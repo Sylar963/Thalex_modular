@@ -1,8 +1,7 @@
-import time
 import logging
-from datetime import datetime, timezone as dt_timezone
+from datetime import datetime
 import zoneinfo
-from typing import Dict, Optional, List, Any
+from typing import Dict, Optional, List
 from dataclasses import dataclass, field
 from ..interfaces import SignalEngine
 from ..entities import Ticker, Trade
@@ -77,7 +76,9 @@ class OpenRangeSignalEngine(SignalEngine):
         subsequent_target_pct_of_range: float = 220,
         timezone: str = "UTC",
         use_bias: bool = False,
+        validation_threshold: float = 0.20,
     ):
+        self.validation_threshold = validation_threshold
         self._config = {
             "session_start_hour": int(session_start_utc.split(":")[0]),
             "session_start_minute": int(session_start_utc.split(":")[1])
@@ -96,7 +97,9 @@ class OpenRangeSignalEngine(SignalEngine):
         self.use_bias = use_bias
         self.signals: Dict[str, Dict[str, float]] = {}
         self._last_closes: Dict[str, float] = {}
+        self._last_closes: Dict[str, float] = {}
         self._prev_closes: Dict[str, float] = {}
+        self._last_valid_prices: Dict[str, float] = {}
         self._session_just_completed = False
 
     def _get_state(self, symbol: str) -> OpenRangeState:
@@ -375,6 +378,27 @@ class OpenRangeSignalEngine(SignalEngine):
     def _update_core(
         self, symbol: str, ts: float, price: float, high: float, low: float
     ):
+        # --- Validation Layer ---
+        if price <= 0:
+            logger.warning(
+                f"Validation Error: Rejecting non-positive price {price} for {symbol}"
+            )
+            return
+
+        last_valid = self._last_valid_prices.get(symbol)
+        if last_valid is not None and last_valid > 0:
+            # Check deviation
+            deviation = abs(price - last_valid) / last_valid
+            if deviation > self.validation_threshold:
+                logger.warning(
+                    f"Band Collar Triggered: Rejecting price {price} for {symbol} "
+                    f"(Last Valid: {last_valid}, Deviation: {deviation:.2%})"
+                )
+                return
+
+        # Price is valid, update state
+        self._last_valid_prices[symbol] = price
+
         state = self._get_state(symbol)
         self._prev_closes[symbol] = self._last_closes.get(symbol, 0.0)
         self._last_closes[symbol] = price
@@ -474,7 +498,6 @@ class OpenRangeSignalEngine(SignalEngine):
                 for t in state.down_targets
             ],
             "up_signal": state.up_signal,
-            "down_signal": state.down_signal,
             "down_signal": state.down_signal,
             "session_active": state.or_sesh,
             "session_ma": state.session_ma if state.session_ma > 0 else None,

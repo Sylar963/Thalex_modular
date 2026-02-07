@@ -1,3 +1,4 @@
+# Standard library imports
 import asyncio
 import logging
 import signal
@@ -7,9 +8,8 @@ import os
 import json
 from dotenv import load_dotenv
 
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-sys.path.append(project_root)
-sys.path.append(os.path.join(project_root, "thalex_py"))
+# Project root for config loading
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 from src.adapters.exchanges.thalex_adapter import ThalexAdapter
 from src.domain.strategies.avellaneda import AvellanedaStoikovStrategy
@@ -204,7 +204,6 @@ async def main():
     if args.multi_venue:
         from src.use_cases.strategy_manager import (
             MultiExchangeStrategyManager,
-            ExchangeConfig,
         )
         from src.domain.tracking.sync_engine import SyncEngine
 
