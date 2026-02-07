@@ -227,9 +227,18 @@ class ThalexAdapter(ExchangeGateway):
                 response = await self._rpc_request(self.client.account_summary)
                 if "result" in response:
                     res = response["result"]
-                    total = self._safe_float(res.get("equity", 0.0))
-                    available = self._safe_float(res.get("available_funds", 0.0))
-                    margin_used = self._safe_float(res.get("margin_used", 0.0))
+                    total = self._safe_float(
+                        res.get("equity")
+                        or res.get("margin")
+                        or res.get("cash_collateral"),
+                        0.0,
+                    )
+                    available = self._safe_float(
+                        res.get("available_funds") or res.get("remaining_margin"), 0.0
+                    )
+                    margin_used = self._safe_float(
+                        res.get("margin_used") or res.get("required_margin"), 0.0
+                    )
 
                     bal = Balance(
                         exchange=self.name,
@@ -739,9 +748,18 @@ class ThalexAdapter(ExchangeGateway):
                     # Map fields - adjusting based on assumed Thalex API response for account
                     # total_equity, available_funds, etc.
                     # Fallback if specific fields aren't found, log for debugging
-                    total = self._safe_float(acc.get("equity", 0.0))
-                    available = self._safe_float(acc.get("available_funds", 0.0))
-                    margin_used = self._safe_float(acc.get("margin_used", 0.0))
+                    total = self._safe_float(
+                        acc.get("equity")
+                        or acc.get("margin")
+                        or acc.get("cash_collateral"),
+                        0.0,
+                    )
+                    available = self._safe_float(
+                        acc.get("available_funds") or acc.get("remaining_margin"), 0.0
+                    )
+                    margin_used = self._safe_float(
+                        acc.get("margin_used") or acc.get("required_margin"), 0.0
+                    )
 
                     bal = Balance(
                         exchange=self.name,
