@@ -8,7 +8,7 @@
         },
         "bybit": {
             "enabled": true,
-            "symbols": ["BTCUSDT"],
+            "symbols": ["HYPEUSDT"],
             "testnet": false,
             "strategy_params": {
                 "gamma": 0.3,

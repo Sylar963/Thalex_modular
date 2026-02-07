@@ -26,7 +26,9 @@ class SimulationRepository(BaseRepository):
         ]
 
     async def start_simulation(self, params: Dict) -> Dict:
-        from ...adapters.storage.bybit_history_adapter import BybitHistoryAdapter
+        from ...adapters.storage.timescale_history_provider import (
+            TimescaleHistoryProvider,
+        )
 
         strategy = AvellanedaStoikovStrategy()
         strategy.setup(params.get("strategy_config", {}))
@@ -36,7 +38,7 @@ class SimulationRepository(BaseRepository):
 
         # Initialize modular components
         # Note: We assume self.storage is the TimescaleDBAdapter instance
-        history_provider = BybitHistoryAdapter(self.storage)
+        history_provider = TimescaleHistoryProvider(self.storage)
 
         engine = SimulationEngine(
             strategy=strategy,
