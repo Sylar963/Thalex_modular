@@ -8,7 +8,7 @@ try:
 except ImportError:
     import json as orjson  # Fallback for type hinting/mocking, though functionality differs
 
-from ...domain.interfaces import ExchangeGateway
+from ...domain.interfaces import ExchangeGateway, TimeSyncManager
 
 
 class TokenBucket:
@@ -51,10 +51,19 @@ class TokenBucket:
 
 
 class BaseExchangeAdapter(ExchangeGateway):
-    def __init__(self, api_key: str, api_secret: str, testnet: bool = True):
+    RECV_WINDOW = 20000  # Default 20s for most exchanges
+
+    def __init__(
+        self,
+        api_key: str,
+        api_secret: str,
+        testnet: bool = True,
+        time_sync_manager: Optional[TimeSyncManager] = None,
+    ):
         self.api_key = api_key
         self.api_secret = api_secret
         self.testnet = testnet
+        self.time_sync_manager = time_sync_manager
         self.connected = False
 
         self.ticker_callback: Optional[Callable] = None
@@ -62,12 +71,12 @@ class BaseExchangeAdapter(ExchangeGateway):
         self.order_callback: Optional[Callable] = None
         self.position_callback: Optional[Callable] = None
         self.balance_callback: Optional[Callable] = None
-        self._time_offset_ms: int = 0
-        self._last_sync_time: float = 0
 
     def _get_timestamp(self) -> int:
         """Standardized method to get exchange-aligned timestamp in milliseconds."""
-        return int(time.time() * 1000) + self._time_offset_ms
+        if self.time_sync_manager:
+            return self.time_sync_manager.get_timestamp(self.name)
+        return int(time.time() * 1000)
 
     @property
     @abstractmethod

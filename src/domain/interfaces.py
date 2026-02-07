@@ -79,6 +79,30 @@ class ExchangeGateway(ABC):
         """Set callback for balance updates: async def cb(balance: Balance)."""
         pass
 
+    @abstractmethod
+    async def get_server_time(self) -> int:
+        """Fetch current exchange server time in milliseconds."""
+        pass
+
+
+class TimeSyncManager(ABC):
+    """Interface for managing time synchronization across multiple venues."""
+
+    @abstractmethod
+    def get_timestamp(self, exchange: str) -> int:
+        """Get exchange-aligned timestamp in milliseconds."""
+        pass
+
+    @abstractmethod
+    async def sync_all(self):
+        """Perform synchronization with all managed exchanges."""
+        pass
+
+    @abstractmethod
+    async def start_sync_loop(self):
+        """Start periodic background synchronization."""
+        pass
+
 
 class Strategy(ABC):
     """Abstract interface for trading strategies."""

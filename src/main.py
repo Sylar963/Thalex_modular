@@ -18,6 +18,7 @@ from src.domain.risk.basic_manager import BasicRiskManager
 from src.domain.market.regime_analyzer import MultiWindowRegimeAnalyzer
 from src.services.options_volatility_service import OptionsVolatilityService
 from src.domain.tracking.state_tracker import StateTracker
+from src.domain.tracking.time_sync import MultiVenueTimeSyncService
 from src.use_cases.quoting_service import QuotingService
 
 logging.basicConfig(
@@ -100,15 +101,21 @@ async def main():
         logger.warning("API credentials not found in environment.")
 
     exchange_config = bot_config.get("exchange", {})
+
+    # Initialize Time Sync Manager
+    time_sync_manager = MultiVenueTimeSyncService()
+
     gateway = None
     if not args.multi_venue:
         gateway = ThalexAdapter(
             api_key,
             api_secret,
             testnet=testnet,
+            time_sync_manager=time_sync_manager,
             me_rate_limit=exchange_config.get("me_rate_limit", 45.0),
             cancel_rate_limit=exchange_config.get("cancel_rate_limit", 900.0),
         )
+        time_sync_manager.add_venue(gateway)
 
     db_user = os.getenv("DATABASE_USER", "postgres")
     db_pass = os.getenv("DATABASE_PASSWORD", "password")
@@ -210,7 +217,12 @@ async def main():
         from src.infrastructure.config_factory import ConfigFactory
 
         # Use shared factory to create exchange configurations
-        exchange_configs = ConfigFactory.create_exchange_configs(bot_config)
+        exchange_configs = ConfigFactory.create_exchange_configs(
+            bot_config, time_sync_manager=time_sync_manager
+        )
+        for cfg in exchange_configs:
+            time_sync_manager.add_venue(cfg.gateway)
+
         safety_components = ConfigFactory.create_safety_components(bot_config)
 
         for cfg in exchange_configs:

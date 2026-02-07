@@ -12,7 +12,7 @@ except ImportError:
     # Fail fast if lib missing
     raise ImportError("Thalex package not found. Ensure 'thalex' is in PYTHONPATH.")
 
-from ...domain.interfaces import ExchangeGateway
+from ...domain.interfaces import ExchangeGateway, TimeSyncManager
 from .base_adapter import TokenBucket, BaseExchangeAdapter
 from ...domain.entities import (
     Order,
@@ -39,15 +39,11 @@ class ThalexAdapter(BaseExchangeAdapter):
         api_key: str,
         api_secret: str,
         testnet: bool = True,
+        time_sync_manager: Optional[TimeSyncManager] = None,
         me_rate_limit: float = 45.0,
         cancel_rate_limit: float = 900.0,
     ):
-        self.api_key = api_key
-        self.api_secret = api_secret
-        self.network = Network.TEST if testnet else Network.PROD
-        self.client = Thalex(network=self.network)
-
-        self.connected = False
+        super().__init__(api_key, api_secret, testnet, time_sync_manager)
 
         self.positions: Dict[str, Position] = {}
         self.orders: Dict[str, Order] = {}
@@ -76,6 +72,13 @@ class ThalexAdapter(BaseExchangeAdapter):
     @property
     def name(self) -> str:
         return "thalex"
+
+    async def get_server_time(self) -> int:
+        """Fetch current Thalex server time. Using local time as fallback."""
+        return int(time.time() * 1000)
+
+    def _get_timestamp(self) -> int:
+        return super()._get_timestamp()
 
     def _get_next_id(self) -> int:
         self.request_id_counter += 1

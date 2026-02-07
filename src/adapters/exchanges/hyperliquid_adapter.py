@@ -35,8 +35,13 @@ class HyperliquidAdapter(BaseExchangeAdapter):
     WS_URL = "wss://api.hyperliquid.xyz/ws"
     WS_TESTNET_URL = "wss://api.hyperliquid-testnet.xyz/ws"
 
-    def __init__(self, private_key: str, testnet: bool = True):
-        super().__init__("", private_key, testnet)
+    def __init__(
+        self,
+        private_key: str,
+        testnet: bool = True,
+        time_sync_manager: Optional[TimeSyncManager] = None,
+    ):
+        super().__init__("", private_key, testnet, time_sync_manager)
         self.private_key = private_key
         self.account = Account.from_key(private_key)
         self.address = self.account.address
@@ -58,7 +63,8 @@ class HyperliquidAdapter(BaseExchangeAdapter):
     def name(self) -> str:
         return "hyperliquid"
 
-    async def _sync_server_time(self):
+    async def get_server_time(self) -> int:
+        """Fetch current Hyperliquid server time."""
         url = f"{self.base_url}/info"
         try:
             async with self.session.post(url, json={"type": "meta"}) as resp:
@@ -70,16 +76,10 @@ class HyperliquidAdapter(BaseExchangeAdapter):
                     if date_str:
                         dt = parsedate_to_datetime(date_str)
                         server_time = int(dt.timestamp() * 1000)
-                if server_time > 0:
-                    local_time = int(time.time() * 1000)
-                    self._time_offset_ms = server_time - local_time
-                    logger.info(
-                        f"Hyperliquid time offset: {self._time_offset_ms}ms (server ahead)"
-                        if self._time_offset_ms > 0
-                        else f"Hyperliquid time offset: {self._time_offset_ms}ms (local ahead)"
-                    )
+                return server_time
         except Exception as e:
-            logger.warning(f"Failed to sync Hyperliquid server time: {e}")
+            logger.error(f"Failed to fetch Hyperliquid server time: {e}")
+            raise
 
     async def connect(self):
         logger.info(
@@ -87,7 +87,8 @@ class HyperliquidAdapter(BaseExchangeAdapter):
         )
         self.session = aiohttp.ClientSession()
 
-        await self._sync_server_time()
+        if self.time_sync_manager:
+            await self.time_sync_manager.sync_all()
 
         await self._fetch_meta()
 

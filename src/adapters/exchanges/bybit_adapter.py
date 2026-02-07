@@ -14,6 +14,7 @@ except ImportError:
     )
 
 from .base_adapter import BaseExchangeAdapter
+from ...domain.interfaces import TimeSyncManager
 from ...services.instrument_service import InstrumentService
 from ...domain.entities import (
     Order,
@@ -37,8 +38,14 @@ class BybitAdapter(BaseExchangeAdapter):
     WS_TESTNET_PUBLIC_URL = "wss://stream-testnet.bybit.com/v5/public/linear"
     WS_TESTNET_PRIVATE_URL = "wss://stream-testnet.bybit.com/v5/private"
 
-    def __init__(self, api_key: str, api_secret: str, testnet: bool = True):
-        super().__init__(api_key, api_secret, testnet)
+    def __init__(
+        self,
+        api_key: str,
+        api_secret: str,
+        testnet: bool = True,
+        time_sync_manager: Optional[TimeSyncManager] = None,
+    ):
+        super().__init__(api_key, api_secret, testnet, time_sync_manager)
         self.base_url = self.REST_TESTNET_URL if testnet else self.REST_URL
         self.ws_public_url = (
             self.WS_TESTNET_PUBLIC_URL if testnet else self.WS_PUBLIC_URL
@@ -65,37 +72,29 @@ class BybitAdapter(BaseExchangeAdapter):
     def name(self) -> str:
         return "bybit"
 
-    async def _sync_server_time(self):
+    async def get_server_time(self) -> int:
+        """Fetch current Bybit server time in milliseconds."""
         url = f"{self.base_url}/v5/market/time"
         try:
             async with self.session.get(url) as resp:
                 data = await resp.json()
                 if data.get("retCode") == 0:
-                    server_time = (
-                        int(data.get("result", {}).get("timeSecond", 0)) * 1000
-                    )
-                    if server_time == 0:
-                        server_time = (
-                            int(data.get("result", {}).get("timeNano", 0)) // 1_000_000
-                        )
-                    local_time = int(time.time() * 1000)
-                    self._time_offset_ms = server_time - local_time
-                    logger.info(
-                        f"Bybit time offset: {self._time_offset_ms}ms (server ahead)"
-                        if self._time_offset_ms > 0
-                        else f"Bybit time offset: {self._time_offset_ms}ms (local ahead)"
-                    )
-                    self._last_sync_time = time.time()
+                    res = data.get("result", {})
+                    # Prefer timeSecond (s) * 1000, or use timeNano (ns) // 1M
+                    s_time = int(res.get("timeSecond", 0)) * 1000
+                    if s_time == 0:
+                        s_time = int(res.get("timeNano", 0)) // 1_000_000
+                    return s_time
+                raise Exception(f"Bybit API error: {data.get('retMsg')}")
         except Exception as e:
-            logger.warning(f"Failed to sync Bybit server time: {e}")
+            logger.error(f"Failed to fetch Bybit server time: {e}")
+            raise
 
     def _get_timestamp(self) -> int:
-        if time.time() - self._last_sync_time > 10:
-            asyncio.create_task(self._sync_server_time())
         return super()._get_timestamp()
 
     def _sign(self, timestamp: int, payload: str) -> str:
-        recv_window = "10000"
+        recv_window = str(self.RECV_WINDOW)
         param_str = f"{timestamp}{self.api_key}{recv_window}{payload}"
         return hmac.new(
             self.api_secret.encode("utf-8"),
@@ -108,7 +107,7 @@ class BybitAdapter(BaseExchangeAdapter):
         return {
             "X-BAPI-API-KEY": self.api_key,
             "X-BAPI-TIMESTAMP": str(timestamp),
-            "X-BAPI-RECV-WINDOW": "10000",
+            "X-BAPI-RECV-WINDOW": str(self.RECV_WINDOW),
             "X-BAPI-SIGN": self._sign(timestamp, payload),
             "Content-Type": "application/json",
         }
@@ -119,7 +118,8 @@ class BybitAdapter(BaseExchangeAdapter):
         )
         self.session = aiohttp.ClientSession()
 
-        await self._sync_server_time()
+        if self.time_sync_manager:
+            await self.time_sync_manager.sync_all()
 
         timestamp = self._get_timestamp()
         expires = timestamp + 10000
@@ -251,7 +251,8 @@ class BybitAdapter(BaseExchangeAdapter):
                 await self.ws_private.send_json({"op": "ping"})
             resync_counter += 1
             if resync_counter >= 2:
-                await self._sync_server_time()
+                if self.time_sync_manager:
+                    await self.time_sync_manager.sync_all()
                 resync_counter = 0
 
     async def _msg_loop(self):

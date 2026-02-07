@@ -10,7 +10,7 @@ from src.adapters.exchanges.binance_adapter import BinanceAdapter
 from src.adapters.exchanges.hyperliquid_adapter import HyperliquidAdapter
 from src.use_cases.strategy_manager import ExchangeConfig
 from src.domain.strategies.avellaneda import AvellanedaStoikovStrategy
-from src.domain.interfaces import SafetyComponent
+from src.domain.interfaces import SafetyComponent, TimeSyncManager
 from src.domain.safety.latency_monitor import LatencyMonitor
 from src.domain.safety.circuit_breaker import CircuitBreaker
 
@@ -29,7 +29,9 @@ class ConfigFactory:
 
     @staticmethod
     def create_exchange_configs(
-        bot_config: dict, force_monitor_mode: bool = False
+        bot_config: dict,
+        force_monitor_mode: bool = False,
+        time_sync_manager: Optional[TimeSyncManager] = None,
     ) -> List[ExchangeConfig]:
         """
         Creates a list of ExchangeConfig objects based on the provided configuration.
@@ -80,24 +82,43 @@ class ConfigFactory:
                         )
                     )
                     if key and secret:
-                        gw = ThalexAdapter(key, secret, testnet=venue_testnet)
+                        gw = ThalexAdapter(
+                            key,
+                            secret,
+                            testnet=venue_testnet,
+                            time_sync_manager=time_sync_manager,
+                        )
 
                 elif venue_name == "bybit":
                     key = os.getenv("BYBIT_API_KEY")
                     secret = os.getenv("BYBIT_API_SECRET")
                     if key and secret:
-                        gw = BybitAdapter(key, secret, testnet=venue_testnet)
+                        gw = BybitAdapter(
+                            key,
+                            secret,
+                            testnet=venue_testnet,
+                            time_sync_manager=time_sync_manager,
+                        )
 
                 elif venue_name == "binance":
                     key = os.getenv("BINANCE_API_KEY")
                     secret = os.getenv("BINANCE_API_SECRET")
                     if key and secret:
-                        gw = BinanceAdapter(key, secret, testnet=venue_testnet)
+                        gw = BinanceAdapter(
+                            key,
+                            secret,
+                            testnet=venue_testnet,
+                            time_sync_manager=time_sync_manager,
+                        )
 
                 elif venue_name == "hyperliquid":
                     key = os.getenv("HYPERLIQUID_PRIVATE_KEY")
                     if key:
-                        gw = HyperliquidAdapter(key, testnet=venue_testnet)
+                        gw = HyperliquidAdapter(
+                            key,
+                            testnet=venue_testnet,
+                            time_sync_manager=time_sync_manager,
+                        )
 
                 else:
                     logger.warning(f"Unknown venue type: {venue_name}")

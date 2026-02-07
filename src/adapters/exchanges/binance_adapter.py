@@ -15,6 +15,7 @@ except ImportError:
     )
 
 from .base_adapter import BaseExchangeAdapter
+from ...domain.interfaces import TimeSyncManager
 from ...services.instrument_service import InstrumentService
 from ...domain.entities import (
     Order,
@@ -36,8 +37,14 @@ class BinanceAdapter(BaseExchangeAdapter):
     WS_URL = "wss://fstream.binance.com"
     WS_TESTNET_URL = "wss://fstream.binancefuture.com"
 
-    def __init__(self, api_key: str, api_secret: str, testnet: bool = True):
-        super().__init__(api_key, api_secret, testnet)
+    def __init__(
+        self,
+        api_key: str,
+        api_secret: str,
+        testnet: bool = True,
+        time_sync_manager: Optional[TimeSyncManager] = None,
+    ):
+        super().__init__(api_key, api_secret, testnet, time_sync_manager)
         self.base_url = self.REST_TESTNET_URL if testnet else self.REST_URL
         self.ws_base_url = self.WS_TESTNET_URL if testnet else self.WS_URL
 
@@ -55,23 +62,18 @@ class BinanceAdapter(BaseExchangeAdapter):
     def name(self) -> str:
         return "binance"
 
-    async def _sync_server_time(self):
+    async def get_server_time(self) -> int:
+        """Fetch current Binance server time in milliseconds."""
         url = f"{self.base_url}/fapi/v1/time"
         try:
             async with self.session.get(url) as resp:
                 if resp.status == 200:
                     data = self._fast_json_decode(await resp.read())
-                    server_time = data.get("serverTime", 0)
-                    local_time = int(time.time() * 1000)
-                    self._time_offset_ms = server_time - local_time
-                    logger.info(
-                        f"Binance time offset: {self._time_offset_ms}ms (server ahead)"
-                        if self._time_offset_ms > 0
-                        else f"Binance time offset: {self._time_offset_ms}ms (local ahead)"
-                    )
-                    self._last_sync_time = time.time()
+                    return int(data.get("serverTime", 0))
+                raise Exception(f"Binance API error: {resp.status}")
         except Exception as e:
-            logger.warning(f"Failed to sync Binance server time: {e}")
+            logger.error(f"Failed to fetch Binance server time: {e}")
+            raise
 
     def _sign(self, params: Dict) -> str:
         query_string = urlencode(params)
@@ -88,7 +90,8 @@ class BinanceAdapter(BaseExchangeAdapter):
         )
         self.session = aiohttp.ClientSession(headers={"X-MBX-APIKEY": self.api_key})
 
-        await self._sync_server_time()
+        if self.time_sync_manager:
+            await self.time_sync_manager.sync_all()
 
         self.listen_key = await self._create_listen_key()
         if not self.listen_key:
@@ -131,7 +134,8 @@ class BinanceAdapter(BaseExchangeAdapter):
         while self.connected:
             await asyncio.sleep(resync_interval)
             elapsed += resync_interval
-            await self._sync_server_time()
+            if self.time_sync_manager:
+                await self.time_sync_manager.sync_all()
             if elapsed >= keepalive_interval and self.listen_key:
                 url = f"{self.base_url}/fapi/v1/listenKey"
                 await self.session.put(url)
