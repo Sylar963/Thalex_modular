@@ -42,10 +42,14 @@ Thalex_modular/
 │   │   ├── exchanges/           # Thalex API adapters
 │   │   └── storage/             # TimescaleDB / high-performance persistence
 │   └── services/                # Specialized domain-specific helpers
-│       └── options_volatility_service.py # Expected move & IV calculator
+│       ├── options_volatility_service.py # Expected move & IV calculator
+│       ├── safety/              # Safety plugins (LatencyMonitor, CircuitBreaker)
+│       └── data_ingestor.py     # Independent public data streamer
 ├── tests/                       # Unit and integration test suite
 ├── Architecture.md              # This document
-└── GEMINI.md                    # Project Management Directives
+├── GEMINI.md                    # Project Management Directives
+├── setup.py                     # Standard Python packaging
+└── config.json                  # Global venue & strategy config
 ```
 
 ---
@@ -78,7 +82,12 @@ Adjusts strategy parameters based on real-time market conditions.
 - **Partial Fills**: Highly accurate tracking of simulated fill sizes.
 - **SSE Streams**: Live equity curves and fills are broadcasted via SSE to the dashboard.
 
-### 5. **Data Infrastructure & Persistence**
+### 5. **Safety & Guardrails** (`src/services/safety/`)
+A modular plugin system to protect capital and ensure system integrity.
+- **LatencyMonitor**: Tracks round-trip time (RTT) for execution requests and WebSocket heartbeats. Automatically enters "Safety Mode" (pulls quotes) if latency exceeds thresholds.
+- **CircuitBreaker**: Monitors PnL drawdowns and execution anomalies (e.g., rapid-fire fills). Disconnects the bot if risk limits are breached.
+
+### 6. **Data Infrastructure & Persistence**
 - **BaseExchangeAdapter**: Provides a common interface and shared utilities, including the centralized `TokenBucket` for rate limiting.
 - **ThalexAdapter**: High-performance JSON-RPC client utilizing the shared `TokenBucket` with support for COD (Cancel on Disconnect).
 - **TimescaleDB**:
@@ -136,6 +145,7 @@ main.py --multi-venue
         └── Per-ticker: _run_strategy_for_venue()
             ├── Load venue-specific strategy (or default)
             ├── Calculate quotes
+            ├── Safety check (Latency + Breaker)
             ├── Risk validation (BasicRiskManager + Portfolio)
             └── Order reconciliation (cancel stale, place new)
 ```
