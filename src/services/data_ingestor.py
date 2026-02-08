@@ -91,7 +91,9 @@ class DataIngestionService:
                         thalex_key, thalex_secret, testnet=is_testnet
                     )
                     thalex.set_trade_callback(self.on_trade)
-                    thalex.set_ticker_callback(self.on_ticker)  # Wire Ticker Callback
+                    thalex.set_ticker_callback(self.on_ticker)
+                    thalex.set_balance_callback(self.on_balance)
+                    thalex.set_position_callback(self.on_position)
                     await thalex.connect()
                     self.adapters.append(thalex)
 
@@ -113,7 +115,9 @@ class DataIngestionService:
                 try:
                     bybit = BybitAdapter(bybit_key, bybit_secret, testnet=is_testnet)
                     bybit.set_trade_callback(self.on_trade)
-                    bybit.set_ticker_callback(self.on_ticker)  # Wire Ticker Callback
+                    bybit.set_ticker_callback(self.on_ticker)
+                    bybit.set_balance_callback(self.on_balance)
+                    bybit.set_position_callback(self.on_position)
                     await bybit.connect()
                     self.adapters.append(bybit)
 
@@ -245,6 +249,29 @@ class DataIngestionService:
             asyncio.create_task(self.storage.save_balance(balance))
         except Exception as e:
             logger.error(f"Failed to process balance: {e}")
+
+    async def on_position(self, symbol: str, size: float, entry_price: float):
+        # Persist Position
+        try:
+            from ..domain.entities import Position
+            # We try to get the full position from adapter if possible, but basic is enough for snapshot
+            # Actually, most adapters store the full Position in self.positions
+            # But the callback only sends symbol, size, entry_price for simplicity.
+            
+            # Find the adapter that sent this
+            position = None
+            for adapter in self.adapters:
+                if hasattr(adapter, "positions") and symbol in adapter.positions:
+                    position = adapter.positions[symbol]
+                    break
+            
+            if not position:
+                position = Position(symbol=symbol, size=size, entry_price=entry_price)
+                
+            asyncio.create_task(self.storage.save_position(position))
+            logger.info(f"Saved position update: {symbol} {size} @ {entry_price}")
+        except Exception as e:
+            logger.error(f"Failed to process position: {e}")
 
     async def on_ticker(self, ticker: Ticker):
         # Validate first

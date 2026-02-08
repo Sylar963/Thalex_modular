@@ -1,9 +1,29 @@
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 from .base_repository import BaseRepository
 from ...domain.entities import Position
 
 
 class PortfolioRepository(BaseRepository):
+    async def _get_asset_price(self, asset: str) -> float:
+        """Helper to get latest price of an asset in USD for conversion."""
+        if asset.upper() in ["USD", "USDT", "USDC"]:
+            return 1.0
+        
+        # Try to find a ticker for this asset
+        # We look for ASSET/USD, ASSET/USDT, etc.
+        symbols_to_try = [f"{asset}-PERPETUAL", f"{asset}USDT", f"{asset}-PERP"]
+        
+        if not self.storage:
+            return 0.0
+            
+        for symbol in symbols_to_try:
+            # get_recent_tickers(symbol, limit=1)
+            tickers = await self.storage.get_recent_tickers(symbol, limit=1)
+            if tickers:
+                return tickers[0].mid_price
+                
+        return 0.0
+
     async def get_summary(self, exchange: Optional[str] = None) -> Dict:
         if not self.storage:
             return {
@@ -32,23 +52,34 @@ class PortfolioRepository(BaseRepository):
                 if getattr(p, "exchange", "").lower() == exchange.lower()
             ]
 
-        # Aggregate metrics
-        total_equity = sum(b.equity for b in balances)
-        margin_used = sum(b.margin_used for b in balances)
-        available = sum(b.available for b in balances)
+        # Aggregate metrics with currency conversion
+        total_equity_usd = 0.0
+        total_margin_used_usd = 0.0
+        total_available_usd = 0.0
+        
+        # Cache for asset prices to avoid redundant DB hits
+        price_cache = {}
 
-        # If no balances found (e.g. cold start), fallback to 0 or potentially mocked logic
-        # but better to show 0 to indicate "waiting for data"
+        for b in balances:
+            asset = b.asset.upper()
+            if asset not in price_cache:
+                price_cache[asset] = await self._get_asset_price(asset)
+            
+            price = price_cache[asset]
+            total_equity_usd += b.equity * price
+            total_margin_used_usd += b.margin_used * price
+            total_available_usd += b.available * price
 
-        unrealized_pnl = sum(getattr(p, "unrealized_pnl", 0.0) for p in positions)
+        unrealized_pnl_usd = sum(getattr(p, "unrealized_pnl", 0.0) for p in positions)
 
         return {
-            "equity": total_equity,
-            "margin_used": margin_used,
-            "margin_available": available,
+            "equity": total_equity_usd,
+            "margin_used": total_margin_used_usd,
+            "margin_available": total_available_usd,
             "daily_pnl": 0.0,  # Placeholder until PnL history is tracked
-            "unrealized_pnl": unrealized_pnl,
+            "unrealized_pnl": unrealized_pnl_usd,
             "positions_count": len(positions),
+            "exchange_filtered": exchange or "all"
         }
 
     async def get_positions(self, exchange: Optional[str] = None) -> List[Dict]:

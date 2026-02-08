@@ -78,6 +78,7 @@ class QuotingService:
             self.gateway.set_order_callback(self.state_tracker.on_order_update)
             # Fix: Use wrapper to ensure persistence
             self.gateway.set_position_callback(self.on_position_update)
+            self.gateway.set_balance_callback(self.on_balance_update)
 
             # Wire reactive events
             self.state_tracker.set_fill_callback(self.on_fill_event)
@@ -186,6 +187,12 @@ class QuotingService:
                 position = Position(symbol, size, entry_price)
 
             asyncio.create_task(self.storage.save_position(position))
+
+    async def on_balance_update(self, balance):
+        """Callback for account balance updates from Gateway."""
+        if self.storage and not self.dry_run:
+            asyncio.create_task(self.storage.save_balance(balance))
+        logger.debug(f"Balance update received: {balance}")
 
     async def on_ticker_update(self, ticker: Ticker):
         if not self.running:
