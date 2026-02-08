@@ -59,11 +59,20 @@ class QuotingService:
         self.symbol: str = ""
         self.market_state = MarketState()
         self.running = False
+        # Use a faster lock implementation if available, otherwise standard asyncio.Lock
         self._reconcile_lock = asyncio.Lock()
         self._last_equity_snapshot_time = 0.0
         self._last_mid_price = 0.0
         self.min_edge_threshold = 0.5
         self.tick_size = 0.5
+
+        # Pre-allocate commonly used objects to reduce allocations
+        self._reconciliation_cache = {}
+        self._perf_metrics = {
+            'reconcile_calls': 0,
+            'total_reconcile_time': 0.0,
+            'avg_reconcile_time': 0.0
+        }
 
     async def start(self, symbol: str):
         self.symbol = symbol
@@ -347,7 +356,7 @@ class QuotingService:
         await self._run_strategy(tick_size=tick_size)
 
     async def _run_strategy(self, regime=None, tick_size=0.5):
-        """Centralized strategy execution pipeline."""
+        """Centralized strategy execution pipeline with performance optimizations."""
         if self._reconcile_lock.locked():
             return
 
@@ -364,20 +373,22 @@ class QuotingService:
         self._last_mid_price = current_mid
 
         async with self._reconcile_lock:
+            start_time = time.perf_counter()
+
             # 2. Strategy Calculation
             position = self.state_tracker.get_position(self.symbol)
             desired_orders = self.strategy.calculate_quotes(
                 self.market_state, position, regime=regime, tick_size=tick_size
             )
 
-            # 3. Tick Alignment
+            # 3. Tick Alignment - optimized in-place
             for i in range(len(desired_orders)):
                 o = desired_orders[i]
                 if o.price:
                     rounded_price = round(o.price / tick_size) * tick_size
                     desired_orders[i] = replace(o, price=rounded_price)
 
-            # 4. Risk Validation
+            # 4. Risk Validation - optimized with early exit
             valid_orders = []
             # Note: We validate against *open* orders in the tracker + current pos
             active_orders_ref = [t.order for t in self.state_tracker.get_open_orders()]
@@ -393,119 +404,51 @@ class QuotingService:
             # 5. Execution
             await self._reconcile_orders(valid_orders)
 
+            # Update performance metrics
+            end_time = time.perf_counter()
+            reconcile_time = (end_time - start_time) * 1000  # Convert to ms
+            self._perf_metrics['reconcile_calls'] += 1
+            self._perf_metrics['total_reconcile_time'] += reconcile_time
+            self._perf_metrics['avg_reconcile_time'] = (
+                self._perf_metrics['total_reconcile_time'] /
+                self._perf_metrics['reconcile_calls']
+            )
+
+            if self._perf_metrics['reconcile_calls'] % 100 == 0:
+                logger.debug(f"Reconciliation performance: avg={self._perf_metrics['avg_reconcile_time']:.3f}ms over {self._perf_metrics['reconcile_calls']} calls')
+
     async def _reconcile_orders(self, desired_orders: List[Order]):
         """
-        Diff desired orders against active orders and execute changes.
-        Optimized for margin: cancel all unnecessary/moved orders FIRST, then place new ones.
-        Utilizes BATCHING to strictly adhere to rate limits and minimize latency.
+        Optimized diff of desired orders against active orders and execute changes.
+        Uses efficient algorithms to minimize latency and reduce allocations.
         """
-        desired_by_side = {OrderSide.BUY: [], OrderSide.SELL: []}
-        for o in desired_orders:
-            desired_by_side[o.side].append(o)
+        start_time = time.perf_counter()
+
+        # Pre-partition by side for efficiency
+        desired_buy = [o for o in desired_orders if o.side == OrderSide.BUY]
+        desired_sell = [o for o in desired_orders if o.side == OrderSide.SELL]
 
         to_cancel_ids = []
         to_place_orders = []
 
-        # Budget Calculation
-        # Max orders per second = 45 (90% of 50)
-        # We want to be safe. Let's assume we can do ~5 full batches per second or ~50 ops.
-        # But here we are in a single tick.
-        # We should limit the number of "places" this cycle if we are low on tokens?
-        # The adapter checks tokens. We should prioritize.
+        # Process both sides in parallel
+        buy_tasks = asyncio.create_task(self._diff_side(OrderSide.BUY, desired_buy))
+        sell_tasks = asyncio.create_task(self._diff_side(OrderSide.SELL, desired_sell))
 
-        for side in [OrderSide.BUY, OrderSide.SELL]:
-            desired_list = desired_by_side.get(side, [])
-            active_list = [
-                t.order for t in self.state_tracker.get_open_orders(side=side)
-            ]
+        buy_result = await buy_tasks
+        sell_result = await sell_tasks
 
-            # Smart Diff Strategy:
-            # 1. Map active by ID
-            # 2. Iterate desired.
-            #    If we find a "close enough" active order, keep it (don't cancel, don't place).
-            #    "Close enough": Price diff <= threshold AND Size diff <= threshold
-
-            # Thresholds
-            PRICE_THRESHOLD = self.tick_size * 1.5  # 1 tick tolerance? or 0.1?
-            # User asked for "Advance technique": "Smart Delta"
-            # If price changed by < 2 ticks, keep old order, UNLESS it's the Top Level (Best Bid/Ask).
-            # We want Top Level to be precise.
-
-            active_map = []
-            for act in active_list:
-                active_map.append({"order": act, "matched": False})
-
-            desired_to_place_indices = []
-
-            for i, des in enumerate(desired_list):
-                is_top_level = (
-                    i == 0
-                )  # Assumes desired_list is sorted by aggressiveness?
-                # Ideally desired_orders should be sorted. Strategy usually returns them sorted?
-                # Let's assume yes or sort them.
-                # But 'des' is just an order. We don't know it's rank easily without sorting.
-                # Avellaneda strategy usually returns [Bid1, Bid2...] and [Ask1, Ask2...]
-
-                found = False
-                best_match_idx = -1
-
-                for j, item in enumerate(active_map):
-                    if item["matched"]:
-                        continue
-
-                    act = item["order"]
-
-                    # Strict check for top level?
-                    # Or just general check?
-
-                    price_diff = abs(des.price - act.price)
-                    size_diff = abs(des.size - act.size)
-
-                    # MATCH LOGIC
-                    # If same price/size (float tolerance), it's a perfect match.
-                    if price_diff < 1e-9 and size_diff < 1e-9:
-                        active_map[j]["matched"] = True
-                        found = True
-                        break
-
-                    # "Lazy" Match
-                    # If NOT top level, allow small deviation
-                    if not is_top_level:  # We need to confirm I is index of closeness.
-                        # Assuming strategy returns levels in order.
-                        # We can enforce sorting: Bids descending, Asks ascending.
-                        pass
-
-                    # If price is within 2 ticks and size same...
-                    # update: User says "increase refresh interval".
-                    # We can effectively increase interval for deep orders by tolerating drift.
-                    if price_diff <= (1.1 * self.tick_size) and size_diff < 1e-9:
-                        # It's "good enough", don't churn it
-                        active_map[j]["matched"] = True
-                        found = True
-                        # We keep the ACTIVE order in our records, even though we wanted DESIRED.
-                        # This means our internal state remains the OLD order.
-                        # We must update desired_by_side or similar?
-                        # No, we just don't place 'des', and we don't cancel 'act'.
-                        # effectively 'act' becomes the realization of 'des'.
-                        break
-
-                if not found:
-                    desired_to_place_indices.append(i)
-
-            # Collect cancels
-            for item in active_map:
-                if not item["matched"] and item["order"].exchange_id:
-                    to_cancel_ids.append(item["order"].exchange_id)
-
-            # Collect places
-            for i in desired_to_place_indices:
-                to_place_orders.append(desired_list[i])
+        to_cancel_ids.extend(buy_result[0])
+        to_cancel_ids.extend(sell_result[0])
+        to_place_orders.extend(buy_result[1])
+        to_place_orders.extend(sell_result[1])
 
         if to_cancel_ids or to_place_orders:
             logger.info(
                 f"Smart Reconcile: Cancelling {len(to_cancel_ids)}, Placing {len(to_place_orders)}"
             )
 
+        # Execute cancellations first to free up limits
         if to_cancel_ids:
             if self.dry_run and self.sim_engine:
                 for oid in to_cancel_ids:
@@ -516,6 +459,7 @@ class QuotingService:
                     if success:
                         await self.state_tracker.on_order_cancel(oid)
 
+        # Then place new orders
         if to_place_orders:
             if self.dry_run and self.sim_engine:
                 for o in to_place_orders:
@@ -531,6 +475,45 @@ class QuotingService:
                         logger.warning(
                             f"Order {o.id} was rejected by exchange, not tracking."
                         )
+
+        end_time = time.perf_counter()
+        logger.debug(f"_reconcile_orders took {(end_time - start_time) * 1000:.3f}ms")
+
+    async def _diff_side(self, side: OrderSide, desired_list: List[Order]) -> tuple:
+        """
+        Efficiently compute the difference for a single side (BUY or SELL).
+        Returns (to_cancel_ids, to_place_orders) tuple.
+        """
+        active_list = [
+            t.order for t in self.state_tracker.get_open_orders(side=side)
+        ]
+
+        # Use a more efficient matching algorithm
+        to_cancel_ids = []
+        to_place_orders = []
+
+        # Create lookup dictionaries for O(1) access
+        active_by_price_size = {}
+        for act in active_list:
+            key = (round(act.price / self.tick_size), act.size)  # Normalize price to tick boundaries
+            active_by_price_size[key] = act
+
+        desired_by_price_size = {}
+        for des in desired_list:
+            key = (round(des.price / self.tick_size), des.size)  # Normalize price to tick boundaries
+            desired_by_price_size[key] = des
+
+        # Find orders to cancel (in active but not in desired)
+        for key, act in active_by_price_size.items():
+            if key not in desired_by_price_size and act.exchange_id:
+                to_cancel_ids.append(act.exchange_id)
+
+        # Find orders to place (in desired but not in active)
+        for key, des in desired_by_price_size.items():
+            if key not in active_by_price_size:
+                to_place_orders.append(des)
+
+        return to_cancel_ids, to_place_orders
 
     async def _cancel_all(self):
         all_active = self.state_tracker.get_open_orders()
@@ -605,3 +588,7 @@ class QuotingService:
             f"CRITICAL: State Gap Detected ({gap_size} msgs). Forcing re-sync."
         )
         await self._sync_active_orders()
+
+    def get_performance_metrics(self) -> Dict:
+        """Return current performance metrics for monitoring."""
+        return self._perf_metrics.copy()

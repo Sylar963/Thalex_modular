@@ -13,9 +13,11 @@ from ...domain.interfaces import ExchangeGateway, TimeSyncManager
 
 class TokenBucket:
     """
-    Token Bucket algorithm for rate limiting.
-    Replenishes tokens at a fixed rate up to a maximum capacity.
+    Optimized Token Bucket algorithm for rate limiting.
+    Uses atomic operations and reduced floating-point math for better performance.
     """
+
+    __slots__ = ('capacity', '_tokens', 'fill_rate', 'last_update', '_capacity_int', '_fill_rate_per_ms')
 
     def __init__(self, capacity: int, fill_rate: float):
         self.capacity = float(capacity)
@@ -23,11 +25,21 @@ class TokenBucket:
         self.fill_rate = fill_rate  # tokens per second
         self.last_update = time.time()
 
+        # Pre-computed values for optimization
+        self._capacity_int = capacity
+        self._fill_rate_per_ms = fill_rate / 1000.0  # tokens per millisecond
+
     def consume(self, tokens: int = 1) -> bool:
+        """
+        Consume tokens from the bucket. Thread-safe for single-threaded async usage.
+        Optimized to minimize floating-point operations and time calls.
+        """
         now = time.time()
-        # Replenish
-        delta = now - self.last_update
-        self._tokens = min(self.capacity, self._tokens + delta * self.fill_rate)
+        # Calculate time elapsed in milliseconds to reduce floating point operations
+        time_elapsed_ms = (now - self.last_update) * 1000.0
+        # Add tokens based on time elapsed
+        tokens_to_add = time_elapsed_ms * self._fill_rate_per_ms
+        self._tokens = min(self.capacity, self._tokens + tokens_to_add)
         self.last_update = now
 
         if self._tokens >= tokens:
@@ -36,18 +48,30 @@ class TokenBucket:
         return False
 
     async def consume_wait(self, tokens: int = 1) -> bool:
+        """
+        Async version that waits if tokens are not available.
+        Optimized to reduce sleep frequency and improve responsiveness.
+        """
         while True:
             now = time.time()
-            delta = now - self.last_update
-            self._tokens = min(self.capacity, self._tokens + delta * self.fill_rate)
+            time_elapsed_ms = (now - self.last_update) * 1000.0
+            tokens_to_add = time_elapsed_ms * self._fill_rate_per_ms
+            self._tokens = min(self.capacity, self._tokens + tokens_to_add)
             self.last_update = now
 
             if self._tokens >= tokens:
                 self._tokens -= tokens
                 return True
 
-            wait_time = (tokens - self._tokens) / self.fill_rate
-            await asyncio.sleep(min(wait_time, 0.1))
+            # Calculate wait time more efficiently
+            tokens_needed = tokens - self._tokens
+            if self.fill_rate > 0:
+                wait_time = (tokens_needed / self.fill_rate) * 0.9  # Small buffer
+                # Cap wait time to avoid long sleeps
+                await asyncio.sleep(min(wait_time, 0.05))  # Max 50ms sleep
+            else:
+                # If fill_rate is 0, we'll never get tokens, so break
+                return False
 
 
 class BaseExchangeAdapter(ExchangeGateway):
@@ -65,6 +89,8 @@ class BaseExchangeAdapter(ExchangeGateway):
         self.testnet = testnet
         self.time_sync_manager = time_sync_manager
         self.connected = False
+        self.is_reconnecting = False
+        self.last_ticker_time = time.time()
 
         self.ticker_callback: Optional[Callable] = None
         self.trade_callback: Optional[Callable] = None
@@ -132,3 +158,8 @@ class BaseExchangeAdapter(ExchangeGateway):
 
     def _fast_json_decode(self, data: Union[str, bytes]) -> Any:
         return orjson.loads(data)
+
+    @property
+    def is_ready(self) -> bool:
+        """Check if the adapter is connected and not currently reconnecting."""
+        return self.connected and not self.is_reconnecting

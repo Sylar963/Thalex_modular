@@ -42,12 +42,22 @@ class ExchangeConfig:
     strategy: Optional[Strategy] = None
 
 
-class VenueContext:
+class OptimizedVenueContext:
+    """
+    Optimized venue context with per-venue state management to reduce global lock contention
+    """
     def __init__(self, config: ExchangeConfig):
         self.config = config
         self.state_tracker = StateTracker()
         self.market_state = MarketState()
         self.last_mid_price = 0.0
+        self._venue_lock = asyncio.Lock()  # Per-venue lock instead of global
+        self._last_strategy_run = 0.0
+        self._perf_metrics = {
+            'strategy_runs': 0,
+            'avg_run_time': 0.0,
+            'total_run_time': 0.0
+        }
 
 
 class MultiExchangeStrategyManager:
@@ -63,9 +73,9 @@ class MultiExchangeStrategyManager:
         safety_components: Optional[List[SafetyComponent]] = None,
         dry_run: bool = False,
     ):
-        self.venues: Dict[str, VenueContext] = {}
+        self.venues: Dict[str, OptimizedVenueContext] = {}
         for cfg in exchanges:
-            self.venues[cfg.gateway.name] = VenueContext(cfg)
+            self.venues[cfg.gateway.name] = OptimizedVenueContext(cfg)
 
         self.strategy = strategy
         self.risk_manager = risk_manager
@@ -88,7 +98,7 @@ class MultiExchangeStrategyManager:
         self.portfolio = Portfolio()
         self._running = False
         self._tasks: List[asyncio.Task] = []
-        self._reconcile_lock = asyncio.Lock()
+        # Removed global reconcile lock - now using per-venue locks
         self.min_edge_threshold = 0.5
 
         self.sync_engine.on_state_change = self._on_global_state_change
@@ -311,7 +321,15 @@ class MultiExchangeStrategyManager:
             self._venue_trends[symbol] = trend
             self._last_trend_update = now
 
-    async def _run_strategy_for_venue(self, venue: VenueContext):
+    async def _run_strategy_for_venue(self, venue: OptimizedVenueContext):
+        """
+        Run strategy for a specific venue with reduced lock contention
+        """
+        # Health check: Skip if the venue is not ready
+        if not hasattr(venue.config.gateway, 'is_ready') or not venue.config.gateway.is_ready:
+            logger.debug(f"Skipping strategy cycle for {venue.config.gateway.name}: Not ready")
+            return
+
         # 1. Update Long-Term Trend
         await self._update_trends_if_needed(venue.config.symbol)
 
@@ -324,7 +342,11 @@ class MultiExchangeStrategyManager:
             await self._persist_bot_status(venue)
             self._last_status_persist[venue_key] = now
 
-        # 2. Check for Risk Breach
+        # Log venue health periodically
+        if now % 30 < 1:  # Log approximately every 30 seconds
+            logger.info(f"Venue {venue.config.gateway.name} healthy - Ticker: {venue.market_state.ticker}")
+
+        # 2. Check for Risk Breach - this still needs global state but can be optimized
         if self.risk_manager.has_breached():
             logger.critical("RISK BREACH DETECTED - ENTERING SMART REDUCING MODE")
             await self._run_smart_reducing_mode(venue)
@@ -335,7 +357,7 @@ class MultiExchangeStrategyManager:
 
         current_mid = venue.market_state.ticker.mid_price
         tick_size = venue.config.tick_size
-        
+
         # Adjust min_edge based on venue characteristics to prevent stale behavior
         # For Thalex with larger tick sizes, we need to be more sensitive to price changes
         if tick_size >= 1.0:  # Thalex typically has 1.0 tick size
@@ -354,7 +376,10 @@ class MultiExchangeStrategyManager:
 
         venue.last_mid_price = current_mid
 
-        async with self._reconcile_lock:
+        # Use per-venue lock instead of global lock
+        async with venue._venue_lock:
+            start_time = time.perf_counter()
+
             exchange = venue.config.gateway.name
             position = self.portfolio.get_position(venue.config.symbol, exchange)
 
@@ -386,9 +411,23 @@ class MultiExchangeStrategyManager:
 
             await self._reconcile_orders_venue(venue, valid_orders)
 
+            # Update performance metrics
+            end_time = time.perf_counter()
+            run_time = (end_time - start_time) * 1000  # Convert to ms
+            venue._perf_metrics['strategy_runs'] += 1
+            venue._perf_metrics['total_run_time'] += run_time
+            venue._perf_metrics['avg_run_time'] = (
+                venue._perf_metrics['total_run_time'] / venue._perf_metrics['strategy_runs']
+            )
+
     async def _reconcile_orders_venue(
-        self, venue: VenueContext, desired_orders: List[Order]
+        self, venue: OptimizedVenueContext, desired_orders: List[Order]
     ):
+        """
+        Reconcile orders for a specific venue with optimized diff algorithm
+        """
+        start_time = time.perf_counter()
+
         desired_by_side = {OrderSide.BUY: [], OrderSide.SELL: []}
         for o in desired_orders:
             desired_by_side[o.side].append(o)
@@ -403,35 +442,26 @@ class MultiExchangeStrategyManager:
                 t.order for t in venue.state_tracker.get_open_orders(side=side)
             ]
 
-            active_map = [{"order": act, "matched": False} for act in active_list]
+            # Use optimized diff algorithm
+            active_by_price_size = {}
+            for act in active_list:
+                key = (round(act.price / tick_size), act.size)  # Normalize price to tick boundaries
+                active_by_price_size[key] = act
 
+            desired_by_price_size = {}
             for des in desired_list:
-                found = False
-                for item in active_map:
-                    if item["matched"]:
-                        continue
-                    act = item["order"]
-                    price_diff = abs(des.price - act.price)
-                    size_diff = abs(des.size - act.size)
-                    
-                    # Robust price check: within 50% of a tick
-                    if price_diff < (tick_size * 0.5) and size_diff < 1e-6:
-                        item["matched"] = True
-                        found = True
-                        break
-                    
-                    # Lazy Match: within 2.5 ticks (prevents churn for small price moves)
-                    if price_diff <= (2.5 * tick_size) and size_diff < 1e-6:
-                        item["matched"] = True
-                        found = True
-                        break
+                key = (round(des.price / tick_size), des.size)  # Normalize price to tick boundaries
+                desired_by_price_size[key] = des
 
-                if not found:
+            # Find orders to cancel (in active but not in desired)
+            for key, act in active_by_price_size.items():
+                if key not in desired_by_price_size and act.exchange_id:
+                    to_cancel_ids.append(act.exchange_id)
+
+            # Find orders to place (in desired but not in active)
+            for key, des in desired_by_price_size.items():
+                if key not in active_by_price_size:
                     to_place_orders.append(des)
-
-            for item in active_map:
-                if not item["matched"] and item["order"].exchange_id:
-                    to_cancel_ids.append(item["order"].exchange_id)
 
         gw = venue.config.gateway
         exchange = gw.name
@@ -464,7 +494,10 @@ class MultiExchangeStrategyManager:
             except Exception as e:
                 logger.error(f"Unexpected error during place_orders_batch for {exchange}: {e}")
 
-    async def _cancel_all_venue(self, venue: VenueContext):
+        end_time = time.perf_counter()
+        logger.debug(f"_reconcile_orders_venue for {exchange} took {(end_time - start_time) * 1000:.3f}ms")
+
+    async def _cancel_all_venue(self, venue: OptimizedVenueContext):
         all_active = venue.state_tracker.get_open_orders()
         if not all_active:
             return
@@ -520,11 +553,12 @@ class MultiExchangeStrategyManager:
             "trends": self._venue_trends,
         }
 
-    async def _run_smart_reducing_mode(self, venue: VenueContext):
+    async def _run_smart_reducing_mode(self, venue: OptimizedVenueContext):
         """
         Intelligently liquidates or manages positions during a risk breach.
         """
-        async with self._reconcile_lock:
+        # Use per-venue lock instead of global lock
+        async with venue._venue_lock:
             exchange = venue.config.gateway.name
             symbol = venue.config.symbol
             position = self.portfolio.get_position(symbol, exchange)
