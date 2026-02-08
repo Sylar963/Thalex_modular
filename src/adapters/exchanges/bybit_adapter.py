@@ -375,10 +375,9 @@ class BybitAdapter(BaseExchangeAdapter):
         }
         payload_str = self._fast_json_encode(payload)
         headers = self._get_headers(payload_str)
-        
-        logger.info(f"Bybit Order: {payload['side']} {payload['qty']} @ {payload['price']} (TS: {headers['X-BAPI-TIMESTAMP']})")
 
         url = f"{self.base_url}/v5/order/create"
+
 
         async with self.session.post(
             url, data=payload_str, headers=headers

@@ -110,6 +110,37 @@ class TimescaleDBAdapter(StorageGateway):
                     );
                 """)
 
+                # 3b. Options Metrics Table (Historical & Live)
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS options_live_metrics (
+                        time TIMESTAMPTZ NOT NULL,
+                        underlying TEXT NOT NULL,
+                        strike DOUBLE PRECISION NOT NULL,
+                        expiry_date DATE NOT NULL,
+                        days_to_expiry INTEGER,
+                        call_mark_price DOUBLE PRECISION,
+                        put_mark_price DOUBLE PRECISION,
+                        straddle_price DOUBLE PRECISION,
+                        implied_vol DOUBLE PRECISION,
+                        expected_move_pct DOUBLE PRECISION
+                    );
+                """)
+                try:
+                    await conn.execute(
+                        "SELECT create_hypertable('options_live_metrics', 'time', if_not_exists => TRUE);"
+                    )
+                except Exception:
+                    pass
+                
+                # Unique Index for Idempotency (Time + Underlying + Strike + Expiry)
+                try:
+                    await conn.execute("""
+                        CREATE UNIQUE INDEX IF NOT EXISTS options_live_metrics_idx 
+                        ON options_live_metrics (time, underlying, strike, expiry_date);
+                    """)
+                except Exception as e:
+                    logger.warning(f"Failed to create unique index on options_live_metrics: {e}")
+
                 # 4. Market Regimes Table
                 await conn.execute("""
                     CREATE TABLE IF NOT EXISTS market_regimes (
@@ -347,7 +378,11 @@ class TimescaleDBAdapter(StorageGateway):
                     """
                     INSERT INTO market_tickers (time, symbol, exchange, bid, ask, last, volume)
                     VALUES ($1, $2, $3, $4, $5, $6, $7)
-                    ON CONFLICT DO NOTHING
+                    ON CONFLICT (time, symbol, exchange) DO UPDATE SET
+                        bid = EXCLUDED.bid,
+                        ask = EXCLUDED.ask,
+                        last = EXCLUDED.last,
+                        volume = EXCLUDED.volume
                     """,
                     tickers,
                 )
@@ -368,12 +403,42 @@ class TimescaleDBAdapter(StorageGateway):
                     INSERT INTO options_live_metrics 
                     (time, underlying, strike, expiry_date, days_to_expiry, call_mark_price, put_mark_price, straddle_price, implied_vol, expected_move_pct)
                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                    ON CONFLICT DO NOTHING
+                    ON CONFLICT (time, underlying, strike, expiry_date) DO UPDATE SET
+                        days_to_expiry = EXCLUDED.days_to_expiry,
+                        call_mark_price = EXCLUDED.call_mark_price,
+                        put_mark_price = EXCLUDED.put_mark_price,
+                        straddle_price = EXCLUDED.straddle_price,
+                        implied_vol = EXCLUDED.implied_vol,
+                        expected_move_pct = EXCLUDED.expected_move_pct
                     """,
                     metrics,
                 )
         except Exception as e:
             logger.error(f"Failed to save options metrics bulk: {e}")
+
+    async def get_time_range(self, symbol: str, exchange: str = "thalex") -> Tuple[Optional[float], Optional[float]]:
+        """
+        Get the earliest and latest timestamps for a symbol/exchange in market_tickers.
+        Returns (min_ts, max_ts) or (None, None) if no data exists.
+        """
+        if not self.pool:
+            return None, None
+        try:
+            async with self.pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT MIN(time) as min_t, MAX(time) as max_t
+                    FROM market_tickers
+                    WHERE symbol = $1 AND exchange = $2
+                    """,
+                    symbol, exchange
+                )
+                if row and row["min_t"] and row["max_t"]:
+                    return row["min_t"].timestamp(), row["max_t"].timestamp()
+                return None, None
+        except Exception as e:
+            logger.error(f"Failed to fetch time range for {symbol}: {e}")
+            return None, None
 
     async def get_signal_history(
         self, symbol: str, start: float, end: float, signal_type: Optional[str] = None

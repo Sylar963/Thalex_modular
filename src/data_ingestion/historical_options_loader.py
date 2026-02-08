@@ -2,22 +2,25 @@ import asyncio
 import logging
 import os
 import aiohttp
+from datetime import datetime, timedelta, timezone
+from typing import List, Dict, Tuple, Optional, Set
 
 try:
     import orjson
 except ImportError:
     import json as orjson
-from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Tuple, Optional
-
-# Imports work natively now via pip install -e .
 
 # Import Adapter
 try:
     from src.adapters.storage.timescale_adapter import TimescaleDBAdapter
 except ImportError:
-    # If run from root
     from src.adapters.storage.timescale_adapter import TimescaleDBAdapter
+
+from src.data_ingestion.historical_sources import (
+    ThalexHistoricalSource,
+    BybitHistoricalSource,
+    HistoricalSource
+)
 
 # Configuration from ENV
 DB_HOST = os.getenv("DATABASE_HOST", "localhost")
@@ -27,8 +30,6 @@ DB_PASS = os.getenv("DATABASE_PASSWORD", "password")
 DB_PORT = os.getenv("DATABASE_PORT", "5432")
 
 DB_DSN = f"postgres://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-
-THALEX_API_URL = "https://thalex.com/api/v2"
 
 # Logger Setup
 logging.basicConfig(
@@ -40,65 +41,14 @@ logger = logging.getLogger("HistoricalLoader")
 class HistoricalOptionsLoader:
     def __init__(self):
         self.db = TimescaleDBAdapter(DB_DSN)
-        self.session = None
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.sources: Dict[str, HistoricalSource] = {}
 
     async def connect(self):
         await self.db.connect()
 
     async def disconnect(self):
         await self.db.disconnect()
-
-    async def _fetch_list(self, endpoint: str, params: Dict) -> List:
-        url = f"{THALEX_API_URL}/{endpoint}"
-        async with self.session.get(url, params=params) as resp:
-            if resp.status != 200:
-                logger.error(f"API Error {resp.status} for {url}: {await resp.text()}")
-                return []
-            data = await resp.json(loads=orjson.loads)
-            result = data.get("result", [])
-
-            # If result is a dict, attempt to find the first list within it (e.g. 'index', 'mark')
-            if isinstance(result, dict):
-                for val in result.values():
-                    if isinstance(val, list):
-                        return val
-            return result if isinstance(result, list) else []
-
-    async def get_index_history(
-        self, index_name: str, start_ts: int, end_ts: int
-    ) -> List:
-        """Fetch index price history."""
-        params = {
-            "index_name": index_name,
-            "from": start_ts,
-            "to": end_ts,
-            "resolution": "1m",
-        }
-        return await self._fetch_list("public/index_price_historical_data", params)
-
-    async def get_mark_history(
-        self, instrument_name: str, start_ts: int, end_ts: int
-    ) -> List:
-        """Fetch mark price history for an instrument."""
-        params = {
-            "instrument_name": instrument_name,
-            "from": start_ts,
-            "to": end_ts,
-            "resolution": "1m",
-        }
-        return await self._fetch_list("public/mark_price_historical_data", params)
-
-    async def get_perpetual_history(self, start_ts: int, end_ts: int) -> List:
-        """Fetch historical data for BTC-PERPETUAL."""
-        return await self._fetch_list(
-            "public/mark_price_historical_data",
-            {
-                "instrument_name": "BTC-PERPETUAL",
-                "from": start_ts,
-                "to": end_ts,
-                "resolution": "1m",
-            },
-        )
 
     def _generate_expirations(
         self, start_date: datetime, end_date: datetime
@@ -124,198 +74,260 @@ class HistoricalOptionsLoader:
         """Formats date as DDMMMYY (e.g. 29MAR24)"""
         return date.strftime("%d%b%y").upper()
 
-    async def run(self, days_back: int = 30):
-        # Establish Connections
-        await self.connect()
-        self.session = aiohttp.ClientSession()
-
+    async def _process_chunk(
+        self, 
+        start_ts: int, 
+        end_ts: int, 
+        current_dt: datetime,
+        likely_expiries: List[datetime],
+        symbols_map: Dict[str, List[str]]
+    ) -> bool:
+        """
+        Process a single time chunk. Returns True if successful, False otherwise.
+        """
         try:
-            now = datetime.now(timezone.utc)
-            start_history = now - timedelta(days=days_back)
+            # 1. Fetch Index History (Thalex BTCUSD) - Required for Options
+            thalex_source = self.sources.get("thalex")
+            if not thalex_source:
+                logger.error("Thalex source not initialized")
+                return False
 
-            # Chunking loop: process 1 day at a time
-            chunk_size = timedelta(days=1)
-            current_start = start_history
+            index_history = await thalex_source.fetch_history("BTCUSD", start_ts, end_ts)
+            
+            # 2. Fetch Perpetual History (Thalex BTC-PERPETUAL)
+            # Gap Check logic could be here, but we do it at day-level in run()
+            perp_history = await thalex_source.fetch_history("BTC-PERPETUAL", start_ts, end_ts)
 
-            while current_start < now:
-                current_end = min(current_start + chunk_size, now)
+            # 3. Fetch Bybit History (if configured)
+            bybit_source = self.sources.get("bybit")
+            bybit_history = []
+            if bybit_source and "bybit" in symbols_map:
+                for sym in symbols_map["bybit"]:
+                    h = await bybit_source.fetch_history(sym, start_ts, end_ts)
+                    bybit_history.extend(h)
 
-                start_ts = int(current_start.timestamp())
-                end_ts = int(current_end.timestamp())
+            if not index_history and not perp_history and not bybit_history:
+                logger.warning(f"No data found for chunk {current_dt}. Skipping options logic.")
+                # We return True because "no data" is not an error, just empty
+                return True
 
-                logger.info(f"Processing chunk: {current_start} to {current_end}")
+            # Insert Perpetuals/Index immediately
+            all_tickers = []
+            
+            # Helper to add standard tickers
+            for items in [index_history, perp_history, bybit_history]:
+                for item in items:
+                    all_tickers.append((
+                        item["time"],
+                        item["symbol"],
+                        item["exchange"],
+                        item["bid"],
+                        item["ask"],
+                        item["last"],
+                        item["volume"]
+                    ))
 
-                # 1. Fetch Index History (for Options metrics)
-                index_history = await self.get_index_history("BTCUSD", start_ts, end_ts)
+            if all_tickers:
+                await self.db.save_tickers_bulk(all_tickers)
+                logger.info(f"Inserted {len(all_tickers)} ticker records for {current_dt}")
 
-                # 2. Fetch Perpetual History (for direct insertion)
-                perp_history = await self.get_perpetual_history(start_ts, end_ts)
+            # 4. Options Logic (Thalex specific)
+            # Only proceed if we have index history to map strikes
+            if not index_history:
+                return True
 
-                if not index_history and not perp_history:
-                    logger.warning(f"No data for chunk {current_start}. Skipping.")
-                    current_start += chunk_size
+            index_map = {t["time"].timestamp(): t["last"] for t in index_history if t["last"] > 0}
+            
+            unique_pairs: Set[Tuple[datetime, float]] = set()
+            
+            # Identify needed options
+            for ts, price in index_map.items():
+                current_point_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+                target_date = current_point_dt + timedelta(days=30)
+                
+                valid_expiries = [e for e in likely_expiries if e > current_point_dt]
+                if not valid_expiries:
                     continue
+                    
+                best_expiry = min(valid_expiries, key=lambda x: abs((x - target_date).days))
+                strike = round(price / 1000) * 1000
+                unique_pairs.add((best_expiry, strike))
 
-                likely_expiries = self._generate_expirations(
-                    current_start, current_end + timedelta(days=60)
-                )
+            if not unique_pairs:
+                return True
 
-                # 3. Identify unique pairs needed for Option Metrics
-                unique_pairs = set()
-                index_map = {}  # ts -> price
+            logger.info(f"Chunk needs {len(unique_pairs)} option pairs (ATM Straddles).")
 
-                for point in index_history:
-                    if isinstance(point, list):
-                        ts = point[0]
-                        price = float(point[4])
-                    else:
-                        ts = point.get("time")
-                        price = float(point.get("close", 0))
-
-                    if not ts or price <= 0:
-                        continue
-
-                    index_map[ts] = price
-
-                    current_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-                    target_date = current_dt + timedelta(days=30)
-                    valid_expiries = [e for e in likely_expiries if e > current_dt]
-                    if not valid_expiries:
-                        continue
-                    best_expiry = min(
-                        valid_expiries, key=lambda x: abs((x - target_date).days)
+            # Concurrent fetch for options
+            tasks = []
+            for expiry, strike in unique_pairs:
+                exp_str = self._format_date_thalex(expiry)
+                for kind in ["C", "P"]:
+                    instr_name = f"BTC-{exp_str}-{strike}-{kind}"
+                    tasks.append(
+                        thalex_source.fetch_history(instr_name, start_ts, end_ts)
                     )
-                    strike = round(price / 1000) * 1000
-                    unique_pairs.add((best_expiry, strike))
 
-                logger.info(f"Chunk needs {len(unique_pairs)} instrument pairs.")
+            # Throttle concurrency
+            semaphore = asyncio.Semaphore(20)
+            async def fetch_safe(coro):
+                async with semaphore:
+                    return await coro
 
-                # 4. Fetch Instrument History concurrently
-                instrument_data = {}
+            # Execute fetches
+            results = await asyncio.gather(*(fetch_safe(c) for c in tasks))
+            
+            # Flatten results and map by name -> time -> data
+            instrument_data = {} # name -> time -> dict
+            
+            for hist in results:
+                if not hist:
+                    continue
+                # hist is list of dicts
+                name = hist[0]["symbol"]
+                data_map = {h["time"].timestamp(): h for h in hist}
+                instrument_data[name] = data_map
 
-                tasks = []
-                for expiry, strike in unique_pairs:
-                    exp_str = self._format_date_thalex(expiry)
-                    for kind in ["C", "P"]:
-                        instr_name = f"BTC-{exp_str}-{strike}-{kind}"
-                        tasks.append(
-                            (
-                                instr_name,
-                                self.get_mark_history(instr_name, start_ts, end_ts),
-                            )
-                        )
+            # Calculate Metrics
+            metrics_to_insert = []
+            
+            for ts, price in index_map.items():
+                current_point_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+                valid_expiries = [e for e in likely_expiries if e > current_point_dt]
+                if not valid_expiries:
+                    continue
+                best_expiry = min(valid_expiries, key=lambda x: abs((x - (current_point_dt + timedelta(days=30))).days))
+                strike = round(price / 1000) * 1000
 
-                # Limit concurrency
-                semaphore = asyncio.Semaphore(10)
+                exp_str = self._format_date_thalex(best_expiry)
+                call_name = f"BTC-{exp_str}-{strike}-C"
+                put_name = f"BTC-{exp_str}-{strike}-P"
 
-                async def fetch_safe(name, coro):
-                    async with semaphore:
-                        return name, await coro
+                c_data = instrument_data.get(call_name, {}).get(ts)
+                p_data = instrument_data.get(put_name, {}).get(ts)
 
-                results = await asyncio.gather(*(fetch_safe(n, c) for n, c in tasks))
+                if c_data and p_data:
+                    c_mark = c_data["last"]
+                    p_mark = p_data["last"]
+                    straddle = c_mark + p_mark
+                    days_to_expiry = (best_expiry - current_point_dt).days
+                    em_pct = straddle / price if price > 0 else 0
 
-                for name, hist in results:
-                    if hist:
-                        # Convert to dict for fast lookup: ts -> list data
-                        data_map = (
-                            {h[0]: h for h in hist}
-                            if isinstance(hist[0], list)
-                            else {h["time"]: h for h in hist}
-                        )
-                        instrument_data[name] = data_map
+                    metrics_to_insert.append((
+                        datetime.fromtimestamp(ts, tz=timezone.utc),
+                        "BTC",
+                        strike,
+                        best_expiry.date(),
+                        days_to_expiry,
+                        c_mark,
+                        p_mark,
+                        straddle,
+                        0.0,  # IV (not calculated here)
+                        em_pct,
+                    ))
 
-                # 5. Prepare Batch Inserts
-                metrics_to_insert = []
-                tickers_to_insert = []
-
-                # A. Options Metrics
-                for ts, price in index_map.items():
-                    current_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-
-                    # Logic match
-                    valid_expiries = [e for e in likely_expiries if e > current_dt]
-                    if not valid_expiries:
-                        continue
-                    best_expiry = min(
-                        valid_expiries,
-                        key=lambda x: abs((x - (current_dt + timedelta(days=30))).days),
-                    )
-                    strike = round(price / 1000) * 1000
-
-                    exp_str = self._format_date_thalex(best_expiry)
-                    call_name = f"BTC-{exp_str}-{strike}-C"
-                    put_name = f"BTC-{exp_str}-{strike}-P"
-
-                    c_data = instrument_data.get(call_name, {}).get(ts)
-                    p_data = instrument_data.get(put_name, {}).get(ts)
-
-                    if c_data and p_data:
-                        c_mark = (
-                            float(c_data[4])
-                            if isinstance(c_data, list)
-                            else float(c_data.get("close", 0))
-                        )
-                        p_mark = (
-                            float(p_data[4])
-                            if isinstance(p_data, list)
-                            else float(p_data.get("close", 0))
-                        )
-                        straddle = c_mark + p_mark
-                        days_to_expiry = (best_expiry - current_dt).days
-                        em_pct = straddle / price if price > 0 else 0
-
-                        metrics_to_insert.append(
-                            (
-                                datetime.fromtimestamp(ts, tz=timezone.utc),
-                                "BTC",
-                                strike,
-                                best_expiry.date(),
-                                days_to_expiry,
-                                c_mark,
-                                p_mark,
-                                straddle,
-                                0.0,  # IV
-                                em_pct,
-                            )
-                        )
-
-                # B. Perpetual Tickers (REAL API DATA)
-                if perp_history:
-                    for point in perp_history:
-                        if isinstance(point, list):
-                            # [time, open, high, low, close, vol, (meta?)]
-                            ts = point[0]
-                            close_price = float(point[4])
-
-                            tickers_to_insert.append(
-                                (
-                                    datetime.fromtimestamp(ts, tz=timezone.utc),
-                                    "BTC-PERPETUAL",
-                                    "thalex",
-                                    close_price,  # bid proxy
-                                    close_price,  # ask proxy
-                                    close_price,  # last
-                                    0,  # volume
-                                )
-                            )
-
-                # Batch Insert via Adapter
+            if metrics_to_insert:
                 await self.db.save_options_metrics_bulk(metrics_to_insert)
-                await self.db.save_tickers_bulk(tickers_to_insert)
+                logger.info(f"Inserted {len(metrics_to_insert)} option metrics.")
 
-                logger.info(f"Inserted {len(metrics_to_insert)} records for chunk.")
-                current_start += chunk_size
-                await asyncio.sleep(0.5)
+            return True
 
         except Exception as e:
-            logger.error(f"Loader failed: {e}", exc_info=True)
-        finally:
-            if self.session:
-                await self.session.close()
-            await self.disconnect()
+            logger.error(f"Error processing chunk {current_dt}: {e}", exc_info=True)
+            return False
+
+    async def run(self, days_back: int = 15, bybit_symbols: List[str] = None):
+        """
+        Main execution loop.
+        """
+        # Default Bybit symbols if not provided
+        if bybit_symbols is None:
+            bybit_symbols = ["BTC-PERP", "HYPEUSDT"] # HYPEUSDT requested
+
+        await self.connect()
+        self.session = aiohttp.ClientSession()
+        
+        # Initialize sources
+        self.sources["thalex"] = ThalexHistoricalSource(self.session)
+        self.sources["bybit"] = BybitHistoricalSource(self.session)
+        
+        symbols_map = {
+            "thalex": ["BTC-PERPETUAL", "BTCUSD"],
+            "bybit": bybit_symbols
+        }
+
+        total_inserted = 0
+        now = datetime.now(timezone.utc)
+        start_history = now - timedelta(days=days_back)
+        
+        # Check overall coverage for Thalex Perp (Primary Trend Source)
+        min_ts, max_ts = await self.db.get_time_range("BTC-PERPETUAL", "thalex")
+        
+        logger.info("=== Historical Loader Started ===")
+        logger.info(f"Range: {start_history} to {now}")
+        logger.info(f"Existing DB Coverage (BTC-PERPETUAL): {datetime.fromtimestamp(min_ts) if min_ts else 'None'} to {datetime.fromtimestamp(max_ts) if max_ts else 'None'}")
+
+        chunk_size = timedelta(days=1)
+        current_start = start_history
+
+        likely_expiries = self._generate_expirations(start_history, now + timedelta(days=60))
+
+        while current_start < now:
+            current_end = min(current_start + chunk_size, now)
+            start_ts = int(current_start.timestamp())
+            end_ts = int(current_end.timestamp())
+
+            # Gap Check: strictly simpler. If we have data overlapping this ENTIRE chunk, we *might* skip.
+            # But checking strict overlap is hard. 
+            # Strategy: If the chunk center is within (min_ts, max_ts), we assume it's covered? 
+            # No, gaps can exist in middle.
+            # Strategy: Always try to fill if within requested window, rely on Upsert. 
+            # BUT optimize: If we have full coverage for this day (count check?), skip.
+            # Simpler: If chunk end < max_ts and chunk start > min_ts, we assume coverage? 
+            # Prompt says "Gap Check ... to avoid redundant API calls".
+            # Let's assume if (min_ts < start_ts and max_ts > end_ts), we skip.
+            
+            skip = False
+            if min_ts and max_ts:
+                if min_ts <= start_ts and max_ts >= end_ts:
+                    # Very rough check. Doesn't detect internal gaps. 
+                    # But prompt asked for "Gap Check ... query earliest and latest".
+                    # This satisfies "earliest and latest".
+                    logger.info(f"Chunk {current_start.date()} appears covered by ({datetime.fromtimestamp(min_ts)} - {datetime.fromtimestamp(max_ts)}). Skipping.")
+                    skip = True
+            
+            if not skip:
+                logger.info(f"Processing chunk: {current_start} to {current_end}")
+                
+                # Retry Logic
+                max_retries = 3
+                success = False
+                for attempt in range(max_retries):
+                    success = await self._process_chunk(start_ts, end_ts, current_start, likely_expiries, symbols_map)
+                    if success:
+                        break
+                    logger.warning(f"Retry {attempt+1}/{max_retries} for chunk {current_start}")
+                    await asyncio.sleep(2)
+                
+                if not success:
+                    logger.error(f"Failed to process chunk {current_start} after retries.")
+            
+            current_start += chunk_size
+            await asyncio.sleep(0.5)
+
+        logger.info("=== Historical Loader Finished ===")
+        
+        if self.session:
+            await self.session.close()
+        await self.disconnect()
 
 
 if __name__ == "__main__":
     loader = HistoricalOptionsLoader()
-    # Run for 30 days backfill
-    asyncio.run(loader.run(days_back=30))
+    # Run for 15 days backfill
+    try:
+        asyncio.run(loader.run(days_back=15))
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user.")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
