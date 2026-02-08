@@ -94,8 +94,18 @@ class TimeSyncManager(ABC):
         pass
 
     @abstractmethod
+    def get_offset(self, exchange: str) -> int:
+        """Get the current time offset for the venue in milliseconds."""
+        pass
+
+    @abstractmethod
     async def sync_all(self):
         """Perform synchronization with all managed exchanges."""
+        pass
+
+    @abstractmethod
+    async def sync_venue(self, exchange: str):
+        """Sync a specific venue immediately."""
         pass
 
     @abstractmethod

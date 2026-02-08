@@ -36,15 +36,18 @@ class MultiVenueTimeSyncService(TimeSyncManager):
         offset = self.offsets.get(exchange, 0)
         return int(time.time() * 1000) + offset
 
+    def get_offset(self, exchange: str) -> int:
+        return self.offsets.get(exchange, 0)
+
     async def sync_all(self):
         """Proactively sync with all registered exchanges."""
         logger.info(
             f"TimeSync: Triggering global sync for {list(self.exchanges.keys())}"
         )
-        tasks = [self._sync_venue(name) for name in self.exchanges.keys()]
+        tasks = [self.sync_venue(name) for name in self.exchanges.keys()]
         await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _sync_venue(self, name: str):
+    async def sync_venue(self, name: str):
         """Sync with a specific venue and update internal offset."""
         ex = self.exchanges.get(name)
         if not ex:
@@ -63,9 +66,6 @@ class MultiVenueTimeSyncService(TimeSyncManager):
             offset = server_time - local_estimate
 
             self.offsets[name] = offset
-
-
-
 
             logger.info(
                 f"TimeSync: {name} offset matched: {offset}ms (Drift: {t1 - t0}ms RTT)"
