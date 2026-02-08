@@ -411,14 +411,14 @@ class MultiExchangeStrategyManager:
                     price_diff = abs(des.price - act.price)
                     size_diff = abs(des.size - act.size)
                     
-                    # Robust price check: within 10% of a tick
-                    if price_diff < (tick_size * 0.1) and size_diff < 1e-6:
+                    # Robust price check: within 50% of a tick
+                    if price_diff < (tick_size * 0.5) and size_diff < 1e-6:
                         item["matched"] = True
                         found = True
                         break
                     
-                    # Lazy Match: within 1.1 ticks
-                    if price_diff <= (1.1 * tick_size) and size_diff < 1e-6:
+                    # Lazy Match: within 2.5 ticks (prevents churn for small price moves)
+                    if price_diff <= (2.5 * tick_size) and size_diff < 1e-6:
                         item["matched"] = True
                         found = True
                         break

@@ -1,5 +1,6 @@
 import asyncpg
 import logging
+import time
 from datetime import timedelta
 from typing import List, Optional, Dict, Any, Tuple
 import json
@@ -818,10 +819,16 @@ class TimescaleDBAdapter(StorageGateway):
             return []
 
     async def get_regime_history(
-        self, symbol: str, start: float, end: float
+        self, symbol: str, start: Optional[float] = None, end: Optional[float] = None
     ) -> List[Dict]:
         if not self.pool:
             return []
+        
+        if end is None:
+            end = time.time()
+        if start is None:
+            start = end - 86400 # Default to last 24 hours
+            
         try:
             async with self.pool.acquire() as conn:
                 rows = await conn.fetch(

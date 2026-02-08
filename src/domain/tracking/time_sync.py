@@ -60,10 +60,8 @@ class MultiVenueTimeSyncService(TimeSyncManager):
             # For trading, usually just (server_time - local_time) is used but this is better.
             local_estimate = (t0 + t1) // 2
             # Offset = Server - Local
-            # Added -11000ms extra buffer because local clock is consistently ~10s ahead of Bybit matching engine
-            offset = server_time - local_estimate - 11000
+            offset = server_time - local_estimate
 
-            
             self.offsets[name] = offset
 
 

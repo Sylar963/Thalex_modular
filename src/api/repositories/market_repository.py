@@ -62,7 +62,7 @@ class MarketRepository(BaseRepository):
         return []
 
     async def get_regime_history(
-        self, symbol: str, start: float, end: float
+        self, symbol: str, start: Optional[float] = None, end: Optional[float] = None
     ) -> List[Dict]:
         if not self.storage:
             return []

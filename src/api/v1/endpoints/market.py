@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends
-from typing import List, Dict
+from typing import List, Dict, Optional
 from ...repositories import MarketRepository
 from ...dependencies import get_market_repo
 from dataclasses import asdict
@@ -38,8 +38,8 @@ async def get_recent_ticker(
 @router.get("/regime/history/{symbol}", response_model=List[Dict])
 async def get_regime_history(
     symbol: str,
-    start: float,
-    end: float,
+    start: Optional[float] = None,
+    end: Optional[float] = None,
     repo: MarketRepository = Depends(get_market_repo),
 ):
     """Get historical regime metrics (RV, Trend, EM, Vol Delta)."""
