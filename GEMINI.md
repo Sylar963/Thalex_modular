@@ -67,12 +67,10 @@ The system leverages TimescaleDB as a "Single Source of Truth":
   - *Case Study (Thalex)*: Truncated import blocks during refactoring caused immediate `SyntaxError`.
 - **Environment Variable Divergence**: Standardize env var names system-wide early.
   - *Fix*: Migrated all components (`src/api`, `data_ingestion`, `main.py`) to `DATABASE_HOST`, `DATABASE_PORT` etc., eliminating connection failures in dashboard and ingestion pipelines.
-- **Instrument Mapping Resolution**: Historical data loaders must match the precise string format of the exchange.
-  - *Thalex Tip*: Dates must be uppercase (e.g., `28MAR24`) for historical mark price lookups.
-- **Redundant Logic Drift**: Periodically audit for overlapping components.
-  - *Refactor*: Removed `RegimeDetector` in favor of `MultiWindowRegimeAnalyzer` to prevent conflicting market signals.
-
-### Memory & Learning Log
+- **Thalex Tick Size Alignment**: Thalex is extremely strict about price alignment with `tick_size`.
+  - *Pitfall*: `ThalexAdapter` method name mismatch (`_fetch_instrument_details` vs expected `fetch_instrument_info`) caused the bot to use a default `0.5` tick size when Thalex required `1.0`. ALWAYS ensure adapter method names match the interface expected by `StrategyManager`.
+- **Margin Requirements vs Order Size**: Small account balances can lead to immediate order rejections with code `24` (insufficient margin) if `order_size` is too high.
+  - *Tip*: BTC-PERPETUAL on Thalex can require high margin (~$124 for 0.01 BTC). If orders aren't placing, check for code `24` in logs and reduce `order_size` (e.g., to `0.001`).
 - **Token Bucket algorithm**: Centralized in `base_adapter.py` to ensure consistent rate-limiting across all venues without repeating logic.
 - **Port Consistency**: Standardized on port `5432` for TimescaleDB across all services, removing the legacy `5433` fallback which caused confusion between local and containerized setups.
 - **FastAPI Dependency Injection**: Always call `load_dotenv()` in `main.py` before any repository initializations to ensure DB parameters are hydrated.

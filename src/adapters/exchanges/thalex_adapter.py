@@ -150,7 +150,9 @@ class ThalexAdapter(BaseExchangeAdapter):
             logger.info("Enabled Cancel On Disconnect (Rate Limit boosted).")
 
             # Fetch instrument details (tick size)
-            await self._fetch_instrument_details()
+            await self.fetch_instrument_info(
+                os.getenv("PRIMARY_INSTRUMENT", "BTC-PERPETUAL")
+            )
         except Exception as e:
             logger.error(f"Login/Setup failed: {e}")
             # Cleanup
@@ -189,11 +191,9 @@ class ThalexAdapter(BaseExchangeAdapter):
         await self.client.disconnect()
         logger.info("Thalex Adapter disconnected.")
 
-    async def _fetch_instrument_details(self):
+    async def fetch_instrument_info(self, symbol: str):
         """Fetch instrument details like tick_size from the API"""
         try:
-            # We use a dummy symbol or the primary instrument from env
-            symbol = os.getenv("PRIMARY_INSTRUMENT", "BTC-PERPETUAL")
             response = await self._rpc_request(
                 self.client.instrument, instrument_name=symbol
             )
@@ -599,7 +599,7 @@ class ThalexAdapter(BaseExchangeAdapter):
             response = await self._rpc_request(
                 self.client.last_trades, instrument_name=symbol, limit=limit
             )
-            
+
             if "result" in response:
                 trades_data = response["result"]
                 trades = []

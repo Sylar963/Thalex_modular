@@ -2,7 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Current State] - 2026-02-06
+## [Current State] - 2026-02-08
+
+### Safety & Reliability
+- **Safety Plugin Architecture**: Implemented `SafetyComponent` interface with concrete plugins:
+    - `LatencyMonitor`: Monitors WebSocket heartbeat and execution latency, triggering safety pauses.
+    - `CircuitBreaker`: Automatically halts trading if loss thresholds or abnormal execution patterns are detected.
+- **Robust Order Reconciliation**:
+    - Enhanced `MultiExchangeStrategyManager` to fetch and cancel stale orders from all enabled venues upon bot restart.
+    - Implemented missing `get_open_orders` methods across `BybitAdapter`, `BinanceAdapter`, and `HyperliquidAdapter`.
+
+### Standardization & Infrastructure
+- **Standard Python Packaging**: Migrated the project to use `setup.py` and `pip install -e .`, enabling clean imports across the codebase.
+- **Import Cleanup**: Eliminated ad-hoc `sys.path` modifications in all scripts.
+- **ORB Session Alignment**: Standardized Open Range calculations to align with 8:00 PM PST session starts across backend and frontend.
+
+### Diagnostics & Benchmarking
+- **Order Latency Suite**: Developed a dedicated benchmark tool to measure round-trip latency for order placement and cancellation on Thalex and Bybit.
+- **Chart Protection**: Implemented a "band collar" for Open Range indicators to ignore illiquidity-driven price spikes on specific exchanges.
+
+## [2026-02-06] - Previous State
 ### Features
 - **Live Simulation Framework (Forward Testing)**:
     - Implemented `LiveSimulationRunner` within `SimStateManager` to conduct "paper trading" simulations using live market data.
