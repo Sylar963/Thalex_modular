@@ -82,8 +82,13 @@ class AvellanedaStoikovStrategy(Strategy):
         self.position_limit = config.get("position_limit", 1.0)
         self.order_size = config.get("order_size", 0.001)
         self.min_spread_ticks = config.get("min_spread", 20)
+        
+        # Respect tick_size from config if provided
+        if "tick_size" in config:
+            self.tick_size = float(config["tick_size"])
 
         self.quote_levels = config.get("quote_levels", 1)
+
         self.level_spacing_factor = config.get("level_spacing_factor", 0.5)
 
         # Heuristic Params
@@ -107,8 +112,9 @@ class AvellanedaStoikovStrategy(Strategy):
         """
         Calculate optimal bid and ask orders using legacy heuristic logic.
         """
-        if not market_state.ticker:
+        if not market_state.ticker or market_state.ticker.mid_price <= 0:
             return []
+
 
         ticker = market_state.ticker
         mid_price = ticker.mid_price

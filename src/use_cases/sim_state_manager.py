@@ -27,6 +27,7 @@ class LiveSimState:
     equity_history: List[EquitySnapshot] = field(default_factory=list)
     fills: List[FillEffect] = field(default_factory=list)
     last_price: float = 0.0
+    mark_price: float = 0.0
 
 
 class SimStateManager:
@@ -64,6 +65,7 @@ class SimStateManager:
                 equity_history=[],
                 fills=[],
                 last_price=0.0,
+                mark_price=0.0,
             )
 
             # Initialize Engines
@@ -127,6 +129,9 @@ class SimStateManager:
         async with self._lock:
             # 1. Update Market State
             self.state.last_price = ticker.last
+            # Prefer mark_price from ticker if available
+            self.state.mark_price = ticker.mark_price if ticker.mark_price > 0 else ticker.last
+
             self.match_engine.on_ticker(ticker)
 
             # 2. Strategy Logic
@@ -148,7 +153,14 @@ class SimStateManager:
                     self.match_engine.submit_order(q, ticker.timestamp)
 
             # 4. Update Equity Snapshot
-            current_equity = self.match_engine.get_equity((ticker.bid + ticker.ask) / 2)
+            # Use mid price or mark price for equity calc? 
+            # Usually equity is balance + UPNL. UPNL uses mark price.
+            # But get_equity in match_engine might use mid.
+            # Let's standardize on mark price if available for UPNL part.
+            
+            current_price = self.state.mark_price if self.state.mark_price > 0 else (ticker.bid + ticker.ask) / 2
+            current_equity = self.match_engine.balance + (current_price - self.match_engine.position_entry_price) * self.match_engine.position_size
+            
             snapshot = EquitySnapshot(
                 timestamp=ticker.timestamp,
                 balance=self.match_engine.balance,
@@ -211,8 +223,11 @@ class SimStateManager:
     def get_status(self) -> Dict:
         s = self.state
         unrealized = 0.0
-        if s.position_size != 0 and s.last_price > 0:
-            unrealized = (s.last_price - s.position_entry_price) * s.position_size
+        # Prefer mark_price for UPNL
+        price_for_upnl = s.mark_price if s.mark_price > 0 else s.last_price
+        
+        if s.position_size != 0 and price_for_upnl > 0:
+            unrealized = (price_for_upnl - s.position_entry_price) * s.position_size
 
         return {
             "running": s.running,
@@ -228,6 +243,7 @@ class SimStateManager:
             "equity": s.current_balance + unrealized,
             "total_fills": len(s.fills),
             "last_price": s.last_price,
+            "mark_price": s.mark_price,
         }
 
     def get_fills(self, limit: int = 100) -> List[Dict]:

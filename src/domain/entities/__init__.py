@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional, List, Dict
 from enum import Enum
 import time
@@ -43,6 +43,8 @@ class Ticker:
     last: float
     volume: float
     exchange: str = "thalex"
+    mark_price: float = 0.0
+    index_price: float = 0.0
     timestamp: float = field(default_factory=time.time)
 
     @property
@@ -96,6 +98,27 @@ class Position:
     gamma: float = 0.0
     theta: float = 0.0
     timestamp: float = field(default_factory=time.time)
+
+    def update_upnl(self, current_price: float) -> "Position":
+        """
+        Updates mark_price and recalculates unrealized_pnl.
+        Returns a NEW Position object (immutable pattern).
+        """
+        if current_price <= 0:
+            return self
+            
+        new_upnl = 0.0
+        if self.size != 0:
+            # Linear PnL Formula
+            new_upnl = (current_price - self.entry_price) * self.size
+            
+        return replace(
+            self,
+            mark_price=current_price,
+            unrealized_pnl=new_upnl,
+            timestamp=time.time()
+        )
+
 
 
 @dataclass(slots=True)

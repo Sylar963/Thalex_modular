@@ -64,41 +64,33 @@ class MarketFeedService:
             self.adapters.append(bybit)
             logger.info("Initialized Bybit Adapter")
 
-        # Connect and Subscribe
-        for adapter in self.adapters:
-            try:
-                # Wire up callbacks
-                adapter.set_trade_callback(self.on_trade)
-                adapter.set_ticker_callback(self.on_ticker)
-                if hasattr(adapter, "set_balance_callback"):
-                    adapter.set_balance_callback(self.on_balance)
+                # Connect and Subscribe
+                for adapter in self.adapters:
+                    try:
+                        # Wire up callbacks
+                        adapter.set_trade_callback(self.on_trade)
+                        adapter.set_ticker_callback(self.on_ticker)
+                        if hasattr(adapter, "set_balance_callback"):
+                            adapter.set_balance_callback(self.on_balance)
 
-                await adapter.connect()
+                        await adapter.connect()
 
-                # Determine symbols
-                symbols = os.getenv("MARKET_SYMBOLS", "BTC-PERPETUAL,BTCUSDT").split(
-                    ","
-                )
+                        # Determine symbols
+                        symbols = os.getenv("MARKET_SYMBOLS", "BTC-PERPETUAL,BTCUSDT").split(
+                            ","
+                        )
 
-                for sym in symbols:
-                    sym = sym.strip()
-                    if not sym:
-                        continue
+                        for sym in symbols:
+                            sym = sym.strip()
+                            if not sym:
+                                continue
 
-                    if adapter.name == "thalex" and "PERPETUAL" in sym:
-                        # Thalex Adapter usually handles tickers via same sub or separate
-                        # We'll explicit subscribe if method exists
-                        if hasattr(adapter, "subscribe_ticker"):
-                            await adapter.subscribe_ticker(sym)
+                            # All adapters now implement subscribe_ticker as the unified entry point
+                            if hasattr(adapter, "subscribe_ticker"):
+                                await adapter.subscribe_ticker(sym)
 
-                    elif adapter.name == "bybit":
-                        if hasattr(adapter, "subscribe_ticker"):
-                            # Bybit adapter needs explicit ticker sub usually
-                            await adapter.subscribe_ticker(sym)
-                        if hasattr(adapter, "subscribe_trades"):
-                            await adapter.subscribe_trades(sym)
+                        logger.info(f"Started {adapter.name}")
 
-                logger.info(f"Started {adapter.name}")
             except Exception as e:
                 logger.error(f"Failed to start adapter {adapter.name}: {e}")
 

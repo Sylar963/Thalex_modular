@@ -59,9 +59,15 @@ class MultiVenueTimeSyncService(TimeSyncManager):
             # Simple NTP-style offset: server_time - (local_time_at_receive - round_trip/2)
             # For trading, usually just (server_time - local_time) is used but this is better.
             local_estimate = (t0 + t1) // 2
-            offset = server_time - local_estimate
+            # Offset = Server - Local
+            # Added -11000ms extra buffer because local clock is consistently ~10s ahead of Bybit matching engine
+            offset = server_time - local_estimate - 11000
 
+            
             self.offsets[name] = offset
+
+
+
 
             logger.info(
                 f"TimeSync: {name} offset matched: {offset}ms (Drift: {t1 - t0}ms RTT)"

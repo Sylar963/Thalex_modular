@@ -186,10 +186,23 @@ class MultiExchangeStrategyManager:
 
             venue = self.venues.get(exchange)
             if not venue:
+                logger.warning(f"Ticker received for unknown exchange: {exchange}")
                 return
+
+            # Symbol filtering
+            if ticker.symbol != venue.config.symbol:
+                return
+            
+            # log every 100th ticker or so if needed, but for now let's just log arrival once
+            if not hasattr(venue, "_first_ticker_logged"):
+                logger.info(f"First ticker received for {exchange}:{ticker.symbol}")
+                venue._first_ticker_logged = True
 
             ticker = replace(ticker, exchange=exchange)
             venue.market_state = MarketState(ticker=ticker, timestamp=ticker.timestamp)
+
+            # Ensure state tracker is updated for real-time UPNL
+            await venue.state_tracker.update_ticker(ticker)
 
             if self.signal_engine:
                 self.signal_engine.update(ticker)
@@ -397,14 +410,19 @@ class MultiExchangeStrategyManager:
                     act = item["order"]
                     price_diff = abs(des.price - act.price)
                     size_diff = abs(des.size - act.size)
-                    if price_diff < 1e-9 and size_diff < 1e-9:
+                    
+                    # Robust price check: within 10% of a tick
+                    if price_diff < (tick_size * 0.1) and size_diff < 1e-6:
                         item["matched"] = True
                         found = True
                         break
-                    if price_diff <= (1.1 * tick_size) and size_diff < 1e-9:
+                    
+                    # Lazy Match: within 1.1 ticks
+                    if price_diff <= (1.1 * tick_size) and size_diff < 1e-6:
                         item["matched"] = True
                         found = True
                         break
+
                 if not found:
                     to_place_orders.append(des)
 

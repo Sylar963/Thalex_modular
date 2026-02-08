@@ -894,6 +894,7 @@ class ThalexAdapter(BaseExchangeAdapter):
             ask_size=self._safe_float(data.get("best_ask_amount", 0)),
             last=self._safe_float(data.get("last_price", 0)),
             volume=self._safe_float(data.get("volume_24h", 0)),
+            mark_price=self._safe_float(data.get("mark_price", 0)),
             timestamp=ts,
         )
 

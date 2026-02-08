@@ -191,10 +191,16 @@ class QuotingService:
         if not self.running:
             return
 
+        # DEBUG TRACE
+        logger.debug(f"QS received ticker: {ticker.symbol} {ticker.bid}/{ticker.ask}")
+
         # 1. Update Internal State
         self.market_state.ticker = ticker
         self.market_state.timestamp = ticker.timestamp
-        # tick_size remains 1.0 for now, could be dynamic later
+
+        # 1.1 Real-time UPNL and Mark Price Sync in StateTracker
+        if self.state_tracker:
+            await self.state_tracker.update_ticker(ticker)
 
         if self.dry_run and self.sim_engine:
             await self.state_tracker.update_position(

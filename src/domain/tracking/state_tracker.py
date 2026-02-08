@@ -228,7 +228,26 @@ class StateTracker:
 
     async def update_position(self, symbol: str, size: float, entry_price: float):
         async with self._lock:
-            self.positions[symbol] = Position(symbol, size, entry_price)
+            pos = self.positions.get(symbol)
+            if pos:
+                self.positions[symbol] = replace(
+                    pos, size=size, entry_price=entry_price, timestamp=time.time()
+                )
+            else:
+                self.positions[symbol] = Position(symbol, size, entry_price)
+
+    async def update_ticker(self, ticker: Ticker):
+        """Update position mark price and recalculate UPNL on every ticker."""
+        async with self._lock:
+            pos = self.positions.get(ticker.symbol)
+            if pos and pos.size != 0:
+                # Use mark_price from ticker, fallback to last or mid
+                price_for_upnl = ticker.mark_price if ticker.mark_price > 0 else ticker.last
+                if price_for_upnl == 0:
+                    price_for_upnl = (ticker.bid + ticker.ask) / 2.0
+                
+                if price_for_upnl > 0:
+                    self.positions[ticker.symbol] = pos.update_upnl(price_for_upnl)
 
     def get_position(self, symbol: str) -> Position:
         return self.positions.get(symbol, Position(symbol, 0.0, 0.0))
