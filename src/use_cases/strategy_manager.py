@@ -312,9 +312,6 @@ class MultiExchangeStrategyManager:
             self._last_trend_update = now
 
     async def _run_strategy_for_venue(self, venue: VenueContext):
-        if self._reconcile_lock.locked():
-            return
-
         # 1. Update Long-Term Trend
         await self._update_trends_if_needed(venue.config.symbol)
 
@@ -338,7 +335,13 @@ class MultiExchangeStrategyManager:
 
         current_mid = venue.market_state.ticker.mid_price
         tick_size = venue.config.tick_size
-        min_edge = tick_size * self.min_edge_threshold
+        
+        # Adjust min_edge based on venue characteristics to prevent stale behavior
+        # For Thalex with larger tick sizes, we need to be more sensitive to price changes
+        if tick_size >= 1.0:  # Thalex typically has 1.0 tick size
+            min_edge = tick_size * 0.1  # More sensitive for coarse tick sizes
+        else:
+            min_edge = tick_size * self.min_edge_threshold  # Standard sensitivity for fine tick sizes
 
         # 3. Handle Momentum Sub-strategy (Adds and Exits)
         await self._manage_momentum_strategy(venue)
@@ -439,28 +442,53 @@ class MultiExchangeStrategyManager:
             )
 
         if to_cancel_ids:
-            results = await gw.cancel_orders_batch(to_cancel_ids)
-            for oid, success in zip(to_cancel_ids, results):
-                if success:
-                    await venue.state_tracker.on_order_cancel(oid)
+            try:
+                results = await gw.cancel_orders_batch(to_cancel_ids)
+                for oid, success in zip(to_cancel_ids, results):
+                    if success:
+                        await venue.state_tracker.on_order_cancel(oid)
+            except ConnectionError as e:
+                logger.warning(f"Connection error during cancel_orders_batch for {exchange}: {e}")
+            except Exception as e:
+                logger.error(f"Unexpected error during cancel_orders_batch for {exchange}: {e}")
 
         if to_place_orders:
-            new_orders = await gw.place_orders_batch(to_place_orders)
-            for o in new_orders:
-                if o.status == OrderStatus.OPEN and o.exchange_id:
-                    await venue.state_tracker.submit_order(o)
-                    await venue.state_tracker.on_order_ack(o.id, o.exchange_id)
+            try:
+                new_orders = await gw.place_orders_batch(to_place_orders)
+                for o in new_orders:
+                    if o.status == OrderStatus.OPEN and o.exchange_id:
+                        await venue.state_tracker.submit_order(o)
+                        await venue.state_tracker.on_order_ack(o.id, o.exchange_id)
+            except ConnectionError as e:
+                logger.warning(f"Connection error during place_orders_batch for {exchange}: {e}")
+            except Exception as e:
+                logger.error(f"Unexpected error during place_orders_batch for {exchange}: {e}")
 
     async def _cancel_all_venue(self, venue: VenueContext):
         all_active = venue.state_tracker.get_open_orders()
         if not all_active:
             return
-        tasks = [
-            venue.config.gateway.cancel_order(t.order.exchange_id)
-            for t in all_active
-            if t.order.exchange_id
-        ]
+            
+        tasks = []
+        for t in all_active:
+            if t.order.exchange_id:
+                task = asyncio.create_task(
+                    self._safe_cancel_order(venue.config.gateway, t.order.exchange_id)
+                )
+                tasks.append(task)
+                
         await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _safe_cancel_order(self, gateway, order_id):
+        """Safely cancel an order, handling connection errors."""
+        try:
+            return await gateway.cancel_order(order_id)
+        except ConnectionError as e:
+            logger.warning(f"Connection error during cancel_order for {gateway.name}: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error during cancel_order for {gateway.name}: {e}")
+            return False
 
     def _on_global_state_change(self, state: GlobalState):
         net_position = state.net_position

@@ -4,7 +4,16 @@
         "thalex": {
             "enabled": true,
             "symbols": ["BTC-PERPETUAL"],
-            "testnet": false
+            "testnet": false,
+            "strategy_params": {
+                "gamma": 0.3,
+                "volatility": 0.02,
+                "position_limit": 0.01,
+                "min_spread": 50,
+                "quote_levels": 1,
+                "level_spacing_factor": 0.5,
+                "order_size": 0.001
+            }
         },
         "bybit": {
             "enabled": true,

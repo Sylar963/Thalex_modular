@@ -71,6 +71,9 @@ class ThalexAdapter(BaseExchangeAdapter):
 
         network = Network.TEST if testnet else Network.PROD
         self.client = Thalex(network)
+        
+        # Flag to indicate if the adapter is currently reconnecting
+        self.is_reconnecting = False
 
     @property
     def name(self) -> str:
@@ -363,6 +366,11 @@ class ThalexAdapter(BaseExchangeAdapter):
         if not requests:
             return []
 
+        # Check if the adapter is currently reconnecting
+        if self.is_reconnecting:
+            logger.warning(f"Cannot send batch of {len(requests)} requests: Adapter is reconnecting.")
+            return [ConnectionError("Adapter is reconnecting")] * len(requests)
+
         futures = []
         batch_payload = []
 
@@ -422,6 +430,11 @@ class ThalexAdapter(BaseExchangeAdapter):
         if not self.connected:
             logger.warning(f"Cannot place {len(orders)} orders: Not connected.")
             return [replace(o, status=OrderStatus.REJECTED) for o in orders]
+            
+        # Check if the adapter is currently reconnecting
+        if self.is_reconnecting:
+            logger.warning(f"Cannot place {len(orders)} orders: Adapter is reconnecting.")
+            return [replace(o, status=OrderStatus.REJECTED) for o in orders]
 
         logger.debug(f"Waiting for rate limit tokens for {len(orders)} orders...")
         await self.me_rate_limiter.consume_wait(len(orders))
@@ -480,6 +493,11 @@ class ThalexAdapter(BaseExchangeAdapter):
     async def cancel_orders_batch(self, order_ids: List[str]) -> List[bool]:
         """Cancel multiple orders in a single batch."""
         if not self.connected or not order_ids:
+            return [False] * len(order_ids)
+            
+        # Check if the adapter is currently reconnecting
+        if self.is_reconnecting:
+            logger.warning(f"Cannot cancel {len(order_ids)} orders: Adapter is reconnecting.")
             return [False] * len(order_ids)
 
         await self.cancel_rate_limiter.consume_wait(len(order_ids))
@@ -665,6 +683,9 @@ class ThalexAdapter(BaseExchangeAdapter):
         self._fail_pending_requests(ConnectionError("Disconnected"))
 
     async def _attempt_reconnect(self):
+        # Set the reconnection flag to prevent other operations during reconnection
+        self.is_reconnecting = True
+        
         max_retries = 10
         base_delay = 1.0
         for attempt in range(max_retries):
@@ -694,6 +715,9 @@ class ThalexAdapter(BaseExchangeAdapter):
 
                 logger.info("Reconnection successful.")
                 self.last_msg_time = time.time()
+                
+                # Reset the reconnection flag after successful reconnection
+                self.is_reconnecting = False
                 return
 
             except Exception as e:
@@ -701,6 +725,9 @@ class ThalexAdapter(BaseExchangeAdapter):
 
         logger.error("All reconnection attempts failed. Giving up.")
         self.connected = False
+        
+        # Reset the reconnection flag even if reconnection failed
+        self.is_reconnecting = False
 
     def _fail_pending_requests(self, exc: Exception):
         """Cancel all pending requests with exception"""
@@ -731,6 +758,8 @@ class ThalexAdapter(BaseExchangeAdapter):
                 if len(part) >= 2:
                     symbol = part[1]
                     ticker = self._map_ticker(symbol, data)
+                    # Update ticker liveness timestamp
+                    self.last_ticker_time = time.time()
                     if self.ticker_callback:
                         await self.ticker_callback(ticker)
 
@@ -855,6 +884,8 @@ class ThalexAdapter(BaseExchangeAdapter):
                 if len(part) >= 2:
                     symbol = part[1]
                     ticker = self._map_ticker(symbol, data)
+                    # Update ticker liveness timestamp
+                    self.last_ticker_time = time.time()
                     if self.ticker_callback:
                         await self.ticker_callback(ticker)
 
@@ -876,10 +907,27 @@ class ThalexAdapter(BaseExchangeAdapter):
                             await self.trade_callback(trade)
 
     async def _heartbeat_monitor(self):
+        # Track ticker-specific liveness in addition to general messages
+        self.last_ticker_time = time.time()
+        
+        # Define ticker death threshold as a constant
+        TICKER_DEATH_THRESHOLD = 90  # seconds
+
         while self.connected:
             await asyncio.sleep(5)
+
+            # Check for general message liveness
             if time.time() - self.last_msg_time > 60:
                 logger.warning("No messages for 60s. Potential stale connection.")
+
+            # Check for ticker-specific liveness (more critical for trading)
+            if time.time() - self.last_ticker_time > TICKER_DEATH_THRESHOLD:
+                logger.warning(f"No ticker updates for {TICKER_DEATH_THRESHOLD}s. Potential ticker death.")
+
+                # Trigger reconnection to restore ticker feed
+                if self.connected:
+                    logger.info("Attempting ticker reconnection...")
+                    await self._attempt_reconnect()
 
     def _map_ticker(self, symbol: str, data: Dict) -> Ticker:
         ts = self._safe_float(data.get("timestamp", time.time()))
