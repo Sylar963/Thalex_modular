@@ -62,7 +62,7 @@ Thumbs.db
 .venv
 .conda
 # Sensitive data
-
+skills/
 
 # Testing
 .coverage

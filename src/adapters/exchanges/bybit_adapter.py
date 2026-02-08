@@ -421,14 +421,77 @@ class BybitAdapter(BaseExchangeAdapter):
         return [await self.cancel_order(oid) for oid in order_ids]
 
     async def get_open_orders(self, symbol: str) -> List[Order]:
-        """Fetch all open orders for a specific symbol."""
-        # For now return local cache as a stub to satisfy interface
-        return [
-            o
-            for o in self.orders.values()
-            if o.symbol == symbol
-            and o.status in [OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED]
-        ]
+        """Fetch all open orders from Bybit for a specific symbol."""
+        mapped_symbol = InstrumentService.get_exchange_symbol(symbol, self.name)
+        params = f"category=linear&symbol={mapped_symbol}"
+        url = f"{self.base_url}/v5/order/realtime?{params}"
+
+        async with self.session.get(url, headers=self._get_headers(params)) as resp:
+            data = await resp.json()
+            if data.get("retCode") == 0:
+                result = data.get("result", {})
+                raw_orders = result.get("list", [])
+                orders = []
+                for raw in raw_orders:
+                    status_map = {
+                        "New": OrderStatus.OPEN,
+                        "PartiallyFilled": OrderStatus.PARTIALLY_FILLED,
+                        "Filled": OrderStatus.FILLED,
+                        "Cancelled": OrderStatus.CANCELLED,
+                        "Rejected": OrderStatus.REJECTED,
+                    }
+                    order = Order(
+                        id=raw.get("orderLinkId", ""),
+                        exchange_id=raw.get("orderId", ""),
+                        symbol=symbol,
+                        side=OrderSide.BUY
+                        if raw.get("side") == "Buy"
+                        else OrderSide.SELL,
+                        price=float(raw.get("price", 0)),
+                        size=float(raw.get("qty", 0)),
+                        filled_size=float(raw.get("cumExecQty", 0)),
+                        status=status_map.get(raw.get("orderStatus"), OrderStatus.OPEN),
+                        type=OrderType.LIMIT
+                        if raw.get("orderType") == "Limit"
+                        else OrderType.MARKET,
+                        exchange=self.name,
+                    )
+                    orders.append(order)
+                    # Seed local cache
+                    self.orders[order.exchange_id] = order
+                return orders
+            else:
+                logger.error(f"Bybit get_open_orders error: {data}")
+                return []
+
+    async def cancel_all_orders(self, symbol: str) -> bool:
+        """Cancel all open orders for a specific symbol on Bybit."""
+        mapped_symbol = InstrumentService.get_exchange_symbol(symbol, self.name)
+        payload = {"category": "linear", "symbol": mapped_symbol}
+        payload_str = self._fast_json_encode(payload)
+
+        url = f"{self.base_url}/v5/order/cancel-all"
+        async with self.session.post(
+            url, data=payload_str, headers=self._get_headers(payload_str)
+        ) as resp:
+            data = await resp.json()
+            if data.get("retCode") == 0:
+                logger.info(f"Successfully cancelled all orders on Bybit for {symbol}")
+                # Clear matching local orders
+                to_remove = [
+                    oid
+                    for oid, o in self.orders.items()
+                    if o.symbol == symbol
+                    and o.status in [OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED]
+                ]
+                for oid in to_remove:
+                    self.orders[oid] = replace(
+                        self.orders[oid], status=OrderStatus.CANCELLED
+                    )
+                return True
+            else:
+                logger.error(f"Bybit cancel_all_orders error: {data}")
+                return False
 
     async def subscribe_ticker(self, symbol: str):
         """Subscribe to orderbook stream."""

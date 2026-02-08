@@ -1,7 +1,6 @@
 import asyncio
 import logging
-import time
-from typing import Dict, List, Optional, Any, Callable
+from typing import Dict, List, Optional, Callable
 from dataclasses import replace
 
 try:
@@ -19,10 +18,8 @@ from ...services.instrument_service import InstrumentService
 from ...domain.entities import (
     Order,
     OrderSide,
-    OrderType,
     OrderStatus,
     Position,
-    Ticker,
     Trade,
     Balance,
 )
@@ -225,8 +222,6 @@ class HyperliquidAdapter(BaseExchangeAdapter):
             "message": action,
         }
 
-        import json
-
         action_hash = encode_typed_data(full_message=typed_data)
         signed = self.account.sign_message(action_hash)
         return signed.signature.hex()
@@ -323,16 +318,103 @@ class HyperliquidAdapter(BaseExchangeAdapter):
         return [await self.place_order(o) for o in orders]
 
     async def cancel_orders_batch(self, order_ids: List[str]) -> List[bool]:
-        return [await self.cancel_order(oid) for oid in order_ids]
+        """Cancel multiple orders in a single request."""
+        if not order_ids:
+            return []
+
+        # Group by symbol/asset since Hyperliquid needs asset index
+        # For simplicity and since most cases are for one symbol, we fetch first's asset
+        first_order = self.orders.get(order_ids[0])
+        if not first_order:
+            return [False] * len(order_ids)
+
+        mapped_symbol = InstrumentService.get_exchange_symbol(
+            first_order.symbol, self.name
+        )
+        asset_index = self._get_asset_index(mapped_symbol)
+        nonce = self._get_timestamp()
+
+        action = {
+            "type": "cancel",
+            "cancels": [{"asset": asset_index, "oid": int(oid)} for oid in order_ids],
+        }
+        signature = self._sign_action(action, nonce)
+
+        payload = {
+            "action": action,
+            "nonce": nonce,
+            "signature": {
+                "r": signature[:66],
+                "s": "0x" + signature[66:130],
+                "v": int(signature[130:], 16),
+            },
+        }
+
+        url = f"{self.base_url}/exchange"
+        try:
+            async with self.session.post(url, json=payload) as resp:
+                data = await resp.json()
+                if data.get("status") == "ok":
+                    for oid in order_ids:
+                        if oid in self.orders:
+                            self.orders[oid] = replace(
+                                self.orders[oid], status=OrderStatus.CANCELLED
+                            )
+                    return [True] * len(order_ids)
+                logger.error(f"Hyperliquid batch cancel error: {data}")
+                return [False] * len(order_ids)
+        except Exception as e:
+            logger.error(f"Hyperliquid batch cancel exception: {e}")
+            return [False] * len(order_ids)
 
     async def get_open_orders(self, symbol: str) -> List[Order]:
-        """Fetch all open orders for a specific symbol."""
-        return [
-            o
-            for o in self.orders.values()
-            if o.symbol == symbol
-            and o.status in [OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED]
-        ]
+        """Fetch all open orders from Hyperliquid for a specific symbol."""
+        url = f"{self.base_url}/info"
+        payload = {"type": "openOrders", "user": self.address}
+
+        try:
+            async with self.session.post(url, json=payload) as resp:
+                data = await resp.json()
+                orders = []
+                for raw in data:
+                    if raw.get("coin") != symbol:
+                        continue
+
+                    # status_map not needed as Hyperliquid openOrders returns only active ones
+                    order = Order(
+                        id=str(raw.get("cloid", "")),
+                        exchange_id=str(raw.get("oid", "")),
+                        symbol=symbol,
+                        side=OrderSide.BUY
+                        if raw.get("side") == "B"
+                        else OrderSide.SELL,
+                        price=float(raw.get("limitPx", 0)),
+                        size=float(raw.get("sz", 0)),
+                        filled_size=float(raw.get("cumSz", 0)),
+                        status=OrderStatus.OPEN,
+                        type=OrderType.LIMIT,  # Hyperliquid open orders are typically limit
+                        exchange=self.name,
+                    )
+                    orders.append(order)
+                    # Seed local cache
+                    self.orders[order.exchange_id] = order
+                return orders
+        except Exception as e:
+            logger.error(f"Hyperliquid get_open_orders error: {e}")
+            return []
+
+    async def cancel_all_orders(self, symbol: str) -> bool:
+        """Cancel all open orders for a specific symbol on Hyperliquid."""
+        open_orders = await self.get_open_orders(symbol)
+        if not open_orders:
+            return True
+
+        order_ids = [o.exchange_id for o in open_orders if o.exchange_id]
+        if not order_ids:
+            return True
+
+        results = await self.cancel_orders_batch(order_ids)
+        return all(results)
 
     async def subscribe_ticker(self, symbol: str):
         asyncio.create_task(self._ticker_stream(symbol))
@@ -400,7 +482,6 @@ class HyperliquidAdapter(BaseExchangeAdapter):
                     total_margin_used = float(
                         margin_summary.get("totalMarginUsed", 0.0)
                     )
-                    total_ncn = float(margin_summary.get("totalNtlPos", 0.0))
                     withdrawable = float(data.get("withdrawable", 0.0))
 
                     from ...domain.entities import Balance

@@ -304,13 +304,83 @@ class BinanceAdapter(BaseExchangeAdapter):
         return results
 
     async def get_open_orders(self, symbol: str) -> List[Order]:
-        """Fetch all open orders for a specific symbol."""
-        return [
-            o
-            for o in self.orders.values()
-            if o.symbol == symbol
-            and o.status in [OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED]
-        ]
+        """Fetch all open orders from Binance Futures for a specific symbol."""
+        mapped_symbol = InstrumentService.get_exchange_symbol(symbol, self.name)
+        params = {
+            "symbol": mapped_symbol,
+            "timestamp": self._get_timestamp(),
+        }
+        params["signature"] = self._sign(params)
+
+        url = f"{self.base_url}/fapi/v1/openOrders"
+        async with self.session.get(url, params=params) as resp:
+            data = await resp.json()
+            if resp.status == 200:
+                orders = []
+                for raw in data:
+                    status_map = {
+                        "NEW": OrderStatus.OPEN,
+                        "PARTIALLY_FILLED": OrderStatus.PARTIALLY_FILLED,
+                        "FILLED": OrderStatus.FILLED,
+                        "CANCELED": OrderStatus.CANCELLED,
+                        "REJECTED": OrderStatus.REJECTED,
+                        "EXPIRED": OrderStatus.CANCELLED,
+                    }
+                    order = Order(
+                        id=raw.get("clientOrderId", ""),
+                        exchange_id=str(raw.get("orderId", "")),
+                        symbol=symbol,
+                        side=OrderSide.BUY
+                        if raw.get("side") == "BUY"
+                        else OrderSide.SELL,
+                        price=float(raw.get("price", 0)),
+                        size=float(raw.get("origQty", 0)),
+                        filled_size=float(raw.get("executedQty", 0)),
+                        status=status_map.get(raw.get("status"), OrderStatus.OPEN),
+                        type=OrderType.LIMIT
+                        if raw.get("type") == "LIMIT"
+                        else OrderType.MARKET,
+                        exchange=self.name,
+                    )
+                    orders.append(order)
+                    # Seed local cache
+                    self.orders[order.exchange_id] = order
+                return orders
+            else:
+                logger.error(f"Binance get_open_orders error: {data}")
+                return []
+
+    async def cancel_all_orders(self, symbol: str) -> bool:
+        """Cancel all open orders for a specific symbol on Binance Futures."""
+        mapped_symbol = InstrumentService.get_exchange_symbol(symbol, self.name)
+        params = {
+            "symbol": mapped_symbol,
+            "timestamp": self._get_timestamp(),
+        }
+        params["signature"] = self._sign(params)
+
+        url = f"{self.base_url}/fapi/v1/allOpenOrders"
+        async with self.session.delete(url, params=params) as resp:
+            data = await resp.json()
+            if resp.status == 200:
+                logger.info(
+                    f"Successfully cancelled all orders on Binance for {symbol}"
+                )
+                # Update local cache
+                to_remove = [
+                    oid
+                    for oid, o in self.orders.items()
+                    if o.symbol == symbol
+                    and o.status in [OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED]
+                ]
+                for oid in to_remove:
+                    self.orders[oid] = replace(
+                        self.orders[oid], status=OrderStatus.CANCELLED
+                    )
+                return True
+            else:
+                logger.error(f"Binance cancel_all_orders error: {data}")
+                return False
 
     async def subscribe_ticker(self, symbol: str):
         mapped_symbol = InstrumentService.get_exchange_symbol(symbol, self.name)

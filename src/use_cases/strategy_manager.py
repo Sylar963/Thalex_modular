@@ -146,10 +146,18 @@ class MultiExchangeStrategyManager:
             cfg.tick_size = getattr(gw, "tick_size", cfg.tick_size)
             logger.info(f"Dynamic tick_size for {cfg.symbol}: {cfg.tick_size}")
 
-        if hasattr(gw, "cancel_all_orders"):
-            await gw.cancel_all_orders(cfg.symbol)
-            venue.state_tracker.pending_orders.clear()
-            venue.state_tracker.confirmed_orders.clear()
+        if hasattr(gw, "get_open_orders"):
+            try:
+                open_orders = await gw.get_open_orders(cfg.symbol)
+                for o in open_orders:
+                    await venue.state_tracker.seed_order(o)
+                logger.info(
+                    f"Synchronized {len(open_orders)} existing orders for {gw.name}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to fetch initial open orders for {gw.name}: {e}"
+                )
 
         try:
             initial_pos = await gw.get_position(cfg.symbol)

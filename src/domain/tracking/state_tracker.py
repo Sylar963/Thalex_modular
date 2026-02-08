@@ -128,6 +128,24 @@ class StateTracker:
                 self.confirmed_orders[exchange_id] = tracked
                 logger.debug(f"Order {local_id} -> {exchange_id} CONFIRMED")
 
+    async def seed_order(self, order: Order):
+        """Allows seeding already-existing orders (e.g., found on startup) into the tracker."""
+        async with self._lock:
+            if not order.exchange_id:
+                logger.warning(f"Cannot seed order without exchange_id: {order}")
+                return
+
+            tracked = TrackedOrder(
+                order=order,
+                state=OrderState.CONFIRMED,
+                submit_time=time.time(),
+                confirm_time=time.time(),
+            )
+            self.confirmed_orders[order.exchange_id] = tracked
+            logger.info(
+                f"Seeded existing order {order.exchange_id} ({order.side.value} {order.size} @ {order.price})"
+            )
+
     async def on_order_fill(
         self,
         exchange_id: str,
