@@ -11,7 +11,9 @@ async def test():
             "method": "public/get_tickers",
             "params": {
                 "currency": "HYPE",
-                "instrument_type": "option"
+                "instrument_type": "option",
+                "expiry": 1770537600,
+                "expired": False
             },
             "id": 1
         }
@@ -25,11 +27,13 @@ async def test():
             if "error" in data:
                 print(json.dumps(data, indent=2))
             else:
-                # Print only first 2 results to save space
                 result = data.get("result", [])
-                print(f"Result count: {len(result)}")
-                if result:
+                if isinstance(result, list):
+                    print(f"Result count: {len(result)}")
                     print(json.dumps(result[:2], indent=2))
+                else:
+                    print("Result is not a list:")
+                    print(json.dumps(result, indent=2))
         except Exception as e:
             print(f"Error receiving: {e}")
 

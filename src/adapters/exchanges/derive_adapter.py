@@ -173,7 +173,7 @@ class DeriveAdapter(BaseExchangeAdapter):
             # Silent fallback/fail for public data if one method worked
             return []
             
-    async def get_tickers(self, currency: str = "HYPE", instrument_type: str = "option", expiry: Optional[str] = None) -> List[Dict]:
+    async def get_tickers(self, currency: str = "HYPE", instrument_type: str = "option", expiry: Optional[Union[str, int]] = None) -> List[Dict]:
         """Fetch initial tickers via WebSocket (preferred) or REST."""
         params = {
             "currency": currency,
@@ -183,17 +183,32 @@ class DeriveAdapter(BaseExchangeAdapter):
             params["expiry"] = expiry
 
         try:
+            result = None
             if self.connected:
                 response = await self._rpc_request_ws("public/get_tickers", params)
-                if "result" in response:
-                    return response["result"]
+                result = response.get("result")
             
-            # Fallback to HTTP
-            response = await self._rpc_request_http("public/get_tickers", params)
-            if "result" in response:
-                return response["result"]
+            if not result:
+                # Fallback to HTTP
+                response = await self._rpc_request_http("public/get_tickers", params)
+                result = response.get("result")
+            
+            if not result:
+                return []
+                
+            # Derive v2 returns a dict {"tickers": {"NAME": {...}, ...}} or similar
+            if isinstance(result, dict) and "tickers" in result:
+                tickers_dict = result["tickers"]
+                ticker_list = []
+                for name, data in tickers_dict.items():
+                    data["instrument_name"] = name
+                    ticker_list.append(data)
+                return ticker_list
+            elif isinstance(result, list):
+                return result
             return []
-        except Exception:
+        except Exception as e:
+            logger.error(f"get_tickers failed: {e}")
             return []
 
     async def subscribe_ticker(self, instrument_names: Union[str, List[str]], interval: str = "100ms"):
@@ -337,16 +352,31 @@ class DeriveAdapter(BaseExchangeAdapter):
                 strike = parts[2]
                 opt_type = parts[3]
                 
+                # Check ticker root for mark_price if option_pricing is missing/zero
+                # In Derive v2 get_tickers result, mark_price might be top level
+                opt_pricing = ticker.get('option_pricing', {})
+                mark_price = self._safe_float(opt_pricing.get('mark_price'))
+                if mark_price == 0:
+                     mark_price = self._safe_float(ticker.get('mark_price', ticker.get('mp')))
+                
+                iv = self._safe_float(opt_pricing.get('iv'))
+                if iv == 0:
+                     iv = self._safe_float(ticker.get('mark_iv', ticker.get('iv')))
+
+                delta = self._safe_float(opt_pricing.get('delta'))
+                if delta == 0:
+                     delta = self._safe_float(ticker.get('delta', ticker.get('delta')))
+
                 chain_data.append({
                     'instrument_name': name,
                     'expiry': expiry,
                     'strike': float(strike),
                     'type': 'Call' if 'C' in opt_type else 'Put',
-                    'mark_price': self._safe_float(ticker.get('mark_price')),
-                    'bid': self._safe_float(ticker.get('best_bid_price')),
-                    'ask': self._safe_float(ticker.get('best_ask_price')),
-                    'iv': self._safe_float(ticker.get('mark_iv')),
-                    'delta': self._safe_float(ticker.get('greeks', {}).get('delta')),
+                    'mark_price': mark_price,
+                    'bid': self._safe_float(ticker.get('best_bid_price', ticker.get('bp'))),
+                    'ask': self._safe_float(ticker.get('best_ask_price', ticker.get('ap'))),
+                    'iv': iv,
+                    'delta': delta,
                 })
                 
         return pd.DataFrame(chain_data)

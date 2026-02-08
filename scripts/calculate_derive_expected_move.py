@@ -27,43 +27,43 @@ async def main():
 
         logger.info(f"Found {len(chain)} HYPE option instruments.")
         
-        # 4. Filter for nearest expiration
-        # Convert expiry strings to dates or sort. Assuming '20MAY24' or '20240520' format?
-        # Derive v2 uses 'YYYYMMDD' usually? Or 'DMMMYY'?
-        # Let's inspect the first expiry format if possible, but assuming standard sort works for now if format is YYYYMMDD.
-        # If it's 20240315 it sorts correctly.
+        # 4. Filter for 15-day minimum expiry
+        now_ts = datetime.now().timestamp()
+        min_expiry_ts = now_ts + (15 * 24 * 3600)
         
-        # Filter out expired? The API call already had expired=False.
+        # Get unique expiries and their timestamps from option_details if available, 
+        # but build_options_chain just gives the string 'expiry'.
+        # Let's re-fetch instruments to get timestamps.
+        instruments = await adapter.get_instruments(currency="HYPE")
+        valid_expiries = []
+        for inst in instruments:
+            expiry_ts = inst['option_details']['expiry']
+            if expiry_ts >= min_expiry_ts:
+                valid_expiries.append((expiry_ts, inst['instrument_name'].split('-')[1]))
         
-        expiries = sorted(chain['expiry'].unique())
-        if not expiries:
-            logger.error("No expiries found.")
+        if not valid_expiries:
+            logger.error("No expiries found matching 15-day minimum.")
             return
             
-        target_expiry = expiries[0] # Nearest expiry
-        logger.info(f"Targeting nearest expiry: {target_expiry}")
+        # Sort by timestamp and pick the first one >= 15 days
+        valid_expiries.sort()
+        target_expiry_ts, target_expiry_str = valid_expiries[0]
+        logger.info(f"Targeting 15-day+ expiry: {target_expiry_str} (TS: {target_expiry_ts})")
         
-        expiry_chain = chain[chain['expiry'] == target_expiry]
+        expiry_chain = chain[chain['expiry'] == target_expiry_str]
         
         # 5. Find ATM Strike
-        # We need the underlying price. We can get it from the 'index_price' of any option ticker 
-        # or just infer it from the straddle with minimum difference.
-        # Alternatively, fetch the Spot Ticker.
-        
-        # Let's use the average of the strikes with the lowest premium spread? 
-        # Or easier: Find the strike where Call Price ~ Put Price (Straddle Delta Neutral).
-        # Or just get the index price.
-        
-        # To get index price, we can fetch "public/get_ticker" for the perpetual if available?
-        # Or just use the 'underlying_price' / 'index_price' field if present in ticker. 
-        # The 'get_tickers' result usually has 'index_price'.
-        
-        # Let's re-fetch tickers to get index price from one of them.
-        tickers = await adapter.get_tickers(currency="HYPE")
-        if tickers:
-            index_price = float(tickers[0].get('index_price', 0))
+        # Fetch HYPE-PERP ticker specifically for reliable index price
+        perp_tickers = await adapter.get_tickers(currency="HYPE", instrument_type="perp")
+        index_price = 0.0
+        if perp_tickers:
+            # Handle the specific dict-to-list format from our adapter update
+            perp_data = perp_tickers[0]
+            # In Derive v2, 'I' is index price in the slim/ticker data
+            index_price = float(perp_data.get('I', perp_data.get('index_price', 0)))
             logger.info(f"Current HYPE Index Price: {index_price}")
-        else:
+        
+        if index_price == 0:
             logger.warning("Could not fetch index price. Estimating from strikes.")
             index_price = expiry_chain['strike'].mean()
 
@@ -74,17 +74,28 @@ async def main():
         
         logger.info(f"ATM Strike: {atm_strike}")
         
-        # 6. Subscribe to ATM Call and Put (Optional, but good for verification of live data)
-        # We can just use the snapshot from 'build_options_chain' if it populated prices.
-        
         atm_call = expiry_chain[(expiry_chain['strike'] == atm_strike) & (expiry_chain['type'] == 'Call')].iloc[0]
         atm_put = expiry_chain[(expiry_chain['strike'] == atm_strike) & (expiry_chain['type'] == 'Put')].iloc[0]
         
-        c_price = atm_call['mark_price']
-        p_price = atm_put['mark_price']
+        # 6. Fetch specific ATM Call and Put tickers for pricing
+        # We use public/get_ticker for these specifically as build_options_chain might have missed them
+        call_name = atm_call['instrument_name']
+        put_name = atm_put['instrument_name']
         
-        logger.info(f"ATM Call ({atm_strike}): {c_price}")
-        logger.info(f"ATM Put  ({atm_strike}): {p_price}")
+        logger.info(f"Fetching specific tickers for ATM pair: {call_name}, {put_name}")
+        
+        call_resp = await adapter._rpc_request_ws("public/get_ticker", {"instrument_name": call_name})
+        put_resp = await adapter._rpc_request_ws("public/get_ticker", {"instrument_name": put_name})
+        
+        c_ticker = call_resp.get("result", {})
+        p_ticker = put_resp.get("result", {})
+        
+        # Extract mark price from result root or option_pricing
+        c_price = float(c_ticker.get('mark_price', c_ticker.get('option_pricing', {}).get('mark_price', 0)))
+        p_price = float(p_ticker.get('mark_price', p_ticker.get('option_pricing', {}).get('mark_price', 0)))
+        
+        logger.info(f"ATM Call ({call_name}): {c_price}")
+        logger.info(f"ATM Put  ({put_name}): {p_price}")
         
         # 7. Calculate Expected Move
         # Formula: 0.85 * (ATM Call + ATM Put) for approx 1 standard deviation move?
@@ -95,7 +106,7 @@ async def main():
         
         print("\n" + "="*40)
         print(f"DERIVE HYPE OPTIONS ANALYSIS")
-        print(f"Expiry: {target_expiry}")
+        print(f"Expiry: {target_expiry_str}")
         print(f"Index Price: ${index_price:.4f}")
         print(f"ATM Strike: {atm_strike}")
         print("-" * 40)
