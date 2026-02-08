@@ -735,7 +735,9 @@ class TimescaleDBAdapter(StorageGateway):
             process_rows(trade_rows, "trades")
 
             # 6. Sort and Return
-            final_history = sorted(merged.values(), key=lambda x: x["time"])
+            final_history = sorted(
+                [c for c in merged.values() if c["close"] > 0], key=lambda x: x["time"]
+            )
 
             if not final_history:
                 logger.warning(

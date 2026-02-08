@@ -69,6 +69,9 @@ class ThalexAdapter(BaseExchangeAdapter):
             capacity=int(cancel_rate_limit * 1.1), fill_rate=cancel_rate_limit
         )
 
+        network = Network.TEST if testnet else Network.PROD
+        self.client = Thalex(network)
+
     @property
     def name(self) -> str:
         return "thalex"
