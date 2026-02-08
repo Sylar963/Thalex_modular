@@ -404,10 +404,6 @@ class TimescaleDBAdapter(StorageGateway):
     async def save_ticker(self, ticker: Ticker):
         if not self.pool:
             return
-
-    async def save_ticker(self, ticker: Ticker):
-        if not self.pool:
-            return
         try:
             async with self.pool.acquire() as conn:
                 await conn.execute(
@@ -666,13 +662,14 @@ class TimescaleDBAdapter(StorageGateway):
         # Core Query Builder for Candles
         async def fetch_candles(table_name: str, price_col: str, vol_col: str):
             placeholders = ",".join([f"${i + 4}" for i in range(len(symbols))])
+            # Enhanced aggregation to ignore <= 0 prices
             query = f"""
                 SELECT
                     time_bucket($1, time) AS bucket,
-                    FIRST({price_col}, time) as open,
-                    MAX({price_col}) as high,
-                    MIN({price_col}) as low,
-                    LAST({price_col}, time) as close,
+                    FIRST({price_col}, time) FILTER (WHERE {price_col} > 0) as open,
+                    MAX({price_col}) FILTER (WHERE {price_col} > 0) as high,
+                    MIN({price_col}) FILTER (WHERE {price_col} > 0) as low,
+                    LAST({price_col}, time) FILTER (WHERE {price_col} > 0) as close,
                     SUM({vol_col}) as volume
                 FROM {table_name}
                 WHERE symbol IN ({placeholders})
@@ -704,6 +701,11 @@ class TimescaleDBAdapter(StorageGateway):
             def process_rows(rows, source_name):
                 for r in rows:
                     t = r["bucket"].timestamp()
+                    
+                    # Safety check for NULLs which can occur if a bucket has no trades/ticks
+                    if r["open"] is None or r["close"] is None or r["high"] is None or r["low"] is None:
+                        continue
+                        
                     data = {
                         "time": t,
                         "open": float(r["open"]),
@@ -961,21 +963,6 @@ class TimescaleDBAdapter(StorageGateway):
         except Exception as e:
             logger.error(f"Failed to fetch tick bars: {e}")
             return []
-
-    async def _init_balances_table(self, conn):
-        """Create account balances table."""
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS account_balances (
-                exchange TEXT NOT NULL,
-                asset TEXT NOT NULL,
-                total DOUBLE PRECISION NOT NULL,
-                available DOUBLE PRECISION NOT NULL,
-                margin_used DOUBLE PRECISION DEFAULT 0.0,
-                equity DOUBLE PRECISION DEFAULT 0.0,
-                last_update TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (exchange, asset)
-            );
-        """)
 
     async def save_balance(self, balance):
         if not self.pool:

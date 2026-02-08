@@ -11,7 +11,7 @@ class MetricsRepository:
         self.name = os.getenv("DATABASE_NAME", "thalex_trading")
         self.user = os.getenv("DATABASE_USER", "postgres")
         self.password = os.getenv("DATABASE_PASSWORD", "password")
-        self.port = os.getenv("DATABASE_PORT", "5433")
+        self.port = os.getenv("DATABASE_PORT", "5432")
 
     def _get_conn(self):
         return psycopg2.connect(

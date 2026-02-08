@@ -16,6 +16,7 @@ from ..adapters.exchanges.thalex_adapter import ThalexAdapter
 from ..domain.entities import Trade, Ticker
 from ..domain.signals.open_range import OpenRangeSignalEngine
 from ..use_cases.sim_state_manager import sim_state_manager
+from ..domain.services.market_validator import MarketDataValidator
 
 logger = logging.getLogger("DataIngestor")
 
@@ -29,11 +30,15 @@ class DataIngestionService:
         self.running = False
         self.tasks: List[asyncio.Task] = []
         self.config = self._load_json_config()
+        self.validator = MarketDataValidator()
 
     def _load_json_config(self) -> Dict:
         """Load data_ingestion config from config.json"""
         try:
-            config_path = os.path.join(os.getcwd(), "config.json")
+            # Robust path resolution relative to project root
+            base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            config_path = os.path.join(base_dir, "config.json")
+            
             if os.path.exists(config_path):
                 with open(config_path, "rb") as f:
                     return orjson.loads(f.read())
@@ -217,13 +222,18 @@ class DataIngestionService:
         await self.storage.disconnect()
 
     async def on_trade(self, trade: Trade):
+        # Validate first
+        valid_trade = self.validator.validate_trade(trade)
+        if not valid_trade:
+            return
+
         # Persist to DB
         try:
-            asyncio.create_task(self.storage.save_trade(trade))
+            asyncio.create_task(self.storage.save_trade(valid_trade))
 
             # Update Signal Engine
             if self.or_engine:
-                self.or_engine.update_trade(trade)
+                self.or_engine.update_trade(valid_trade)
 
         except Exception as e:
             logger.error(f"Failed to process trade: {e}")
@@ -237,15 +247,62 @@ class DataIngestionService:
             logger.error(f"Failed to process balance: {e}")
 
     async def on_ticker(self, ticker: Ticker):
+        # Validate first
+        valid_ticker = self.validator.validate_ticker(ticker)
+        if not valid_ticker:
+            return
+
         # 1. Persist Ticker
         try:
             # We can optionally sample decimation here if needed
-            asyncio.create_task(self.storage.save_ticker(ticker))
+            asyncio.create_task(self.storage.save_ticker(valid_ticker))
         except Exception as e:
             logger.error(f"Failed to save ticker: {e}")
 
         # 2. Forward to Live Simulation
         try:
-            await sim_state_manager.on_ticker(ticker)
+            await sim_state_manager.on_ticker(valid_ticker)
         except Exception as e:
             logger.error(f"Failed to update Live Sim with ticker: {e}")
+
+    async def sync_symbol(self, symbol: str, venue: str = "thalex"):
+        """Manual sync of recent data for a symbol (gap-fill)."""
+        logger.info(f"Syncing {symbol} from {venue}...")
+        
+        adapter = None
+        if venue.lower() == "thalex":
+             thalex_key = os.getenv("THALEX_PROD_API_KEY_ID") or os.getenv("THALEX_KEY_ID")
+             thalex_secret = os.getenv("THALEX_PROD_PRIVATE_KEY") or os.getenv("THALEX_PRIVATE_KEY")
+             is_testnet = os.getenv("TRADING_MODE", "testnet").lower() == "testnet"
+             if thalex_key and thalex_secret:
+                 adapter = ThalexAdapter(thalex_key, thalex_secret, testnet=is_testnet)
+             else:
+                 # Fallback to public if no keys? ThalexAdapter requires keys for connect/login currently.
+                 # For sync, we might only need public. But adapter.connect() does login.
+                 logger.warning("Thalex keys missing, sync might fail if adapter requires auth.")
+
+        elif venue.lower() == "bybit":
+             bybit_key = os.getenv("BYBIT_API_KEY", "")
+             bybit_secret = os.getenv("BYBIT_API_SECRET", "")
+             is_testnet = os.getenv("TRADING_MODE", "testnet").lower() == "testnet"
+             adapter = BybitAdapter(bybit_key, bybit_secret, testnet=is_testnet)
+
+        if not adapter:
+            raise ValueError(f"No valid adapter/keys for venue {venue}")
+
+        try:
+            await adapter.connect()
+            # Fetch last 1000 trades to cover the ORB window (usually 15-30m)
+            trades = await adapter.get_recent_trades(symbol, limit=1000)
+            if trades:
+                logger.info(f"Fetched {len(trades)} recent trades for {symbol}")
+                # Save trades to DB
+                for t in trades:
+                    await self.storage.save_trade(t)
+                    # Prime signal engine if active
+                    if self.or_engine:
+                        self.or_engine.update_trade(t)
+            else:
+                logger.warning(f"No recent trades returned for {symbol} on {venue}")
+        finally:
+            await adapter.disconnect()

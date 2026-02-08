@@ -1,6 +1,9 @@
+import logging
 from typing import List, Dict, Optional
 from .base_repository import BaseRepository
 from ...domain.entities import Ticker
+
+logger = logging.getLogger(__name__)
 
 
 class MarketRepository(BaseRepository):
@@ -9,19 +12,32 @@ class MarketRepository(BaseRepository):
         self._or_engine = or_engine
 
     async def trigger_sync(self, symbol: str, venue: str = "bybit") -> dict:
-        from ...services.data_ingestor import DataIngestor
+        from ...services.data_ingestor import DataIngestionService
+        import os
 
         if not self.storage:
             return {"status": "error", "message": "Storage not available"}
 
-        ingestor = DataIngestor(self.storage)
+        # Get DSN from storage or ENV
+        db_dsn = getattr(self.storage, "dsn", None)
+        if not db_dsn:
+            db_user = os.getenv("DATABASE_USER", "postgres")
+            db_pass = os.getenv("DATABASE_PASSWORD", "password")
+            db_host = os.getenv("DATABASE_HOST", "localhost")
+            db_name = os.getenv("DATABASE_NAME", "thalex_trading")
+            db_port = os.getenv("DATABASE_PORT", "5432")
+            db_dsn = f"postgresql://{db_user}:{db_pass}@{db_host}:{db_port}/{db_name}"
+
+        ingestor = DataIngestionService(db_dsn, self._or_engine)
         try:
+            await ingestor.storage.connect()
             await ingestor.sync_symbol(symbol, venue)
             return {"status": "success", "message": f"Sync triggered for {symbol}"}
         except Exception as e:
+            logger.error(f"Sync failed for {symbol}: {e}")
             return {"status": "error", "message": str(e)}
         finally:
-            await ingestor.close()
+            await ingestor.storage.disconnect()
 
     async def get_recent_tickers(self, symbol: str, limit: int = 100) -> List[Ticker]:
         if not self.storage:

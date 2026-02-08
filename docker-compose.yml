@@ -7,7 +7,7 @@ services:
       - POSTGRES_PASSWORD=password
       - POSTGRES_DB=thalex_trading
     ports:
-      - "5433:5432"
+      - "5432:5432"
     volumes:
       - timescaledb_data:/var/lib/postgresql/data
     restart: always

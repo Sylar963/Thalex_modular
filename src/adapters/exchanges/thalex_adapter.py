@@ -592,6 +592,25 @@ class ThalexAdapter(BaseExchangeAdapter):
             logger.error(f"Failed to fetch open orders: {e}")
             return []
 
+    async def get_recent_trades(self, symbol: str, limit: int = 100) -> List[Trade]:
+        """Fetch recent trades from Thalex REST API."""
+        try:
+            # Thalex API: public/last_trades
+            response = await self._rpc_request(
+                self.client.last_trades, instrument_name=symbol, limit=limit
+            )
+            
+            if "result" in response:
+                trades_data = response["result"]
+                trades = []
+                for t_data in trades_data:
+                    trades.append(self._map_trade(symbol, t_data))
+                return trades
+            return []
+        except Exception as e:
+            logger.error(f"Failed to fetch recent trades from Thalex: {e}")
+            return []
+
     async def get_position(self, symbol: str) -> Position:
         return self.positions.get(symbol, Position(symbol, 0.0, 0.0))
 

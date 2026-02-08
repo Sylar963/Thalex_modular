@@ -493,6 +493,38 @@ class BybitAdapter(BaseExchangeAdapter):
                 logger.error(f"Bybit cancel_all_orders error: {data}")
                 return False
 
+    async def get_recent_trades(self, symbol: str, limit: int = 100) -> List[Trade]:
+        """Fetch recent trades from Bybit REST API."""
+        mapped_symbol = InstrumentService.get_exchange_symbol(symbol, self.name)
+        url = f"{self.base_url}/v5/market/recent-trade"
+        params = {"category": "linear", "symbol": mapped_symbol, "limit": limit}
+        
+        try:
+            async with self.session.get(url, params=params) as resp:
+                data = await resp.json()
+                if data.get("retCode") == 0:
+                    trades_data = data.get("result", {}).get("list", [])
+                    trades = []
+                    for item in trades_data:
+                        ts_ms = int(item.get("time"))
+                        trades.append(Trade(
+                            id=item.get("execId", ""),
+                            order_id="",
+                            symbol=symbol,
+                            side=OrderSide.BUY if item.get("side") == "Buy" else OrderSide.SELL,
+                            price=float(item.get("price")),
+                            size=float(item.get("size")),
+                            exchange=self.name,
+                            timestamp=ts_ms / 1000.0
+                        ))
+                    return trades
+                else:
+                    logger.error(f"Bybit get_recent_trades error: {data}")
+                    return []
+        except Exception as e:
+            logger.error(f"Failed to fetch recent trades from Bybit: {e}")
+            return []
+
     async def subscribe_ticker(self, symbol: str):
         """Subscribe to orderbook stream."""
         await self._ensure_public_conn()

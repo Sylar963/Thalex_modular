@@ -33,7 +33,7 @@ async def init_dependencies():
     db_name = os.getenv("DATABASE_NAME", "thalex_trading")
 
     # Robust Port Detection
-    db_port = os.getenv("DATABASE_PORT", "5433")
+    db_port = os.getenv("DATABASE_PORT", "5432")
 
     # Log configuration for verification (masking password)
     print(f"Initializing DB Connection: {db_user}@{db_host}:{db_port}/{db_name}")
@@ -53,9 +53,10 @@ async def init_dependencies():
     try:
         import json
 
-        config_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "config.json"
-        )
+        # Robust config path handling
+        base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        config_path = os.path.join(base_dir, "config.json")
+        
         with open(config_path, "r") as f:
             config = json.load(f)
 
