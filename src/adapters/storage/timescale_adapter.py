@@ -1,7 +1,7 @@
 import asyncpg
 import logging
 from datetime import timedelta
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 import json
 from ...domain.interfaces import StorageGateway
 from ...domain.entities import Ticker, Trade, Position
