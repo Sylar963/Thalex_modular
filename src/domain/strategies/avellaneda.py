@@ -280,17 +280,16 @@ class AvellanedaStoikovStrategy(Strategy):
 
         half_fee_cover = fee_coverage_spread / 2.0
 
-        # Calculate levels
-        # Base Prices (Level 0)
+        suppress_bids = market_state.signals.get("suppress_bids", 0.0)
+        suppress_asks = market_state.signals.get("suppress_asks", 0.0)
+
         bid_l0 = bid_price
         ask_l0 = ask_price
 
-        # Spacing logic: Add fraction of FINAL spread
         level_step = final_spread * self.level_spacing_factor
 
         for i in range(self.quote_levels):
-            # Bid Logic
-            if current_pos < self.position_limit:
+            if current_pos < self.position_limit and suppress_bids < 0.8:
                 # Level i
                 p_bid = bid_l0 - (i * level_step)
                 p_bid = self._round_to_tick(p_bid)
@@ -316,7 +315,7 @@ class AvellanedaStoikovStrategy(Strategy):
                 )
 
             # Ask Logic
-            if current_pos > -self.position_limit:
+            if current_pos > -self.position_limit and suppress_asks < 0.8:
                 # Level i
                 p_ask = ask_l0 + (i * level_step)
                 p_ask = self._round_to_tick(p_ask)

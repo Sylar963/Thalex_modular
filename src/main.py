@@ -229,13 +229,28 @@ async def main():
             logger.info(f"Configured {cfg.gateway.name} for {cfg.symbol}")
 
         sync_engine = SyncEngine()
+
+        inventory_bias_engine = None
+        bias_config = bot_config.get("signals", {}).get("inventory_bias", {})
+        if bias_config.get("enabled", True):
+            from src.domain.signals.inventory_bias import InventoryBiasEngine
+
+            inventory_bias_engine = InventoryBiasEngine(
+                or_weight=bias_config.get("or_weight", 0.4),
+                vamp_weight=bias_config.get("vamp_weight", 0.6),
+                suppression_threshold=bias_config.get("suppression_threshold", 0.3),
+            )
+            logger.info("InventoryBiasEngine initialized")
+
         multi_service = MultiExchangeStrategyManager(
             exchanges=exchange_configs,
             strategy=strategy,
             risk_manager=risk_manager,
             sync_engine=sync_engine,
             signal_engine=signal_engine,
+            or_engine=or_engine,
             canary_sensor=canary_sensor,
+            inventory_bias_engine=inventory_bias_engine,
             storage=storage,
             safety_components=safety_components,
             dry_run=dry_run,

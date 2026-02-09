@@ -16,6 +16,7 @@ from ..domain.interfaces import (
     SafetyComponent,
 )
 from ..domain.market.trend_service import HistoricalTrendService
+from ..domain.signals.inventory_bias import InventoryBiasEngine
 from ..domain.tracking.sync_engine import SyncEngine, GlobalState
 from ..domain.tracking.state_tracker import StateTracker
 from ..domain.entities import (
@@ -76,6 +77,7 @@ class MultiExchangeStrategyManager:
         signal_engine: Optional[SignalEngine] = None,
         or_engine: Optional[SignalEngine] = None,
         canary_sensor: Optional[SignalEngine] = None,
+        inventory_bias_engine: Optional[InventoryBiasEngine] = None,
         storage: Optional[StorageGateway] = None,
         safety_components: Optional[List[SafetyComponent]] = None,
         dry_run: bool = False,
@@ -90,6 +92,7 @@ class MultiExchangeStrategyManager:
         self.sync_engine = sync_engine
         self.or_engine = or_engine
         self.canary_sensor = canary_sensor
+        self.inventory_bias_engine = inventory_bias_engine
         self.storage = storage
         self.safety_components = safety_components or []
         self.dry_run = dry_run
@@ -259,6 +262,28 @@ class MultiExchangeStrategyManager:
                             ticker.ask,
                         )
                     )
+
+            if self.inventory_bias_engine:
+                position = self.portfolio.get_position(ticker.symbol, exchange)
+                or_sigs = (
+                    self.or_engine.get_signals().get(ticker.symbol, {})
+                    if self.or_engine
+                    else {}
+                )
+                vamp_sigs = (
+                    self.signal_engine.get_signals() if self.signal_engine else {}
+                )
+
+                if isinstance(or_sigs, dict):
+                    or_sigs["current_price"] = ticker.mid_price
+
+                self.inventory_bias_engine.update_position(
+                    position.size if position else 0.0
+                )
+                self.inventory_bias_engine.update_signals(or_sigs, vamp_sigs)
+                venue.market_state.signals.update(
+                    self.inventory_bias_engine.get_signals()
+                )
 
             await self.sync_engine.update_ticker(exchange, ticker.symbol, ticker)
 

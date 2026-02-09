@@ -56,21 +56,27 @@ Thalex_modular/
 
 ## Technical Components
 
-### 1. **QuotingService** (`quoting_service.py`)
+### 1. **QuotingService / StrategyManager** (`strategy_manager.py`)
 The central orchestrator that wires together market data, strategy, and risk management.
 - **Mode Aware**: Seamlessly switches between `Live` and `Dry-Run` (Shadow) modes.
-- **Concurrency**: Uses `asyncio.Lock` for atomic order reconciliation on fast price updates.
-- **Toxic Flow Defense**: Automatically pulls quotes when extreme one-sided volume is detected.
+- **Concurrency**: Uses per-venue `_venue_lock` for atomic order reconciliation on fast price updates.
+- **Smart Reducing Mode**: When a risk breach is detected, the bot enters a specialized mode that ONLY allows orders which reduce absolute exposure, preventing the bot from being "locked" in a losing position while still enforcing safety limits.
 - **Fast Reconcile**: Triggered by both price updates (tickers) and aggressive flow (trades).
 
 ### 2. **StateTracker** (`state_tracker.py`)
 Provides a "Single Source of Truth" for the bot's internal state.
 - **Order Lifecycle**: Tracks orders through `PENDING` -> `CONFIRMED` -> `FILLED/CANCELLED`.
+- **Pending Order Tracking**: Explicitly manages unacknowledged (`PENDING`) orders to prevent duplicate submissions (infinite spam loops) during periods of exchange latency.
 - **Sequence Monitoring**: Detects gaps in exchange message sequences to trigger emergency re-syncs.
 - **Reactive Fills**: Emits events the moment a fill is confirmed via the private trade stream.
-- **LRU Cache**: Manages historical order memory while keeping the hot path optimized.
 
-### 3. **MultiWindowRegimeAnalyzer** (`regime_analyzer.py`)
+### 3. **Volume Candle Signal Engine** (`volume_candle.py`)
+Provides real-time alpha and toxicity metrics used to skew market making quotes.
+- **VAMP (Volume Adjusted Market Pressure)**: Calculates the imbalance between aggressive buy and sell pressure to generate a `reservation_price_offset`.
+- **Floating Signals**: Calculates signals on incomplete candles for zero-latency feedback on "Toxic Flow".
+- **Dynamic Offsets**: Informs the strategy to shift the "fair price" (reservation price) in the direction of order flow, allowing the bot to "go with the trend" and avoid being run over by informed traders.
+
+### 4. **MultiWindowRegimeAnalyzer** (`regime_analyzer.py`)
 Adjusts strategy parameters based on real-time market conditions.
 - **Triple Window RV**: Calculates Volatility across Fast (20), Mid (100), and Slow (500) intervals.
 - **Options Convergence**: Integrates data from the `OptionsVolatilityService` to detect if realized vol is over/under-priced vs market expectations.

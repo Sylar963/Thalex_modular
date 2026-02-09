@@ -443,6 +443,11 @@ class OpenRangeSignalEngine(SignalEngine):
 
         self._update_core(ticker.symbol, ts, price, high, low)
 
+    def is_session_just_completed(self) -> bool:
+        result = self._session_just_completed
+        self._session_just_completed = False
+        return result
+
     def get_signals(self) -> Dict[str, float]:
         return self.signals.copy()
 
