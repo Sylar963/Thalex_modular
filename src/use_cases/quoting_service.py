@@ -59,8 +59,8 @@ class QuotingService:
         self.symbol: str = ""
         self.market_state = MarketState()
         self.running = False
-        # Use a faster lock implementation if available, otherwise standard asyncio.Lock
-        self._reconcile_lock = asyncio.Lock()
+        # Use a boolean flag for zero-overhead "try-lock" behavior
+        self._is_reconciling = False
         self._last_equity_snapshot_time = 0.0
         self._last_mid_price = 0.0
         self.min_edge_threshold = 0.5
@@ -325,7 +325,7 @@ class QuotingService:
             return
 
         if abs(immediate_flow) > 0.3:
-            if not self._reconcile_lock.locked():
+            if not self._is_reconciling:
                 self.market_state.signals.update(signals)
                 asyncio.create_task(self._fast_reconcile())
 
@@ -357,7 +357,7 @@ class QuotingService:
 
     async def _run_strategy(self, regime=None, tick_size=0.5):
         """Centralized strategy execution pipeline with performance optimizations."""
-        if self._reconcile_lock.locked():
+        if self._is_reconciling:
             return
 
         current_mid = (
@@ -371,8 +371,9 @@ class QuotingService:
             return
 
         self._last_mid_price = current_mid
+        self._is_reconciling = True
 
-        async with self._reconcile_lock:
+        try:
             start_time = time.perf_counter()
 
             # 2. Strategy Calculation
@@ -416,6 +417,8 @@ class QuotingService:
 
             if self._perf_metrics['reconcile_calls'] % 100 == 0:
                 logger.debug(f"Reconciliation performance: avg={self._perf_metrics['avg_reconcile_time']:.3f}ms over {self._perf_metrics['reconcile_calls']} calls")
+        finally:
+            self._is_reconciling = False
 
     async def _reconcile_orders(self, desired_orders: List[Order]):
         """
@@ -578,7 +581,7 @@ class QuotingService:
                 )
         # Trigger immediate re-quotes or signal updates if needed
         # This allows the bot to react to fills faster than the next ticker
-        if not self._reconcile_lock.locked():
+        if not self._is_reconciling:
             # Trigger a fast reconcile cycle
             pass
 

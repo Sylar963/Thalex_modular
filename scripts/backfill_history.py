@@ -61,10 +61,12 @@ async def backfill():
 
         start_wait = time.time()
         while time.time() - start_wait < 10:
-            msg_str = await client.receive()
-            import json
-
-            msg = json.loads(msg_str)
+            msg = await client.receive()
+            
+            # Handle potential string fallback (though it should be dict now)
+            if isinstance(msg, str):
+                import json
+                msg = json.loads(msg)
 
             if msg.get("id") == req_id:
                 if "error" in msg:

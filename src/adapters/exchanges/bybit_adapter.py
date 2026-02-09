@@ -263,11 +263,13 @@ class BybitAdapter(BaseExchangeAdapter):
     async def _msg_loop(self):
         while self.connected and self.ws_private:
             try:
-                msg = await asyncio.wait_for(
-                    self.ws_private.receive_json(), timeout=5.0
+                msg_raw = await asyncio.wait_for(
+                    self.ws_private.receive(), timeout=5.0
                 )
-                if not msg:
+                if not msg_raw or msg_raw.type != aiohttp.WSMsgType.TEXT:
                     continue
+                
+                msg = self._fast_json_decode(msg_raw.data)
                 await self._handle_message(msg)
             except asyncio.TimeoutError:
                 continue

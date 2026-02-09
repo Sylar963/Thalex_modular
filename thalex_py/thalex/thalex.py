@@ -7,7 +7,6 @@ import jwt
 import time
 import functools
 import orjson  # Faster JSON parsing
-import ujson  # Fast JSON serialization
 from typing import Optional, List, Union, Dict, Any, Callable
 import numpy as np
 from collections import deque
@@ -461,7 +460,7 @@ class Thalex:
                     message = orjson.loads(raw_message)
 
                     # Add to queue for processing by application
-                    await self.message_queue.put(ujson.dumps(message))
+                    await self.message_queue.put(message)
                 except Exception as e:
                     logging.error(f"Error parsing message: {str(e)}")
                     await self.message_queue.put(raw_message)  # Fall back to original
@@ -518,7 +517,7 @@ class Thalex:
         if req_id is not None:
             request["id"] = req_id
 
-        request_str = json.dumps(request)  # Use standard json to avoid escaping issues
+        request_str = orjson.dumps(request).decode("utf-8")
 
         # DEBUG LOG
         logging.debug(f"TX RAW: {request_str}")
