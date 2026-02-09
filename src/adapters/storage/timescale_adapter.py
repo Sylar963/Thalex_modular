@@ -132,7 +132,7 @@ class TimescaleDBAdapter(StorageGateway):
                     )
                 except Exception:
                     pass
-                
+
                 # Unique Index for Idempotency (Time + Underlying + Strike + Expiry)
                 try:
                     await conn.execute("""
@@ -140,7 +140,9 @@ class TimescaleDBAdapter(StorageGateway):
                         ON options_live_metrics (time, underlying, strike, expiry_date);
                     """)
                 except Exception as e:
-                    logger.warning(f"Failed to create unique index on options_live_metrics: {e}")
+                    logger.warning(
+                        f"Failed to create unique index on options_live_metrics: {e}"
+                    )
 
                 # 4. Market Regimes Table
                 await conn.execute("""
@@ -264,7 +266,35 @@ class TimescaleDBAdapter(StorageGateway):
                 except Exception:
                     pass
 
-                # 7. Account Balances Table
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS hft_signals (
+                        time TIMESTAMPTZ NOT NULL,
+                        symbol TEXT NOT NULL,
+                        exchange TEXT NOT NULL DEFAULT 'bybit',
+                        toxicity_score DOUBLE PRECISION,
+                        pull_rate DOUBLE PRECISION,
+                        quote_stability DOUBLE PRECISION,
+                        size_asymmetry DOUBLE PRECISION,
+                        bid DOUBLE PRECISION,
+                        ask DOUBLE PRECISION,
+                        spread DOUBLE PRECISION
+                    );
+                """)
+                try:
+                    await conn.execute(
+                        "SELECT create_hypertable('hft_signals', 'time', if_not_exists => TRUE, chunk_time_interval => INTERVAL '1 hour');"
+                    )
+                except Exception:
+                    pass
+
+                try:
+                    await conn.execute("""
+                        CREATE INDEX IF NOT EXISTS hft_signals_symbol_time_idx 
+                        ON hft_signals (symbol, time DESC);
+                    """)
+                except Exception as e:
+                    logger.warning(f"Failed to create index on hft_signals: {e}")
+
                 await conn.execute("""
                     CREATE TABLE IF NOT EXISTS account_balances (
                         exchange TEXT NOT NULL,
@@ -366,6 +396,37 @@ class TimescaleDBAdapter(StorageGateway):
         except Exception as e:
             logger.error(f"Failed to save signal: {e}")
 
+    async def save_hft_signal(
+        self,
+        symbol: str,
+        exchange: str,
+        signals: Dict[str, float],
+        bid: float,
+        ask: float,
+    ):
+        if not self.pool:
+            return
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO hft_signals 
+                    (time, symbol, exchange, toxicity_score, pull_rate, quote_stability, size_asymmetry, bid, ask, spread)
+                    VALUES (NOW(), $1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    """,
+                    symbol,
+                    exchange,
+                    signals.get("toxicity_score"),
+                    signals.get("pull_rate"),
+                    signals.get("quote_stability"),
+                    signals.get("size_asymmetry"),
+                    bid,
+                    ask,
+                    ask - bid if bid > 0 and ask > 0 else None,
+                )
+        except Exception as e:
+            logger.error(f"Failed to save HFT signal: {e}")
+
     async def save_tickers_bulk(self, tickers: List[Tuple]):
         """
         Batch insert tickers.
@@ -417,7 +478,9 @@ class TimescaleDBAdapter(StorageGateway):
         except Exception as e:
             logger.error(f"Failed to save options metrics bulk: {e}")
 
-    async def get_time_range(self, symbol: str, exchange: str = "thalex") -> Tuple[Optional[float], Optional[float]]:
+    async def get_time_range(
+        self, symbol: str, exchange: str = "thalex"
+    ) -> Tuple[Optional[float], Optional[float]]:
         """
         Get the earliest and latest timestamps for a symbol/exchange in market_tickers.
         Returns (min_ts, max_ts) or (None, None) if no data exists.
@@ -432,7 +495,8 @@ class TimescaleDBAdapter(StorageGateway):
                     FROM market_tickers
                     WHERE symbol = $1 AND exchange = $2
                     """,
-                    symbol, exchange
+                    symbol,
+                    exchange,
                 )
                 if row and row["min_t"] and row["max_t"]:
                     return row["min_t"].timestamp(), row["max_t"].timestamp()
@@ -767,11 +831,16 @@ class TimescaleDBAdapter(StorageGateway):
             def process_rows(rows, source_name):
                 for r in rows:
                     t = r["bucket"].timestamp()
-                    
+
                     # Safety check for NULLs which can occur if a bucket has no trades/ticks
-                    if r["open"] is None or r["close"] is None or r["high"] is None or r["low"] is None:
+                    if (
+                        r["open"] is None
+                        or r["close"] is None
+                        or r["high"] is None
+                        or r["low"] is None
+                    ):
                         continue
-                        
+
                     data = {
                         "time": t,
                         "open": float(r["open"]),
@@ -823,12 +892,12 @@ class TimescaleDBAdapter(StorageGateway):
     ) -> List[Dict]:
         if not self.pool:
             return []
-        
+
         if end is None:
             end = time.time()
         if start is None:
-            start = end - 86400 # Default to last 24 hours
-            
+            start = end - 86400  # Default to last 24 hours
+
         try:
             async with self.pool.acquire() as conn:
                 rows = await conn.fetch(

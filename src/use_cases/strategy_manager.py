@@ -93,6 +93,7 @@ class MultiExchangeStrategyManager:
         self._venue_trends: Dict[str, float] = {}  # symbol -> trend_value
         self._last_trend_update = 0.0
         self._last_status_persist: Dict[str, float] = {}
+        self._last_hft_persist: Dict[str, float] = {}
 
         self._momentum_adds: Dict[
             str, List[Dict]
@@ -236,7 +237,23 @@ class MultiExchangeStrategyManager:
 
             if self.canary_sensor:
                 self.canary_sensor.update(ticker)
-                venue.market_state.signals.update(self.canary_sensor.get_signals())
+                canary_signals = self.canary_sensor.get_signals()
+                venue.market_state.signals.update(canary_signals)
+
+                venue_key = f"{exchange}:{ticker.symbol}"
+                now = ticker.timestamp
+                last_persist = self._last_hft_persist.get(venue_key, 0.0)
+                if self.storage and not self.dry_run and (now - last_persist) >= 1.0:
+                    self._last_hft_persist[venue_key] = now
+                    asyncio.create_task(
+                        self.storage.save_hft_signal(
+                            ticker.symbol,
+                            exchange,
+                            canary_signals,
+                            ticker.bid,
+                            ticker.ask,
+                        )
+                    )
 
             await self.sync_engine.update_ticker(exchange, ticker.symbol, ticker)
 
