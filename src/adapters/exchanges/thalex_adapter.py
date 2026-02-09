@@ -158,6 +158,7 @@ class ThalexAdapter(BaseExchangeAdapter):
         self.connected = True
         self.msg_loop_task = asyncio.create_task(self._msg_loop())
         self.heartbeat_task = asyncio.create_task(self._heartbeat_monitor())
+        self._ping_task = asyncio.create_task(self._ping_loop())
 
         logger.info("Logging in...")
 
@@ -215,6 +216,8 @@ class ThalexAdapter(BaseExchangeAdapter):
             self.msg_loop_task.cancel()
         if self.heartbeat_task:
             self.heartbeat_task.cancel()
+        if hasattr(self, "_ping_task") and self._ping_task:
+            self._ping_task.cancel()
         if self._prune_task:
             self._prune_task.cancel()
 
@@ -642,59 +645,40 @@ class ThalexAdapter(BaseExchangeAdapter):
             return []
 
         try:
-            # Check if the client has the get_open_orders method
-            if not hasattr(self.client, 'get_open_orders'):
-                logger.warning("Thalex client does not have get_open_orders method")
-                return []
-
+            # Call open_orders on the client
             response = await self._rpc_request(
-                self.client.get_open_orders, instrument_name=symbol
+                self.client.open_orders, instrument_name=symbol
             )
 
             if "result" in response:
                 orders_data = response["result"]
                 mapped_orders = []
                 for o_data in orders_data:
-                    # Map to Order entity
-                    # Thalex format:
-                    # {
-                    #   "order_id": ...,
-                    #   "instrument_name": ...,
-                    #   "direction": "buy"|"sell",
-                    #   "amount": ...,
-                    #   "price": ...,
-                    #   "label": ...,
-                    #   "status": ...
-                    # }
-
                     # Safe float parsing
                     price = self._safe_float(o_data.get("price"))
                     size = self._safe_float(o_data.get("amount"))
-                    filled = self._safe_float(o_data.get("amount_filled"))
+                    filled = self._safe_float(o_data.get("amount_filled", 0.0))
 
                     side = (
                         OrderSide.BUY
-                        if o_data.get("direction") == "buy"
+                        if o_data.get("direction", "").lower() == "buy"
                         else OrderSide.SELL
                     )
-                    exchange_id = str(o_data.get("order_id", ""))
+                    exchange_id = str(o_data.get("order_id", o_data.get("id", "")))
                     label = str(o_data.get("label", ""))
-
-                    # status mapping if needed, but get_open_orders implies OPEN or PARTIALLY_FILLED
 
                     mapped_orders.append(
                         Order(
-                            id=label
-                            if label
-                            else f"EXT_{exchange_id}",  # Use label as ID if available
+                            id=label if label else f"EXT_{exchange_id}",
                             symbol=symbol,
                             side=side,
                             price=price,
                             size=size,
-                            type=OrderType.LIMIT,  # Assumption for now, could be MARKET
+                            filled_size=filled,
+                            type=OrderType.LIMIT,
                             status=OrderStatus.OPEN,
                             exchange_id=exchange_id,
-                            timestamp=time.time(),  # Approximation
+                            timestamp=time.time(),
                         )
                     )
                 return mapped_orders
@@ -804,6 +788,8 @@ class ThalexAdapter(BaseExchangeAdapter):
                     self.msg_loop_task.cancel()
                 if self.heartbeat_task:
                     self.heartbeat_task.cancel()
+                if hasattr(self, "_ping_task") and self._ping_task:
+                    self._ping_task.cancel()
                     
                 # Disconnect and reconnect
                 await self.client.disconnect()
@@ -815,6 +801,7 @@ class ThalexAdapter(BaseExchangeAdapter):
                 # Restart message loop and heartbeat before login
                 self.msg_loop_task = asyncio.create_task(self._msg_loop())
                 self.heartbeat_task = asyncio.create_task(self._heartbeat_monitor())
+                self._ping_task = asyncio.create_task(self._ping_loop())
 
                 login_id = self._get_next_id()
                 future = asyncio.Future()
@@ -860,13 +847,41 @@ class ThalexAdapter(BaseExchangeAdapter):
         msg_id = msg.get("id")
         if msg_id is not None:
             logger.debug(f"RX RPC: {msg}")
+            
+            # Try direct lookup first
             if msg_id in self.pending_requests:
                 self.pending_requests[msg_id].set_result(msg)
                 del self.pending_requests[msg_id]
                 return
+            
+            # Try casting to int if it's a string (or vice versa, but keys are ints)
+            try:
+                int_id = int(msg_id)
+                if int_id in self.pending_requests:
+                    self.pending_requests[int_id].set_result(msg)
+                    del self.pending_requests[int_id]
+                    return
+            except (ValueError, TypeError):
+                pass
+                
+            logger.warning(f"Received RPC response with unknown ID: {msg_id}")
+            return
 
         # Delegate processing
         await self._process_message(msg)
+
+    async def _ping_loop(self):
+        """Send periodic application-level pings to keep connection healthy."""
+        while self.connected:
+            try:
+                await asyncio.sleep(20)
+                if self.connected and self.client.connected():
+                    # Thalex uses public/ping or just standard ping frame.
+                    # Library has ping() which sends protocol ping.
+                    # Let's send a lightweight public request as app-level ping
+                    await self._rpc_request(self.client.system_info)
+            except Exception as e:
+                logger.debug(f"Ping failed: {e}")
 
     async def _process_message(self, msg: Dict):
         # Handle new format: {'channel_name': ..., 'notification': ...}
@@ -892,7 +907,7 @@ class ThalexAdapter(BaseExchangeAdapter):
                     for t_data in trade_data_list:
                         trade = self._map_trade(symbol, t_data)
                         if self.trade_callback:
-                            await self.trade_callback(trade)
+                            asyncio.create_task(self.trade_callback(trade))
             elif channel == "orders":
                 order_data_list = data if isinstance(data, list) else [data]
                 for o_data in order_data_list:
@@ -924,9 +939,9 @@ class ThalexAdapter(BaseExchangeAdapter):
                             f"Updated order {exchange_id} (label={label}) status to {status} from notification"
                         )
 
-                    await self.notify_order_update(
+                    asyncio.create_task(self.notify_order_update(
                         exchange_id, status, filled_size, avg_price, local_id=label
-                    )
+                    ))
 
             elif channel == "portfolio":
                 positions_data = data if isinstance(data, list) else [data]
@@ -958,7 +973,7 @@ class ThalexAdapter(BaseExchangeAdapter):
                         )
 
                         if self.position_callback:
-                            await self.position_callback(symbol, amount, entry_price)
+                            asyncio.create_task(self.position_callback(symbol, amount, entry_price))
 
             elif channel == "account":
                 acc_data = data if isinstance(data, list) else [data]
@@ -989,7 +1004,7 @@ class ThalexAdapter(BaseExchangeAdapter):
                         equity=total,
                     )
                     if self.balance_callback:
-                        await self.balance_callback(bal)
+                        asyncio.create_task(self.balance_callback(bal))
             return
 
         # Fallback to old format (if any)
@@ -1007,7 +1022,7 @@ class ThalexAdapter(BaseExchangeAdapter):
                     # Update ticker liveness timestamp
                     self.last_ticker_time = time.time()
                     if self.ticker_callback:
-                        await self.ticker_callback(ticker)
+                        asyncio.create_task(self.ticker_callback(ticker))
 
             elif channel.startswith("trades."):
                 part = channel.split(".")
@@ -1024,7 +1039,7 @@ class ThalexAdapter(BaseExchangeAdapter):
                     for t_data in trade_data_list:
                         trade = self._map_trade(symbol, t_data)
                         if self.trade_callback:
-                            await self.trade_callback(trade)
+                            asyncio.create_task(self.trade_callback(trade))
 
     async def _heartbeat_monitor(self):
         # Use the standardized last_ticker_time from the base class

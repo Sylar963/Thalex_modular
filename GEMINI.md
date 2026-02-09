@@ -79,6 +79,20 @@ The system leverages TimescaleDB as a "Single Source of Truth":
     - *Pitfall*: Running `src/main.py` when intending to start the API caused a confusion in service wiring.
 - **Service Injection**: `SimStateManager` needs access to the *active* data stream. Wiring it into `market_feed.py` is useless if the API uses `data_ingestor.py`. Check `dependencies.py` to confirm which service is actually being instantiated.
 
+## VI. Performance & Optimization Standards
+
+### Serialization & I/O
+- **Zero-Copy JSON**: Use `orjson` exclusively for high-performance serialization. Avoid "Double-Serialization" (parsing a WS frame and then re-serializing it before it reaches the application logic). Message loops should parse once into a dict and pass that object forward.
+- **Binary Protocols**: When possible, use `orjson.OPT_SERIALIZE_NUMPY` to handle mathematical types without intermediate casting.
+
+### Concurrency & Locking
+- **Lock-Free Hot Path**: Avoid `asyncio.Lock` in the core reconciliation loop (`QuotingService`). Use a simple boolean flag (`_is_reconciling`) to implement a zero-overhead "try-lock" pattern. This eliminates the latency of creating and awaiting Future objects for every ticker update.
+- **Per-Venue Isolation**: Strategy execution must be venue-isolated via `OptimizedVenueContext` to prevent slow responses from one exchange (e.g., Bybit) from starving another (e.g., Thalex).
+
+### Memory Management
+- **Entity Slots**: All classes in `src/domain/entities/` MUST use `__slots__`. This reduces memory overhead by ~40-60% and improves attribute access speed.
+- **Object Recycling**: For high-frequency objects (like `Quote` or `Ticker` updates), prefer updating existing instances or using object pools to reduce GC pressure.
+
 ---
 *This document is a living record of project directives and should be updated as the roadmap evolves.*
 

@@ -108,6 +108,7 @@ class AvellanedaStoikovStrategy(Strategy):
         position: Position,
         regime: Any = None,
         tick_size: Optional[float] = None,
+        exchange: Optional[str] = None,
     ) -> List[Order]:
         """
         Calculate optimal bid and ask orders using legacy heuristic logic.
@@ -126,9 +127,22 @@ class AvellanedaStoikovStrategy(Strategy):
         elif ticker.symbol and "BTC" in ticker.symbol:
             self.tick_size = 0.5
 
+        # Apply venue-specific adjustments
+        venue_gamma_multiplier = 1.0
+        venue_volatility_multiplier = 1.0
+        
+        if exchange:
+            if exchange.lower() == "thalex":
+                # Thalex-specific adjustments for better performance
+                venue_gamma_multiplier = 0.8  # Slightly more aggressive spreads
+                venue_volatility_multiplier = 1.1  # Adjust for Thalex's volatility characteristics
+            elif exchange.lower() == "bybit":
+                venue_gamma_multiplier = 1.0
+                venue_volatility_multiplier = 1.0
+
         # --- 0. Regime & Mode Adjustment ---
-        gamma = self.gamma
-        volatility_mult = self.volatility_multiplier
+        gamma = self.gamma * venue_gamma_multiplier
+        volatility_mult = self.volatility_multiplier * venue_volatility_multiplier
         inventory_factor = self.inventory_factor
 
         # Mode Adjustment

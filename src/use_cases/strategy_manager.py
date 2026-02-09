@@ -46,6 +46,7 @@ class OptimizedVenueContext:
     """
     Optimized venue context with per-venue state management to reduce global lock contention
     """
+
     def __init__(self, config: ExchangeConfig):
         self.config = config
         self.state_tracker = StateTracker()
@@ -54,9 +55,9 @@ class OptimizedVenueContext:
         self._venue_lock = asyncio.Lock()  # Per-venue lock instead of global
         self._last_strategy_run = 0.0
         self._perf_metrics = {
-            'strategy_runs': 0,
-            'avg_run_time': 0.0,
-            'total_run_time': 0.0
+            "strategy_runs": 0,
+            "avg_run_time": 0.0,
+            "total_run_time": 0.0,
         }
 
 
@@ -202,7 +203,7 @@ class MultiExchangeStrategyManager:
             # Symbol filtering
             if ticker.symbol != venue.config.symbol:
                 return
-            
+
             # log every 100th ticker or so if needed, but for now let's just log arrival once
             if not hasattr(venue, "_first_ticker_logged"):
                 logger.info(f"First ticker received for {exchange}:{ticker.symbol}")
@@ -260,7 +261,14 @@ class MultiExchangeStrategyManager:
                     component.record_success()
 
             if is_healthy:
-                await self._run_strategy_for_venue(venue)
+                # Fix for Deadlock: Decouple strategy run from WebSocket loop
+                # If we await here, the WS loop blocks, preventing RPC responses (Order Acks) from being processed.
+                # This causes the strategy to timeout waiting for the very messages this loop is supposed to deliver.
+                if not venue._venue_lock.locked():
+                    asyncio.create_task(self._run_strategy_for_venue(venue))
+                else:
+                    # Strategy is already running, skip this tick to prevent pile-up
+                    pass
 
         return callback
 
@@ -326,8 +334,13 @@ class MultiExchangeStrategyManager:
         Run strategy for a specific venue with reduced lock contention
         """
         # Health check: Skip if the venue is not ready
-        if not hasattr(venue.config.gateway, 'is_ready') or not venue.config.gateway.is_ready:
-            logger.debug(f"Skipping strategy cycle for {venue.config.gateway.name}: Not ready")
+        if (
+            not hasattr(venue.config.gateway, "is_ready")
+            or not venue.config.gateway.is_ready
+        ):
+            logger.debug(
+                f"Skipping strategy cycle for {venue.config.gateway.name}: Not ready"
+            )
             return
 
         # 1. Update Long-Term Trend
@@ -344,7 +357,9 @@ class MultiExchangeStrategyManager:
 
         # Log venue health periodically
         if now % 30 < 1:  # Log approximately every 30 seconds
-            logger.info(f"Venue {venue.config.gateway.name} healthy - Ticker: {venue.market_state.ticker}")
+            logger.info(
+                f"Venue {venue.config.gateway.name} healthy - Ticker: {venue.market_state.ticker}"
+            )
 
         # 2. Check for Risk Breach - this still needs global state but can be optimized
         if self.risk_manager.has_breached():
@@ -361,9 +376,20 @@ class MultiExchangeStrategyManager:
         # Adjust min_edge based on venue characteristics to prevent stale behavior
         # For Thalex with larger tick sizes, we need to be more sensitive to price changes
         if tick_size >= 1.0:  # Thalex typically has 1.0 tick size
+            # Use a more dynamic calculation based on both tick size and market volatility
             min_edge = tick_size * 0.1  # More sensitive for coarse tick sizes
         else:
-            min_edge = tick_size * self.min_edge_threshold  # Standard sensitivity for fine tick sizes
+            min_edge = (
+                tick_size * self.min_edge_threshold
+            )  # Standard sensitivity for fine tick sizes
+
+        # Further adjust min_edge based on exchange-specific characteristics
+        exchange_name = venue.config.gateway.name
+        if exchange_name.lower() == "thalex":
+            # For Thalex, be slightly more responsive to price movements
+            min_edge = min_edge * 0.8  # 20% more responsive
+        elif exchange_name.lower() == "bybit":
+            min_edge = min_edge * 1.0  # Standard responsiveness
 
         # 3. Handle Momentum Sub-strategy (Adds and Exits)
         await self._manage_momentum_strategy(venue)
@@ -391,7 +417,7 @@ class MultiExchangeStrategyManager:
             )
 
             desired_orders = active_strategy.calculate_quotes(
-                venue.market_state, position, tick_size=tick_size
+                venue.market_state, position, tick_size=tick_size, exchange=exchange
             )
 
             for i in range(len(desired_orders)):
@@ -409,16 +435,43 @@ class MultiExchangeStrategyManager:
                 else:
                     logger.warning(f"Risk rejected order on {exchange}: {o}")
 
+            # Log detailed metrics for Thalex specifically
+            if exchange.lower() == "thalex":
+                logger.info(
+                    f"Thalex strategy run - Position: {position.size}, Desired orders: {len(desired_orders)}, Valid orders: {len(valid_orders)}"
+                )
+                if venue.market_state.ticker:
+                    logger.info(
+                        f"Thalex ticker - Bid: {venue.market_state.ticker.bid}, Ask: {venue.market_state.ticker.ask}, Mid: {venue.market_state.ticker.mid_price}"
+                    )
+
+                # Additional Thalex-specific metrics
+                spread = (
+                    venue.market_state.ticker.ask - venue.market_state.ticker.bid
+                    if venue.market_state.ticker
+                    else 0
+                )
+                logger.info(
+                    f"Thalex spread: {spread}, Position utilization: {abs(position.size) / venue.config.strategy.position_limit if venue.config.strategy and venue.config.strategy.position_limit > 0 else 0}"
+                )
+
             await self._reconcile_orders_venue(venue, valid_orders)
 
             # Update performance metrics
             end_time = time.perf_counter()
             run_time = (end_time - start_time) * 1000  # Convert to ms
-            venue._perf_metrics['strategy_runs'] += 1
-            venue._perf_metrics['total_run_time'] += run_time
-            venue._perf_metrics['avg_run_time'] = (
-                venue._perf_metrics['total_run_time'] / venue._perf_metrics['strategy_runs']
+            venue._perf_metrics["strategy_runs"] += 1
+            venue._perf_metrics["total_run_time"] += run_time
+            venue._perf_metrics["avg_run_time"] = (
+                venue._perf_metrics["total_run_time"]
+                / venue._perf_metrics["strategy_runs"]
             )
+
+            # Log performance metrics for Thalex
+            if exchange.lower() == "thalex":
+                logger.info(
+                    f"Thalex strategy performance - Run time: {run_time:.2f}ms, Avg: {venue._perf_metrics['avg_run_time']:.2f}ms"
+                )
 
     async def _reconcile_orders_venue(
         self, venue: OptimizedVenueContext, desired_orders: List[Order]
@@ -445,12 +498,18 @@ class MultiExchangeStrategyManager:
             # Use optimized diff algorithm
             active_by_price_size = {}
             for act in active_list:
-                key = (round(act.price / tick_size), act.size)  # Normalize price to tick boundaries
+                key = (
+                    round(act.price / tick_size),
+                    act.size,
+                )  # Normalize price to tick boundaries
                 active_by_price_size[key] = act
 
             desired_by_price_size = {}
             for des in desired_list:
-                key = (round(des.price / tick_size), des.size)  # Normalize price to tick boundaries
+                key = (
+                    round(des.price / tick_size),
+                    des.size,
+                )  # Normalize price to tick boundaries
                 desired_by_price_size[key] = des
 
             # Find orders to cancel (in active but not in desired)
@@ -478,9 +537,13 @@ class MultiExchangeStrategyManager:
                     if success:
                         await venue.state_tracker.on_order_cancel(oid)
             except ConnectionError as e:
-                logger.warning(f"Connection error during cancel_orders_batch for {exchange}: {e}")
+                logger.warning(
+                    f"Connection error during cancel_orders_batch for {exchange}: {e}"
+                )
             except Exception as e:
-                logger.error(f"Unexpected error during cancel_orders_batch for {exchange}: {e}")
+                logger.error(
+                    f"Unexpected error during cancel_orders_batch for {exchange}: {e}"
+                )
 
         if to_place_orders:
             try:
@@ -490,18 +553,24 @@ class MultiExchangeStrategyManager:
                         await venue.state_tracker.submit_order(o)
                         await venue.state_tracker.on_order_ack(o.id, o.exchange_id)
             except ConnectionError as e:
-                logger.warning(f"Connection error during place_orders_batch for {exchange}: {e}")
+                logger.warning(
+                    f"Connection error during place_orders_batch for {exchange}: {e}"
+                )
             except Exception as e:
-                logger.error(f"Unexpected error during place_orders_batch for {exchange}: {e}")
+                logger.error(
+                    f"Unexpected error during place_orders_batch for {exchange}: {e}"
+                )
 
         end_time = time.perf_counter()
-        logger.debug(f"_reconcile_orders_venue for {exchange} took {(end_time - start_time) * 1000:.3f}ms")
+        logger.debug(
+            f"_reconcile_orders_venue for {exchange} took {(end_time - start_time) * 1000:.3f}ms"
+        )
 
     async def _cancel_all_venue(self, venue: OptimizedVenueContext):
         all_active = await venue.state_tracker.get_open_orders()
         if not all_active:
             return
-            
+
         tasks = []
         for t in all_active:
             if t.order.exchange_id:
@@ -509,7 +578,7 @@ class MultiExchangeStrategyManager:
                     self._safe_cancel_order(venue.config.gateway, t.order.exchange_id)
                 )
                 tasks.append(task)
-                
+
         await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _safe_cancel_order(self, gateway, order_id):
@@ -517,10 +586,14 @@ class MultiExchangeStrategyManager:
         try:
             return await gateway.cancel_order(order_id)
         except ConnectionError as e:
-            logger.warning(f"Connection error during cancel_order for {gateway.name}: {e}")
+            logger.warning(
+                f"Connection error during cancel_order for {gateway.name}: {e}"
+            )
             return False
         except Exception as e:
-            logger.error(f"Unexpected error during cancel_order for {gateway.name}: {e}")
+            logger.error(
+                f"Unexpected error during cancel_order for {gateway.name}: {e}"
+            )
             return False
 
     def _on_global_state_change(self, state: GlobalState):

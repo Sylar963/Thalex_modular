@@ -1086,137 +1086,61 @@ class Thalex:
     async def portfolio(
         self,
         id: Optional[int] = None,
+        **kwargs
     ):
         """Portfolio"""
         await self._send(
             "private/portfolio",
             id,
+            **kwargs
         )
 
     async def open_orders(
         self,
         id: Optional[int] = None,
+        **kwargs
     ):
         """Open orders"""
         await self._send(
             "private/open_orders",
             id,
+            **kwargs
         )
 
     async def order_history(
         self,
-        limit: Optional[int] = None,
-        time_low: Optional[int] = None,
-        time_high: Optional[int] = None,
-        bookmark: Optional[str] = None,
         id: Optional[int] = None,
+        **kwargs
     ):
-        """Order history
-
-        :limit:  Max results to return.
-        :time_low:  Start time (UNIX timestamp) defaults to zero.
-        :time_high:  End time (UNIX timestamp) defaults to now.
-        :bookmark:  Set to bookmark from previous call to get next page.
-        """
+        """Order history"""
         await self._send(
             "private/order_history",
             id,
-            limit=limit,
-            time_low=time_low,
-            time_high=time_high,
-            bookmark=bookmark,
+            **kwargs
         )
 
     async def trade_history(
         self,
-        limit: Optional[int] = None,
-        time_low: Optional[int] = None,
-        time_high: Optional[int] = None,
-        bookmark: Optional[str] = None,
         id: Optional[int] = None,
+        **kwargs
     ):
-        """Trade history
-
-        :limit:  Max results to return.
-        :time_low:  Start time (UNIX timestamp) defaults to zero.
-        :time_high:  End time (UNIX timestamp) defaults to now.
-        :bookmark:  Set to bookmark from previous call to get next page.
-        """
+        """Trade history"""
         await self._send(
             "private/trade_history",
             id,
-            limit=limit,
-            time_low=time_low,
-            time_high=time_high,
-            bookmark=bookmark,
-        )
-
-    async def transaction_history(
-        self,
-        limit: Optional[int] = None,
-        time_low: Optional[int] = None,
-        time_high: Optional[int] = None,
-        bookmark: Optional[str] = None,
-        id: Optional[int] = None,
-    ):
-        """Transaction history
-
-        :limit:  Max results to return.
-        :time_low:  Start time (UNIX timestamp) defaults to zero.
-        :time_high:  End time (UNIX timestamp) defaults to now.
-        :bookmark:  Set to bookmark from previous call to get next page.
-        """
-        await self._send(
-            "private/transaction_history",
-            id,
-            limit=limit,
-            time_low=time_low,
-            time_high=time_high,
-            bookmark=bookmark,
-        )
-
-    async def rfq_history(
-        self,
-        limit: Optional[int] = None,
-        time_low: Optional[int] = None,
-        time_high: Optional[int] = None,
-        bookmark: Optional[str] = None,
-        id: Optional[int] = None,
-    ):
-        """RFQ history
-
-        :limit:  Max results to return.
-        :time_low:  Start time (UNIX timestamp) defaults to zero.
-        :time_high:  End time (UNIX timestamp) defaults to now.
-        :bookmark:  Set to bookmark from previous call to get next page.
-        """
-        await self._send(
-            "private/rfq_history",
-            id,
-            limit=limit,
-            time_low=time_low,
-            time_high=time_high,
-            bookmark=bookmark,
-        )
-
-    async def account_breakdown(
-        self,
-        id: Optional[int] = None,
-    ):
-        """Account breakdown"""
-        await self._send(
-            "private/account_breakdown",
-            id,
+            **kwargs
         )
 
     async def account_summary(
         self,
         id: Optional[int] = None,
+        **kwargs
     ):
         """Account summary"""
         await self._send(
             "private/account_summary",
             id,
+            **kwargs
         )
 
     async def required_margin_breakdown(

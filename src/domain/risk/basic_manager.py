@@ -65,6 +65,16 @@ class BasicRiskManager(RiskManager):
         projected_total = current_exposure + active_exposure_change + new_impact
 
         max_limit = self._get_limit_for_order(order)
+        
+        # Add more detailed logging for Thalex
+        exchange = getattr(order, "exchange", "")
+        if exchange and exchange.lower() == "thalex":
+            logger.info(
+                f"Thalex risk check - Order: {order.side.value} {order.size}@{order.price}, "
+                f"Current: {current_exposure:.4f}, Active change: {active_exposure_change:.4f}, "
+                f"New impact: {new_impact:.4f}, Projected: {projected_total:.4f}, Limit: {max_limit:.4f}"
+            )
+
         if abs(projected_total) > max_limit:
             logger.warning(
                 f"Order REJECTED: Projected {projected_total:.4f} exceeds limit {max_limit}. "
