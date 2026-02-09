@@ -475,6 +475,9 @@ class Thalex:
                 break
             except Exception as e:
                 logging.error(f"Error in message processing: {str(e)}")
+                # Check if connection is still valid
+                if not self.connected():
+                    await self.reconnect()
                 await asyncio.sleep(0.1)  # Avoid tight loop on persistent errors
 
     async def reconnect(self):
@@ -507,7 +510,7 @@ class Thalex:
         if not params:
             params = {}
 
-        # Fix: Extract 'id' from params if present and put it at top level
+        # Extract 'id' from params if present and put it at top level
         # This fixes the issue where ID was being sent inside params{} instead of root
         req_id = params.pop("id", None)
 
@@ -518,7 +521,7 @@ class Thalex:
         request_str = json.dumps(request)  # Use standard json to avoid escaping issues
 
         # DEBUG LOG
-        logging.info(f"TX RAW: {request_str}")
+        logging.debug(f"TX RAW: {request_str}")
 
         if self.ws and self.ws.state == WsState.OPEN:
             await self.ws.send(request_str)
@@ -527,6 +530,11 @@ class Thalex:
 
     async def _send(self, method: str, id: Optional[int], **kwargs):
         """Enhanced send with batching, circuit breaking, and priority"""
+        # Check connection state first
+        if not self.connected():
+            logging.warning(f"Cannot send {method}: WebSocket not connected")
+            raise ConnectionError("WebSocket not connected")
+
         # Add ID to request if provided
         params = {}
         if id is not None:

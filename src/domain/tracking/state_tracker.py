@@ -70,6 +70,9 @@ class OptimizedLRUCache:
     def keys(self):
         return self._dict.keys()
 
+    def items(self):
+        return self._dict.items()
+
 
 class StateTracker:
     def __init__(

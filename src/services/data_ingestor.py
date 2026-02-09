@@ -130,12 +130,31 @@ class DataIngestionService:
                 except Exception as e:
                     logger.error(f"Failed to init Bybit ingestion: {e}")
 
+        # Ensure historical data coverage (Async Background Task)
+        asyncio.create_task(self._ensure_history_coverage())
+
         # Warmup Signal Engine
         if self.or_engine:
             asyncio.create_task(self._warmup_engine())
 
         self.loop_task = asyncio.create_task(self._run_loop())
         logger.info(f"DataIngestionService running with {len(self.adapters)} adapters.")
+
+    async def _ensure_history_coverage(self):
+        """
+        Check if we have 15 days of history. If not, trigger backfill using HistoricalOptionsLoader.
+        """
+        try:
+            logger.info("Starting background history coverage check (15d)...")
+            from ..data_ingestion.historical_options_loader import HistoricalOptionsLoader
+            
+            loader = HistoricalOptionsLoader()
+            # Run loader logic. It handles its own DB connection and gap checks.
+            await loader.run(days_back=15)
+            logger.info("History coverage check completed.")
+            
+        except Exception as e:
+            logger.error(f"Failed to ensure history coverage: {e}")
 
     async def _warmup_engine(self):
         """Load historical data to prime the engine."""

@@ -132,7 +132,7 @@ class MultiExchangeStrategyManager:
 
         logger.info("MultiExchangeStrategyManager stopped")
 
-    async def _connect_exchange(self, venue: VenueContext):
+    async def _connect_exchange(self, venue: OptimizedVenueContext):
         cfg = venue.config
         gw = cfg.gateway
 
@@ -628,7 +628,7 @@ class MultiExchangeStrategyManager:
 
             await self._reconcile_orders_venue(venue, desired_orders)
 
-    async def _manage_momentum_strategy(self, venue: VenueContext):
+    async def _manage_momentum_strategy(self, venue: OptimizedVenueContext):
         """
         Handles adding to momentum and managing time-based exits.
         """
@@ -713,7 +713,7 @@ class MultiExchangeStrategyManager:
                     }
                 )
 
-    async def _exit_momentum_add(self, venue: VenueContext, add_info: Dict):
+    async def _exit_momentum_add(self, venue: OptimizedVenueContext, add_info: Dict):
         """Executes a market order to exit a momentum addition."""
         logger.info(f"Exiting Momentum Add ({add_info['side']})")
         exit_order = Order(
@@ -728,7 +728,7 @@ class MultiExchangeStrategyManager:
         if hasattr(venue.config.gateway, "place_order"):
             await venue.config.gateway.place_order(exit_order)
 
-    async def _persist_bot_status(self, venue: VenueContext):
+    async def _persist_bot_status(self, venue: OptimizedVenueContext):
         if not self.storage:
             return
 

@@ -116,13 +116,25 @@ class ThalexAdapter(BaseExchangeAdapter):
         future = asyncio.Future()
         self.pending_requests[req_id] = future
 
+        # Determine timeout based on request type
+        # Subscription requests may take longer
+        method_name = func.__name__.lower()
+        if 'subscribe' in method_name:
+            timeout_val = 30.0  # Increased timeout for subscriptions
+        else:
+            timeout_val = 15.0  # Increased timeout for other requests
+
         try:
+            # Check connection status before sending request
+            if not self.client.connected():
+                raise ConnectionError("Client not connected")
+                
             # Call the client function (buy, sell, cancel, etc) passing 'id'
             # Note: The client methods must be awaited as they are async
             await func(id=req_id, **kwargs)
 
-            # Wait for response with shorter timeout for better responsiveness
-            response = await asyncio.wait_for(future, timeout=3.0)  # Reduced from 5.0
+            # Wait for response with adaptive timeout
+            response = await asyncio.wait_for(future, timeout=timeout_val)
             return response
         except asyncio.TimeoutError:
             logger.warning(f"RPC Timeout for request {req_id}")
@@ -158,14 +170,10 @@ class ThalexAdapter(BaseExchangeAdapter):
             await self.client.login(self.api_key, self.api_secret, id=login_id)
 
             # This should now work with the thalex.py library fix!
-            await asyncio.wait_for(future, timeout=8.0)  # Reduced from 10.0
+            await asyncio.wait_for(future, timeout=20.0)  # Increased from 15.0
             logger.info("Logged in successfully.")
 
             # Enable Cancel On Disconnect to get higher rate limits (50 req/s vs 10 req/s)
-            cod_id = self._get_next_id()
-            future_cod = asyncio.Future()
-            self.pending_requests[cod_id] = future_cod
-
             # Note: The library expects 'timeout_secs' to enable cancel on disconnect
             await self._rpc_request(
                 self.client.set_cancel_on_disconnect, timeout_secs=15
@@ -351,33 +359,56 @@ class ThalexAdapter(BaseExchangeAdapter):
             return False
 
     async def subscribe_ticker(self, symbol: str):
+        # Ensure we're properly connected before subscribing
+        if not self.connected or not self.client.connected():
+            logger.warning(f"Cannot subscribe to {symbol}: Not connected.")
+            return
+
         channel = f"ticker.{symbol}.raw"
         trade_channel = f"trades.{symbol}"
         orders_channel = "orders"  # Account orders channel
 
         logger.info(f"Subscribing to {channel}, {trade_channel}, and {orders_channel}")
+
+        # Subscribe to public channels first with retry
         try:
-            # Note: orders is technically a private channel but 'public_subscribe' often handles both if session is auth'd on some exchanges.
-            # On Thalex, it's 'private/subscribe' for account-related things if following strict RPC.
-            # But the adapter has been using public_subscribe for ticker/trades.
-            # Let's check if we should use private/subscribe.
-            await self._rpc_request(
-                self.client.public_subscribe, channels=[channel, trade_channel]
+            await self._rpc_request_with_retry(
+                self.client.public_subscribe, channels=[channel, trade_channel], max_retries=3
             )
-            # Try private subscribe for orders and portfolio
-            await self._rpc_request(
+            logger.info(f"Successfully subscribed to public channels: {channel}, {trade_channel}")
+        except Exception as e:
+            logger.error(f"Public subscription failed after retries: {e}")
+
+        # Subscribe to private channels with retry
+        try:
+            await self._rpc_request_with_retry(
                 self.client.private_subscribe,
                 channels=[orders_channel, "portfolio", "account"],
+                max_retries=3
             )
+            logger.info("Successfully subscribed to private channels: orders, portfolio, account")
         except Exception as e:
-            logger.error(f"Subscription failed: {e}")
-        try:
-            # Verification for sub is nice too
-            await self._rpc_request(
-                self.client.public_subscribe, channels=[channel, trade_channel]
-            )
-        except Exception as e:
-            logger.error(f"Subscription failed: {e}")
+            logger.error(f"Private subscription failed after retries: {e}")
+
+    async def _rpc_request_with_retry(self, func, max_retries=3, **kwargs):
+        """Wrapper for _rpc_request with retry logic"""
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                return await self._rpc_request(func, **kwargs)
+            except (TimeoutError, ConnectionError) as e:
+                last_error = e
+                logger.warning(f"RPC request failed (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:  # Don't sleep after the last attempt
+                    await asyncio.sleep(0.5 * (2 ** attempt))  # Exponential backoff
+                continue
+            except Exception as e:
+                # For other exceptions, don't retry
+                raise e
+        
+        # If all retries failed, raise the last error
+        raise last_error
 
     async def _send_batch(self, requests: List[Dict]) -> List[Any]:
         """
@@ -391,6 +422,11 @@ class ThalexAdapter(BaseExchangeAdapter):
         if self.is_reconnecting:
             logger.warning(f"Cannot send batch of {len(requests)} requests: Adapter is reconnecting.")
             return [ConnectionError("Adapter is reconnecting")] * len(requests)
+
+        # Ensure we're properly connected and authenticated
+        if not self.connected or not self.client.connected():
+            logger.warning(f"Cannot send batch of {len(requests)} requests: Not connected.")
+            return [ConnectionError("Not connected")] * len(requests)
 
         futures = []
         batch_payload = []
@@ -426,25 +462,30 @@ class ThalexAdapter(BaseExchangeAdapter):
                 logger.debug(f"TX PIPE: {req_str}")
                 await self.client.ws.send(req_str)
 
-            # Wait with Timeout - optimized timeout
+            # Wait with Timeout - increased timeout for batch operations
             results = await asyncio.wait_for(
-                asyncio.gather(*futures, return_exceptions=True), timeout=3.0  # Reduced from 5.0
+                asyncio.gather(*futures, return_exceptions=True), timeout=35.0  # Increased from 25.0
             )
             return results
 
         except asyncio.TimeoutError:
             logger.error("Batch send timed out")
-            for f in futures:
-                if not f.done():
-                    f.cancel()
+            # Properly clean up pending requests on timeout
+            for req_id, future in zip([payload["id"] for payload in batch_payload], futures):
+                if req_id in self.pending_requests:
+                    del self.pending_requests[req_id]
+                if not future.done():
+                    future.cancel()
             return [TimeoutError("Batch Timeout")] * len(requests)
 
         except Exception as e:
             logger.error(f"Batch send failed: {e}")
-            # Fail all futures
-            for f in futures:
-                if not f.done():
-                    f.set_exception(e)
+            # Properly clean up pending requests on failure
+            for req_id, future in zip([payload["id"] for payload in batch_payload], futures):
+                if req_id in self.pending_requests:
+                    del self.pending_requests[req_id]
+                if not future.done():
+                    future.set_exception(e)
             return [e] * len(requests)
 
     async def place_orders_batch(self, orders: List[Order]) -> List[Order]:
@@ -458,9 +499,14 @@ class ThalexAdapter(BaseExchangeAdapter):
             logger.warning(f"Cannot place {len(orders)} orders: Adapter is reconnecting.")
             return [replace(o, status=OrderStatus.REJECTED) for o in orders]
 
+        # Additional check: ensure client is connected and ready
+        if not self.client.connected():
+            logger.warning(f"Cannot place {len(orders)} orders: Client not connected.")
+            return [replace(o, status=OrderStatus.REJECTED) for o in orders]
+
         # Optimized rate limiting with early exit
         if not self.me_rate_limiter.consume(len(orders)):
-            logger.warning(f"Insufficient tokens for {len(orders)} orders. Waiting...")
+            logger.info(f"Insufficient tokens for {len(orders)} orders. Waiting...")
             await self.me_rate_limiter.consume_wait(len(orders))
 
         logger.debug(f"Rate limit cleared, placing {len(orders)} orders.")
@@ -483,6 +529,7 @@ class ThalexAdapter(BaseExchangeAdapter):
             }
             requests.append({"method": method, "params": params})
 
+        logger.debug(f"Sending batch request with {len(requests)} orders")
         results = await self._send_batch(requests)
         logger.debug(f"Received {len(results)} results from batch send.")
 
@@ -491,27 +538,37 @@ class ThalexAdapter(BaseExchangeAdapter):
             if isinstance(res, Exception):
                 logger.warning(f"Order {order.id} failed with exception: {res}")
                 updated_orders.append(replace(order, status=OrderStatus.REJECTED))
-            elif "error" in res:
+            elif isinstance(res, dict) and "error" in res:
                 logger.warning(f"Order {order.id} rejected: {res.get('error')}")
                 updated_orders.append(replace(order, status=OrderStatus.REJECTED))
             else:
-                result_data = res.get("result", {})
-                exchange_id = str(
-                    result_data.get("order_id", result_data.get("id", ""))
-                )
-                if exchange_id:
-                    logger.info(
-                        f"Order {order.id} placed successfully as {exchange_id}"
+                # Handle successful response
+                if isinstance(res, dict):
+                    result_data = res.get("result", {})
+                    exchange_id = str(
+                        result_data.get("order_id", result_data.get("id", ""))
                     )
-                    updated_orders.append(
-                        replace(order, exchange_id=exchange_id, status=OrderStatus.OPEN)
-                    )
-                    self.orders[exchange_id] = updated_orders[-1]
+                    if exchange_id:
+                        logger.info(
+                            f"Order {order.id} placed successfully as {exchange_id}"
+                        )
+                        updated_orders.append(
+                            replace(order, exchange_id=exchange_id, status=OrderStatus.OPEN)
+                        )
+                        self.orders[exchange_id] = updated_orders[-1]
+                    else:
+                        logger.error(
+                            f"Order {order.id} response missing exchange_id: {res}"
+                        )
+                        updated_orders.append(replace(order, status=OrderStatus.REJECTED))
                 else:
-                    logger.error(
-                        f"Order {order.id} response missing exchange_id: {res}"
-                    )
+                    # Response is not a dict and not an exception, treat as failure
+                    logger.warning(f"Order {order.id} unexpected response type: {type(res)}")
                     updated_orders.append(replace(order, status=OrderStatus.REJECTED))
+
+        # Log the outcome of the batch operation
+        successful_orders = sum(1 for order in updated_orders if order.status != OrderStatus.REJECTED)
+        logger.info(f"Batch order placement: {successful_orders}/{len(orders)} orders successful")
 
         return updated_orders
 
@@ -523,6 +580,11 @@ class ThalexAdapter(BaseExchangeAdapter):
         # Check if the adapter is currently reconnecting
         if self.is_reconnecting:
             logger.warning(f"Cannot cancel {len(order_ids)} orders: Adapter is reconnecting.")
+            return [False] * len(order_ids)
+
+        # Additional check: ensure client is connected and ready
+        if not self.client.connected():
+            logger.warning(f"Cannot cancel {len(order_ids)} orders: Client not connected.")
             return [False] * len(order_ids)
 
         # Optimized rate limiting with early exit
@@ -580,8 +642,11 @@ class ThalexAdapter(BaseExchangeAdapter):
             return []
 
         try:
-            # Thalex API: private/get_open_orders
-            # params: { "instrument_name": symbol }
+            # Check if the client has the get_open_orders method
+            if not hasattr(self.client, 'get_open_orders'):
+                logger.warning("Thalex client does not have get_open_orders method")
+                return []
+
             response = await self._rpc_request(
                 self.client.get_open_orders, instrument_name=symbol
             )
@@ -686,23 +751,33 @@ class ThalexAdapter(BaseExchangeAdapter):
                 if isinstance(msg, list):
                     for m in msg:
                         if isinstance(m, dict):
-                            await self._process_message(m)  # Direct processing instead of queuing
+                            await self._handle_single_msg(m)
                     continue
 
                 if not isinstance(msg, dict):
                     logger.warning(f"Received non-dict msg: {msg}")
                     continue
 
-                # Process message efficiently
-                await self._process_message(msg)
+                # Process message efficiently via handle_single_msg
+                await self._handle_single_msg(msg)
 
             except asyncio.TimeoutError:
                 # Normal timeout, continue loop
+                # Check if the connection is still alive by checking if the client is connected
+                if not self.client.connected():
+                    logger.warning("Client reports disconnected, ending message loop")
+                    self.connected = False
+                    break
                 continue
             except Exception as e:
+                error_msg = str(e).lower()
                 logger.error(f"Message loop error: {e}")
-                if "connection closed" in str(e).lower():
-                    logger.info("Connection closed, exiting message loop")
+                
+                # Check for specific connection-related errors
+                if "connection closed" in error_msg or "invalid state" in error_msg or "websocket" in error_msg:
+                    logger.info(f"Connection issue detected ({error_msg}), initiating reconnection")
+                    # Trigger reconnection by setting connected to False
+                    self.connected = False
                     break
                 # Brief pause before continuing to prevent tight loop on error
                 await asyncio.sleep(0.1)
@@ -713,7 +788,7 @@ class ThalexAdapter(BaseExchangeAdapter):
     async def _attempt_reconnect(self):
         # Set the reconnection flag to prevent other operations during reconnection
         self.is_reconnecting = True
-        
+
         max_retries = 10
         base_delay = 1.0
         for attempt in range(max_retries):
@@ -724,26 +799,42 @@ class ThalexAdapter(BaseExchangeAdapter):
             await asyncio.sleep(delay)
 
             try:
+                # Cancel existing tasks before reconnecting
+                if self.msg_loop_task:
+                    self.msg_loop_task.cancel()
+                if self.heartbeat_task:
+                    self.heartbeat_task.cancel()
+                    
+                # Disconnect and reconnect
                 await self.client.disconnect()
                 await self.client.initialize()
 
                 if not self.client.connected():
                     continue
 
+                # Restart message loop and heartbeat before login
+                self.msg_loop_task = asyncio.create_task(self._msg_loop())
+                self.heartbeat_task = asyncio.create_task(self._heartbeat_monitor())
+
                 login_id = self._get_next_id()
                 future = asyncio.Future()
                 self.pending_requests[login_id] = future
 
                 await self.client.login(self.api_key, self.api_secret, id=login_id)
-                await asyncio.wait_for(future, timeout=10.0)
+                await asyncio.wait_for(future, timeout=15.0)  # Use same timeout as connect
 
                 await self._rpc_request(
                     self.client.set_cancel_on_disconnect, timeout_secs=15
                 )
 
+                # Fetch instrument details again after reconnection
+                await self.fetch_instrument_info(
+                    os.getenv("PRIMARY_INSTRUMENT", "BTC-PERPETUAL")
+                )
+
                 logger.info("Reconnection successful.")
                 self.last_msg_time = time.time()
-                
+
                 # Reset the reconnection flag after successful reconnection
                 self.is_reconnecting = False
                 return
@@ -753,7 +844,7 @@ class ThalexAdapter(BaseExchangeAdapter):
 
         logger.error("All reconnection attempts failed. Giving up.")
         self.connected = False
-        
+
         # Reset the reconnection flag even if reconnection failed
         self.is_reconnecting = False
 
@@ -767,14 +858,15 @@ class ThalexAdapter(BaseExchangeAdapter):
     async def _handle_single_msg(self, msg: Dict):
         # Check for RPC response
         msg_id = msg.get("id")
-        if msg_id is not None and msg_id in self.pending_requests:
-            self.pending_requests[msg_id].set_result(msg)
-            if msg_id in self.pending_requests:  # check again just in case
+        if msg_id is not None:
+            logger.debug(f"RX RPC: {msg}")
+            if msg_id in self.pending_requests:
+                self.pending_requests[msg_id].set_result(msg)
                 del self.pending_requests[msg_id]
-            return
+                return
 
         # Delegate processing
-        asyncio.create_task(self._process_message(msg))
+        await self._process_message(msg)
 
     async def _process_message(self, msg: Dict):
         # Handle new format: {'channel_name': ..., 'notification': ...}
@@ -938,15 +1030,13 @@ class ThalexAdapter(BaseExchangeAdapter):
         # Use the standardized last_ticker_time from the base class
         self.last_ticker_time = time.time()
 
-        # Define ticker death threshold as a constant
-        TICKER_DEATH_THRESHOLD = 90  # seconds
-
         while self.connected:
-            await asyncio.sleep(30)  # Check every 30 seconds instead of 5
+            await asyncio.sleep(10)  # Check every 10 seconds for more responsive monitoring
             time_since_last_msg = time.time() - self.last_msg_time
 
-            if time_since_last_msg > 60:  # 60 second timeout
-                logger.warning("Heartbeat timeout detected, connection may be dead")
+            # Check both the internal timer and the client's connection status
+            if time_since_last_msg > 60 or not self.client.connected():  # Increase timeout to 60 seconds to avoid premature disconnections
+                logger.warning("Heartbeat timeout detected or client disconnected, connection may be dead")
                 # Trigger reconnection logic
                 self.connected = False
                 break
