@@ -135,3 +135,198 @@ class MMVisualizer:
             xaxis_range=[current_price * 0.95, current_price * 1.05],  # Zoom to +/- 5%
         )
         return fig
+
+    def plot_cumulative_pnl(self, df, symbol):
+        if df.empty or "cum_pnl" not in df.columns:
+            return go.Figure()
+
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatter(
+                x=df["time"],
+                y=df["cum_pnl"],
+                mode="lines",
+                name="Cumulative PnL",
+                line=dict(color="blue", width=2),
+                fill="tozeroy",
+            )
+        )
+        fig.update_layout(
+            title=f"Cumulative Realized PnL - {symbol}",
+            xaxis_title="Time",
+            yaxis_title="PnL (USD)",
+            template="plotly_dark",
+        )
+        return fig
+
+    def plot_trade_executions(self, klines, fills_df, symbol):
+        # Klines to OHLC dataframe
+        if not klines:
+            return go.Figure()
+
+        # Parse klines
+        # [startTime, open, high, low, close, volume, turnover]
+        k_data = []
+        for k in klines:
+            k_data.append(
+                {
+                    "time": pd.to_datetime(int(k[0]), unit="ms", utc=True),
+                    "open": float(k[1]),
+                    "high": float(k[2]),
+                    "low": float(k[3]),
+                    "close": float(k[4]),
+                }
+            )
+        ohlc = pd.DataFrame(k_data).sort_values("time")
+
+        fig = go.Figure(
+            data=[
+                go.Candlestick(
+                    x=ohlc["time"],
+                    open=ohlc["open"],
+                    high=ohlc["high"],
+                    low=ohlc["low"],
+                    close=ohlc["close"],
+                    name="Price",
+                )
+            ]
+        )
+
+        if not fills_df.empty:
+            buys = fills_df[fills_df["side"] == "Buy"]
+            sells = fills_df[fills_df["side"] == "Sell"]
+
+            if not buys.empty:
+                fig.add_trace(
+                    go.Scatter(
+                        x=buys["time"],
+                        y=buys["price"],
+                        mode="markers",
+                        name="Buy Fill",
+                        marker=dict(
+                            symbol="triangle-up", size=10, color="green", line_width=1
+                        ),
+                    )
+                )
+
+            if not sells.empty:
+                fig.add_trace(
+                    go.Scatter(
+                        x=sells["time"],
+                        y=sells["price"],
+                        mode="markers",
+                        name="Sell Fill",
+                        marker=dict(
+                            symbol="triangle-down", size=10, color="red", line_width=1
+                        ),
+                    )
+                )
+
+        fig.update_layout(
+            title=f"Trade Executions - {symbol}",
+            xaxis_title="Time",
+            yaxis_title="Price",
+            template="plotly_dark",
+            xaxis_rangeslider_visible=False,
+        )
+        return fig
+
+    def plot_markout_distribution(self, markouts, symbol):
+        if markouts.empty:
+            return go.Figure()
+
+        fig = go.Figure()
+
+        for col in ["markout_1m", "markout_5m", "markout_60m"]:
+            if col in markouts.columns:
+                fig.add_trace(go.Box(y=markouts[col], name=col, boxmean=True))
+
+        fig.update_layout(
+            title=f"Post-Trade Markout Distribution (PnL per Unit) - {symbol}",
+            yaxis_title="Price Change in Favor (USD)",
+            template="plotly_dark",
+        )
+        return fig
+
+    def plot_indicators(self, indicators, symbol):
+        """
+        Plots key indicators: Liquidity, Trend, and Toxicity.
+        Expects indicators dict with 'regimes' and 'hft' keys containing DataFrames.
+        """
+        from plotly.subplots import make_subplots
+
+        regimes = indicators.get("regimes")
+        hft = indicators.get("hft")
+
+        if (regimes is None or regimes.empty) and (hft is None or hft.empty):
+            return go.Figure()
+
+        # Create subplots
+        fig = make_subplots(
+            rows=3,
+            cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.05,
+            subplot_titles=[
+                "Trend Strength (Regimes)",
+                "Liquidity Score",
+                "HFT Toxicity",
+            ],
+        )
+
+        # 1. Trend
+        if regimes is not None and not regimes.empty:
+            for col, color in [
+                ("trend_fast", "cyan"),
+                ("trend_mid", "yellow"),
+                ("trend_slow", "magenta"),
+            ]:
+                if col in regimes.columns:
+                    fig.add_trace(
+                        go.Scatter(
+                            x=regimes["time"],
+                            y=regimes[col],
+                            mode="lines",
+                            name=col,
+                            line=dict(color=color, width=1),
+                        ),
+                        row=1,
+                        col=1,
+                    )
+
+            # 2. Liquidity
+            if "liquidity_score" in regimes.columns:
+                fig.add_trace(
+                    go.Scatter(
+                        x=regimes["time"],
+                        y=regimes["liquidity_score"],
+                        mode="lines",
+                        name="Liquidity Score",
+                        line=dict(color="lime", width=1),
+                        fill="tozeroy",
+                    ),
+                    row=2,
+                    col=1,
+                )
+
+        # 3. Toxicity
+        if hft is not None and not hft.empty:
+            if "toxicity_score" in hft.columns:
+                fig.add_trace(
+                    go.Scatter(
+                        x=hft["time"],
+                        y=hft["toxicity_score"],
+                        mode="lines",
+                        name="Toxicity",
+                        line=dict(color="red", width=1),
+                    ),
+                    row=3,
+                    col=1,
+                )
+
+        fig.update_layout(
+            title=f"Market Regime & Risk Indicators - {symbol}",
+            template="plotly_dark",
+            height=800,
+        )
+        return fig

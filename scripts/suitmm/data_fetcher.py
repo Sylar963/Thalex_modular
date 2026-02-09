@@ -64,35 +64,105 @@ class MarketDataFetcher:
             print(f"Error fetching instrument info for {symbol}: {e}")
             return None
 
-    async def fetch_fills_from_db(self, symbol: str) -> List[Dict]:
+    async def _get_db_connection(self):
         try:
-            # Note: 5433 port as per project config, but verify if 5432 is used elsewhere
-            # The prompt context mentioned "Standardized on port 5432... removing the legacy 5433"
-            # So I should probably use 5432, but mm_coin_analyzer.py usages 5433.
-            # I will check valid port. User rules say 5432.
-            # But mm_coin_analyzer.py has 5433.
-            # I will use 5432 based on "Standardized on port 5432" rule.
-            conn = await asyncpg.connect(
+            return await asyncpg.connect(
                 "postgresql://postgres:password@localhost:5432/thalex_trading"
             )
-            fills = await conn.fetch(
-                "SELECT time, side, price, size, fee FROM bot_executions WHERE symbol=$1 ORDER BY time ASC",
+        except Exception as e:
+            print(f"Failed to connect to primary port 5432: {e}")
+            # Fallback for legacy setups
+            return await asyncpg.connect(
+                "postgresql://postgres:password@localhost:5433/thalex_trading"
+            )
+
+    async def fetch_fills_from_db(self, symbol: str) -> List[Dict]:
+        try:
+            conn = await self._get_db_connection()
+            # Try to fetch fills. Handle cases where table might use 'symbol' or 'instrument_id'
+            # Assuming 'symbol' based on previous context.
+            rows = await conn.fetch(
+                """
+                SELECT time, side, price, size, fee 
+                FROM bot_executions 
+                WHERE symbol=$1 
+                ORDER BY time ASC
+                """,
                 symbol,
             )
             await conn.close()
-            return [dict(f) for f in fills]
+            return [dict(r) for r in rows]
         except Exception as e:
-            # Fallback to 5433 just in case, or just log error
-            try:
-                conn = await asyncpg.connect(
-                    "postgresql://postgres:password@localhost:5433/thalex_trading"
-                )
-                fills = await conn.fetch(
-                    "SELECT time, side, price, size, fee FROM bot_executions WHERE symbol=$1 ORDER BY time ASC",
-                    symbol,
-                )
-                await conn.close()
-                return [dict(f) for f in fills]
-            except Exception as e2:
-                print(f"Error fetching DB fills: {e2}")
-                return []
+            print(f"Error fetching DB fills: {e}")
+            return []
+
+    async def fetch_indicators(
+        self, symbol: str, days: int = 14
+    ) -> Dict[str, List[Dict]]:
+        """
+        Fetches historical indicator data from TimescaleDB tables.
+        Returns a dictionary with lists of records for signals, regimes, and hft metrics.
+        """
+        try:
+            conn = await self._get_db_connection()
+
+            # Helper to fetch and convert to dict
+            async def fetch_table(table, columns):
+                query = f"""
+                    SELECT time, {", ".join(columns)}
+                    FROM {table}
+                    WHERE symbol=$1 AND time > NOW() - INTERVAL '{days} days'
+                    ORDER BY time ASC
+                """
+                try:
+                    rows = await conn.fetch(query, symbol)
+                    return [dict(r) for r in rows]
+                except Exception as e:
+                    print(f"  Warning: Could not fetch from {table}: {e}")
+                    return []
+
+            print(f"  Fetching indicators for {symbol}...")
+
+            # 1. Market Signals
+            signals = await fetch_table(
+                "market_signals",
+                [
+                    "momentum",
+                    "reversal",
+                    "volatility",
+                    "vamp_value",
+                    "market_impact",
+                    "immediate_flow",
+                    "orh",
+                    "orl",
+                    "orm",
+                ],
+            )
+
+            # 2. Market Regimes
+            regimes = await fetch_table(
+                "market_regimes",
+                [
+                    "trend_fast",
+                    "trend_mid",
+                    "trend_slow",
+                    "rv_fast",
+                    "rv_mid",
+                    "rv_slow",
+                    "liquidity_score",
+                    "expected_move_pct",
+                    "atm_iv",
+                ],
+            )
+
+            # 3. HFT Signals
+            hft = await fetch_table(
+                "hft_signals", ["toxicity_score", "pull_rate", "quote_stability"]
+            )
+
+            await conn.close()
+            return {"signals": signals, "regimes": regimes, "hft": hft}
+
+        except Exception as e:
+            print(f"Error fetching indicators: {e}")
+            return {"signals": [], "regimes": [], "hft": []}

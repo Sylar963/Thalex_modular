@@ -4,6 +4,7 @@ import argparse
 import aiohttp
 from .data_fetcher import MarketDataFetcher
 from .analyzer import MarketAnalyzer
+from .performance_analyzer import PerformanceAnalyzer
 from .visualizer import MMVisualizer
 from .report_generator import ReportGenerator
 
@@ -67,6 +68,56 @@ async def analyze_symbol(
     return params
 
 
+async def analyze_performance(symbol, fetcher, perf_analyzer, visualizer, reporter):
+    print(f"\nAnalyzing Performance for {symbol}...")
+
+    # 1. Fetch Fills (DB)
+    fills = await fetcher.fetch_fills_from_db(symbol)
+    if not fills:
+        print(f"No fills found for {symbol} in database.")
+        return None
+
+    # 2. Fetch Market Data and Indicators
+    # Fetch klines for context (last 14 days hourly)
+    # Fetch indicators (last 14 days)
+    klines, indicators = await asyncio.gather(
+        fetcher.fetch_klines(symbol, interval="60", limit=336),
+        fetcher.fetch_indicators(symbol, days=14),
+    )
+
+    # 3. Analyze
+    pnl_df = perf_analyzer.calculate_pnl_series(fills)
+    stats = perf_analyzer.calculate_trade_stats(fills)
+
+    # Use klines for markout? 60m klines might be too coarse for 1m markout
+    # But for visual context they are fine.
+    # Ideally we'd fetch 1m klines, but let's use what we have for now.
+    markouts = perf_analyzer.calculate_markout(fills, klines)
+
+    ind_dfs = perf_analyzer.prepare_indicator_data(indicators)
+
+    # 4. Visualize
+    figs = []
+
+    # Cumulative PnL
+    figs.append(visualizer.plot_cumulative_pnl(pnl_df, symbol))
+
+    # Execution Map
+    figs.append(visualizer.plot_trade_executions(klines, pnl_df, symbol))
+
+    # Indicator Correlation
+    figs.append(visualizer.plot_indicators(ind_dfs, symbol))
+
+    # Execution Quality
+    figs.append(visualizer.plot_markout_distribution(markouts, symbol))
+
+    # 5. Generate Report
+    filename = f"performance_{symbol}.html"
+    reporter.generate_performance_report(symbol, stats, figs, filename)
+
+    return stats
+
+
 async def main():
     parser = argparse.ArgumentParser(
         description="SuitMM: Visual Market Making Analysis Suite"
@@ -78,32 +129,45 @@ async def main():
     parser.add_argument(
         "--size", type=float, help="Override minimum order size (e.g. 0.1)"
     )
+    parser.add_argument(
+        "--mode",
+        choices=["analyze", "performance"],
+        default="analyze",
+        help="Mode: 'analyze' for market feasibility, 'performance' for bot stats",
+    )
 
     args = parser.parse_args()
 
     async with aiohttp.ClientSession() as session:
         fetcher = MarketDataFetcher(session)
         analyzer = MarketAnalyzer()
+        perf_analyzer = PerformanceAnalyzer()
         visualizer = MMVisualizer()
         reporter = ReportGenerator()
 
         results = {}
 
         for symbol in args.symbols:
-            params = await analyze_symbol(
-                symbol.upper(),
-                args.capital,
-                args.size,
-                fetcher,
-                analyzer,
-                visualizer,
-                reporter,
-            )
-            if params:
-                results[symbol] = params
+            if args.mode == "analyze":
+                res = await analyze_symbol(
+                    symbol.upper(),
+                    args.capital,
+                    args.size,
+                    fetcher,
+                    analyzer,
+                    visualizer,
+                    reporter,
+                )
+            else:
+                res = await analyze_performance(
+                    symbol.upper(), fetcher, perf_analyzer, visualizer, reporter
+                )
+
+            if res:
+                results[symbol] = res
 
         # CLI Summary
-        if len(results) > 0:
+        if len(results) > 0 and args.mode == "analyze":
             print(f"\n{'=' * 70}")
             print(f"  COMPARISON RANKING (by RTs needed for 2%/day)")
             print(f"{'=' * 70}")
@@ -122,6 +186,16 @@ async def main():
                 )
             print(f"{'=' * 70}\n")
             print("Check generated .html files for visual reports.")
+        elif len(results) > 0 and args.mode == "performance":
+            print(f"\n{'=' * 70}")
+            print("  PERFORMANCE SUMMARY")
+            print(f"{'=' * 70}")
+            for sym, stats in results.items():
+                pnl = stats.get("Total PnL", 0)
+                wr = stats.get("Win Rate", 0) * 100
+                print(f"  {sym:15s} | PnL: ${pnl:.4f} | Win Rate: {wr:.1f}%")
+            print(f"{'=' * 70}\n")
+            print("Check generated performance_*.html files.")
 
 
 if __name__ == "__main__":

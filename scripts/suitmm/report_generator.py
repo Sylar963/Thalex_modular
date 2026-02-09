@@ -122,3 +122,86 @@ class ReportGenerator:
             f.write(html_content)
 
         print(f"Report saved to: {output_path}")
+
+    def generate_performance_report(self, symbol, stats, visual_figs, output_path):
+        """
+        Generates HTML report for Bot Performance.
+        stats: Dict from PerformanceAnalyzer.calculate_trade_stats
+        visual_figs: List of Plotly Figures
+        """
+
+        # Convert figures to HTML divs
+        charts_html = ""
+        for fig in visual_figs:
+            charts_html += pio.to_html(fig, include_plotlyjs="cdn", full_html=False)
+            charts_html += "<br><hr><br>"
+
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # Color coding for PnL
+        pnl = stats.get("Total PnL", 0)
+        pnl_color = "text-success" if pnl >= 0 else "text-danger"
+
+        html_content = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Bot Performance: {symbol}</title>
+            <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+            <style>
+                body {{ background-color: #1e1e1e; color: #f0f0f0; }}
+                .card {{ background-color: #2d2d2d; border: 1px solid #444; margin-bottom: 20px; }}
+                .metric-label {{ color: #aaa; font-size: 0.9em; }}
+                .metric-value {{ font-size: 1.4em; font-weight: bold; }}
+            </style>
+        </head>
+        <body>
+            <div class="container-fluid mt-4">
+                <h1 class="mb-4">Bot Performance Analysis: <span class="text-primary">{symbol}</span></h1>
+                <p class="text-muted">Generated at {timestamp}</p>
+                
+                <div class="row">
+                    <div class="col-md-3">
+                        <div class="card p-3">
+                            <div class="metric-label">Total Realized PnL</div>
+                            <div class="metric-value {pnl_color}">${stats.get("Total PnL", 0):.4f}</div>
+                        </div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="card p-3">
+                            <div class="metric-label">Win Rate</div>
+                            <div class="metric-value">{stats.get("Win Rate", 0) * 100:.1f}%</div>
+                            <small class="text-muted">{stats.get("Total Trades", 0)} trades</small>
+                        </div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="card p-3">
+                            <div class="metric-label">Profit Factor</div>
+                            <div class="metric-value">{stats.get("Profit Factor", 0):.2f}</div>
+                        </div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="card p-3">
+                            <div class="metric-label">Volume Traded</div>
+                            <div class="metric-value">${stats.get("Total Volume", 0):.2f}</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="row">
+                    <div class="col-12">
+                        <div class="card p-3">
+                            <h3 class="mb-3">Visual Analysis & Indicators</h3>
+                            {charts_html}
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+
+        with open(output_path, "w") as f:
+            f.write(html_content)
+
+        print(f"Performance Report saved to: {output_path}")
