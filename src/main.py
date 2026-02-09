@@ -1,4 +1,3 @@
-# Standard library imports
 import asyncio
 import logging
 import signal
@@ -319,11 +318,11 @@ if __name__ == "__main__":
     try:
         import uvloop
 
-        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+        uvloop.run(main())
     except ImportError:
-        pass  # Fallback to default loop if uvloop not installed
-
-    try:
-        asyncio.run(main())
+        try:
+            asyncio.run(main())
+        except KeyboardInterrupt:
+            pass
     except KeyboardInterrupt:
         pass

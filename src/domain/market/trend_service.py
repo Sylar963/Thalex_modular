@@ -15,7 +15,8 @@ class HistoricalTrendService:
         self.storage = storage
         self._trend_cache: Dict[str, float] = {}
         self._last_update: Dict[str, float] = {}
-        self.update_interval = 3600  # Update every hour
+        self._last_warning: Dict[str, float] = {}
+        self.update_interval = 3600
 
     async def get_trend_14d(self, symbol: str) -> float:
         """
@@ -37,9 +38,11 @@ class HistoricalTrendService:
             )
 
             if not history or len(history) < 24 * 14:
-                logger.warning(
-                    f"Insufficient history for 14d trend calculation for {symbol}"
-                )
+                if now - self._last_warning.get(symbol, 0) > 3600:
+                    logger.warning(
+                        f"Insufficient history for 14d trend calculation for {symbol} ({len(history) if history else 0} bars, need {24 * 14})"
+                    )
+                    self._last_warning[symbol] = now
                 return 0.0
 
             # Get price from 14 days ago (approximate by index or searching timestamp)

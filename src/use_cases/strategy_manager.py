@@ -309,7 +309,7 @@ class MultiExchangeStrategyManager:
             self.portfolio.set_position(position)
             if self.risk_manager:
                 self.risk_manager.update_position(position)
-            
+
             await self.sync_engine.update_position(exchange, symbol, position)
 
             if self.storage and not self.dry_run:
@@ -422,7 +422,9 @@ class MultiExchangeStrategyManager:
                     desired_orders[i] = replace(o, price=rounded, exchange=exchange)
 
             # Fetch ALL open orders (confirmed + pending) for risk validation
-            all_open_tracked = await venue.state_tracker.get_open_orders(include_pending=True)
+            all_open_tracked = await venue.state_tracker.get_open_orders(
+                include_pending=True
+            )
             all_open_orders = [t.order for t in all_open_tracked]
 
             valid_orders = []
@@ -479,6 +481,9 @@ class MultiExchangeStrategyManager:
         """
         Reconcile orders for a specific venue with optimized diff algorithm
         """
+        if not self._running:
+            return
+
         start_time = time.perf_counter()
 
         desired_by_side = {OrderSide.BUY: [], OrderSide.SELL: []}
@@ -492,7 +497,10 @@ class MultiExchangeStrategyManager:
         for side in [OrderSide.BUY, OrderSide.SELL]:
             desired_list = desired_by_side.get(side, [])
             active_list = [
-                t.order for t in await venue.state_tracker.get_open_orders(side=side, include_pending=True)
+                t.order
+                for t in await venue.state_tracker.get_open_orders(
+                    side=side, include_pending=True
+                )
             ]
 
             # Use optimized diff algorithm
@@ -779,7 +787,9 @@ class MultiExchangeStrategyManager:
             # Check Risk Before Placing
             # We pass current portfolio position for validation
             current_pos = self.portfolio.get_position(symbol, exchange)
-            if self.risk_manager and not self.risk_manager.validate_order(order, current_pos):
+            if self.risk_manager and not self.risk_manager.validate_order(
+                order, current_pos
+            ):
                 logger.warning(f"Momentum Add REJECTED by Risk Manager: {order}")
                 return
 
