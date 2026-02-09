@@ -65,7 +65,7 @@ class BasicRiskManager(RiskManager):
         projected_total = current_exposure + active_exposure_change + new_impact
 
         max_limit = self._get_limit_for_order(order)
-        
+
         # Add more detailed logging for Thalex
         exchange = getattr(order, "exchange", "")
         if exchange and exchange.lower() == "thalex":
@@ -86,10 +86,13 @@ class BasicRiskManager(RiskManager):
         return True
 
     def update_position(self, position: Position) -> None:
-        self._positions[position.exchange] = position
-        if abs(position.size) > self.venue_limits.get(
-            position.exchange, self.max_position
-        ):
+        # Improve: Key by exchange:symbol to allow multi-symbol tracking per exchange
+        key = f"{position.exchange}:{position.symbol}"
+        self._positions[key] = position
+
+        limit = self.venue_limits.get(position.exchange, self.max_position)
+        if abs(position.size) > limit:
+            logger.warning(f"Risk Breach: {key} size {position.size} > limit {limit}")
             self._breached = True
 
     def _get_limit_for_order(self, order: Order) -> float:
@@ -113,7 +116,10 @@ class BasicRiskManager(RiskManager):
                 if abs(pos.size) > limit:
                     return False
             return True
-        return abs(position.size) <= self.max_position
+
+        # Helper for single position check
+        limit = self.venue_limits.get(position.exchange, self.max_position)
+        return abs(position.size) <= limit
 
     def can_trade(self) -> bool:
         return self.enabled and not self._breached
