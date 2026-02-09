@@ -324,8 +324,16 @@ class CircuitBreaker:
 
 
 class Thalex:
-    def __init__(self, network: Network):
-        self.net: Network = network
+    def __init__(self, network: Union[Network, str]):
+        if isinstance(network, str):
+            # Create a compatibility object that behaves like the Network enum
+            class _CustomNetwork:
+                def __init__(self, val):
+                    self.value = val
+
+            self.net = _CustomNetwork(network)
+        else:
+            self.net: Network = network
         self.ws: websockets.client = None
 
         # Connection management

@@ -86,19 +86,29 @@ class BasicRiskManager(RiskManager):
         return True
 
     def update_position(self, position: Position) -> None:
-        # Improve: Key by exchange:symbol to allow multi-symbol tracking per exchange
         key = f"{position.exchange}:{position.symbol}"
         self._positions[key] = position
 
-        limit = self.venue_limits.get(position.exchange, self.max_position)
+        limit = self._get_limit(position.exchange, position.symbol)
         if abs(position.size) > limit:
             logger.warning(f"Risk Breach: {key} size {position.size} > limit {limit}")
             self._breached = True
 
     def _get_limit_for_order(self, order: Order) -> float:
         exchange = getattr(order, "exchange", "")
-        if exchange and exchange in self.venue_limits:
+        return self._get_limit(exchange, order.symbol)
+
+    def _get_limit(self, exchange: str, symbol: str) -> float:
+        # 1. Try symbol-specific override (e.g., "bybit:BTCUSDT")
+        composite_key = f"{exchange}:{symbol}"
+        if composite_key in self.venue_limits:
+            return self.venue_limits[composite_key]
+        
+        # 2. Try exchange-wide default
+        if exchange in self.venue_limits:
             return self.venue_limits[exchange]
+            
+        # 3. Fallback to global max_position
         return self.max_position
 
     def get_diagnostics(self) -> Dict[str, Any]:
@@ -112,13 +122,13 @@ class BasicRiskManager(RiskManager):
     def check_position_limits(self, position: Union[Position, Portfolio]) -> bool:
         if isinstance(position, Portfolio):
             for pos in position.all_positions():
-                limit = self.venue_limits.get(pos.exchange, self.max_position)
+                limit = self._get_limit(pos.exchange, pos.symbol)
                 if abs(pos.size) > limit:
                     return False
             return True
 
         # Helper for single position check
-        limit = self.venue_limits.get(position.exchange, self.max_position)
+        limit = self._get_limit(position.exchange, position.symbol)
         return abs(position.size) <= limit
 
     def can_trade(self) -> bool:

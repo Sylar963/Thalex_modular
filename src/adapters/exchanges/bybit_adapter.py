@@ -44,13 +44,16 @@ class BybitAdapter(BaseExchangeAdapter):
         api_secret: str,
         testnet: bool = True,
         time_sync_manager: Optional[TimeSyncManager] = None,
+        api_url: Optional[str] = None,
+        ws_public_url: Optional[str] = None,
+        ws_private_url: Optional[str] = None,
     ):
         super().__init__(api_key, api_secret, testnet, time_sync_manager)
-        self.base_url = self.REST_TESTNET_URL if testnet else self.REST_URL
-        self.ws_public_url = (
+        self.base_url = api_url or (self.REST_TESTNET_URL if testnet else self.REST_URL)
+        self.ws_public_url = ws_public_url or (
             self.WS_TESTNET_PUBLIC_URL if testnet else self.WS_PUBLIC_URL
         )
-        self.ws_private_url = (
+        self.ws_private_url = ws_private_url or (
             self.WS_TESTNET_PRIVATE_URL if testnet else self.WS_PRIVATE_URL
         )
 

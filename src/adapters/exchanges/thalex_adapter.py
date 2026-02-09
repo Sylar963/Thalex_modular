@@ -42,6 +42,7 @@ class ThalexAdapter(BaseExchangeAdapter):
         time_sync_manager: Optional[TimeSyncManager] = None,
         me_rate_limit: float = 45.0,
         cancel_rate_limit: float = 900.0,
+        ws_url: Optional[str] = None,
     ):
         super().__init__(api_key, api_secret, testnet, time_sync_manager)
 
@@ -70,7 +71,7 @@ class ThalexAdapter(BaseExchangeAdapter):
             capacity=int(cancel_rate_limit * 1.1), fill_rate=cancel_rate_limit
         )
 
-        network = Network.TEST if testnet else Network.PROD
+        network = ws_url or (Network.TEST if testnet else Network.PROD)
         self.client = Thalex(network)
 
         # Flag to indicate if the adapter is currently reconnecting

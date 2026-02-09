@@ -61,6 +61,13 @@ class ConfigFactory:
             venue_testnet = venue_cfg.get("testnet", True)
             venue_symbols = venue_cfg.get("symbols", [])
             venue_tick_size = venue_cfg.get("tick_size", 0.5)
+            
+            # Custom URLs for flexible environment setup
+            api_url = venue_cfg.get("api_url")
+            ws_url = venue_cfg.get("ws_url")
+            ws_public_url = venue_cfg.get("ws_public_url")
+            ws_private_url = venue_cfg.get("ws_private_url")
+            
             gw = None
 
             try:
@@ -87,6 +94,7 @@ class ConfigFactory:
                             secret,
                             testnet=venue_testnet,
                             time_sync_manager=time_sync_manager,
+                            ws_url=ws_url,
                         )
 
                 elif venue_name == "bybit":
@@ -98,6 +106,9 @@ class ConfigFactory:
                             secret,
                             testnet=venue_testnet,
                             time_sync_manager=time_sync_manager,
+                            api_url=api_url,
+                            ws_public_url=ws_public_url,
+                            ws_private_url=ws_private_url,
                         )
 
                 elif venue_name == "binance":
