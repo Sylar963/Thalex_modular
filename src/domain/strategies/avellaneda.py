@@ -82,7 +82,7 @@ class AvellanedaStoikovStrategy(Strategy):
         self.position_limit = config.get("position_limit", 1.0)
         self.order_size = config.get("order_size", 0.001)
         self.min_spread_ticks = config.get("min_spread", 20)
-        
+
         # Respect tick_size from config if provided
         if "tick_size" in config:
             self.tick_size = float(config["tick_size"])
@@ -116,7 +116,6 @@ class AvellanedaStoikovStrategy(Strategy):
         if not market_state.ticker or market_state.ticker.mid_price <= 0:
             return []
 
-
         ticker = market_state.ticker
         mid_price = ticker.mid_price
         timestamp = market_state.timestamp or time.time()
@@ -130,12 +129,14 @@ class AvellanedaStoikovStrategy(Strategy):
         # Apply venue-specific adjustments
         venue_gamma_multiplier = 1.0
         venue_volatility_multiplier = 1.0
-        
+
         if exchange:
             if exchange.lower() == "thalex":
                 # Thalex-specific adjustments for better performance
                 venue_gamma_multiplier = 0.8  # Slightly more aggressive spreads
-                venue_volatility_multiplier = 1.1  # Adjust for Thalex's volatility characteristics
+                venue_volatility_multiplier = (
+                    1.1  # Adjust for Thalex's volatility characteristics
+                )
             elif exchange.lower() == "bybit":
                 venue_gamma_multiplier = 1.0
                 venue_volatility_multiplier = 1.0
@@ -222,11 +223,11 @@ class AvellanedaStoikovStrategy(Strategy):
 
         # Market Impact (Placeholder from signals)
         impact_signal = market_state.signals.get("market_impact", 0.0)
-        market_impact_comp = (
-            impact_signal * 0.5 * (1 + self.volatility)
-        )  # Simplified from legacy
+        market_impact_comp = impact_signal * 0.5 * (1 + self.volatility)
 
-        # Total Optimal Spread
+        toxicity_score = market_state.signals.get("toxicity_score", 0.0)
+        toxicity_spread_mult = 1.0 + (toxicity_score * 0.5)
+
         optimal_spread = (
             base_spread * gamma_component
             + volatility_component
@@ -234,8 +235,7 @@ class AvellanedaStoikovStrategy(Strategy):
             + inventory_component
         )
 
-        # Ensure at least fee coverage
-        final_spread = max(optimal_spread, fee_coverage_spread)
+        final_spread = max(optimal_spread, fee_coverage_spread) * toxicity_spread_mult
 
         # --- 2. Reservation Price / Skew Calculation ---
 

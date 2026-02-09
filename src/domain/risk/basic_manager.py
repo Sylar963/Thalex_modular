@@ -49,12 +49,12 @@ class BasicRiskManager(RiskManager):
         active_exposure_change = 0.0
         if active_orders:
             for o in active_orders:
+                if o.id == order.id:
+                    continue
                 if o.side == "buy" or o.side == OrderSide.BUY:
-                    if order.side == "buy" or order.side == OrderSide.BUY:
-                        active_exposure_change += o.size
+                    active_exposure_change += o.size
                 else:
-                    if order.side == "sell" or order.side == OrderSide.SELL:
-                        active_exposure_change -= o.size
+                    active_exposure_change -= o.size
 
         new_impact = (
             order.size
@@ -111,11 +111,11 @@ class BasicRiskManager(RiskManager):
         composite_key = f"{exchange}:{symbol}"
         if composite_key in self.venue_limits:
             return self.venue_limits[composite_key]
-        
+
         # 2. Try exchange-wide default
         if exchange in self.venue_limits:
             return self.venue_limits[exchange]
-            
+
         # 3. Fallback to global max_position
         return self.max_position
 

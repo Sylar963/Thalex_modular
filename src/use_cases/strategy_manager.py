@@ -70,6 +70,7 @@ class MultiExchangeStrategyManager:
         sync_engine: SyncEngine,
         signal_engine: Optional[SignalEngine] = None,
         or_engine: Optional[SignalEngine] = None,
+        canary_sensor: Optional[SignalEngine] = None,
         storage: Optional[StorageGateway] = None,
         safety_components: Optional[List[SafetyComponent]] = None,
         dry_run: bool = False,
@@ -83,6 +84,7 @@ class MultiExchangeStrategyManager:
         self.signal_engine = signal_engine
         self.sync_engine = sync_engine
         self.or_engine = or_engine
+        self.canary_sensor = canary_sensor
         self.storage = storage
         self.safety_components = safety_components or []
         self.dry_run = dry_run
@@ -220,7 +222,6 @@ class MultiExchangeStrategyManager:
 
             if self.or_engine:
                 self.or_engine.update(ticker)
-                # Persist Open Range signals on session end OR breakout
                 if (
                     hasattr(self.or_engine, "is_session_just_completed")
                     and self.or_engine.is_session_just_completed()
@@ -232,6 +233,10 @@ class MultiExchangeStrategyManager:
                                 ticker.symbol, "open_range", or_signals
                             )
                         )
+
+            if self.canary_sensor:
+                self.canary_sensor.update(ticker)
+                venue.market_state.signals.update(self.canary_sensor.get_signals())
 
             await self.sync_engine.update_ticker(exchange, ticker.symbol, ticker)
 
@@ -279,7 +284,6 @@ class MultiExchangeStrategyManager:
 
             if self.signal_engine:
                 self.signal_engine.update_trade(trade)
-                # Persist VAMP signals on candle completion
                 if hasattr(self.signal_engine, "pop_completed_candle"):
                     completed = self.signal_engine.pop_completed_candle()
                     if completed and self.storage and not self.dry_run:
@@ -287,6 +291,9 @@ class MultiExchangeStrategyManager:
                         asyncio.create_task(
                             self.storage.save_signal(trade.symbol, "vamp", signals)
                         )
+
+            if self.canary_sensor:
+                self.canary_sensor.update_trade(trade)
 
             logger.debug(
                 f"[{exchange}] Trade: {trade.side.value} {trade.size} @ {trade.price}"

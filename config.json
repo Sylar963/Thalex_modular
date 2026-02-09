@@ -2,7 +2,8 @@
     "primary_instrument": "BTC-PERPETUAL",
     "venues": {
         "thalex": {
-            "enabled": true,
+            "enabled": false
+            ,
             "symbols": ["BTC-PERPETUAL"],
             "testnet": false,
             "ws_url": null,
@@ -17,7 +18,7 @@
             }
         },
         "bybit": {
-            "enabled": false,
+            "enabled": true,
             "symbols": ["HYPEUSDT"],
             "testnet": false,
             "api_url": null,

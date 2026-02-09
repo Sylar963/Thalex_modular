@@ -216,3 +216,19 @@ class ConfigFactory:
                 prefetchers["bybit"] = BybitHistoryPrefetcher(db_adapter)
                 logger.info("History prefetcher created for Bybit.")
         return prefetchers
+
+    @staticmethod
+    def create_canary_sensor(bot_config: dict):
+        from src.domain.sensors.canary_sensor import CanarySensor
+
+        sensors_config = bot_config.get("sensors", {})
+        canary_config = sensors_config.get("canary", {})
+
+        if not canary_config.get("enabled", True):
+            logger.info("Canary sensor disabled by config.")
+            return None
+
+        window_ms = canary_config.get("window_ms", 5000)
+        sensor = CanarySensor(window_ms=window_ms)
+        logger.info(f"Canary sensor enabled (window={window_ms}ms).")
+        return sensor
