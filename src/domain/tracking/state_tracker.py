@@ -439,23 +439,13 @@ class StateTracker:
     def get_position(self, symbol: str) -> Position:
         return self.positions.get(symbol, Position(symbol, 0.0, 0.0))
 
-    def get_open_orders(self, side: Optional[OrderSide] = None) -> List[TrackedOrder]:
+    async def get_open_orders(self, side: Optional[OrderSide] = None) -> List[TrackedOrder]:
         """
         Get open orders with optimized locking
         """
         start_time = time.perf_counter()
 
-        async def _get_open_orders():
-            async with self._lock:
-                result = list(self.confirmed_orders.values())
-                if side:
-                    result = [t for t in result if t.order.side == side]
-                return result
-
-        # In a real implementation, we'd use the async function
-        # For now, we'll return an empty list to avoid the async issue
-        result = []
-        with self._lock:  # Use context manager for sync access
+        async with self._lock:
             result = list(self.confirmed_orders.values())
             if side:
                 result = [t for t in result if t.order.side == side]

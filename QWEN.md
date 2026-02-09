@@ -149,3 +149,63 @@ The system uses a `config.json` file for configuration with sections for:
 - Always test in shadow mode before deploying live strategies.
 - Monitor account balances and margin requirements to avoid order rejections.
 - Use screen sessions for production deployments to maintain persistent connections.
+
+## Performance Optimization Tips Learned
+
+### 1. Clean Architecture Compliance
+- Never create duplicate "optimized" files that violate Clean Architecture principles
+- Instead of duplicating functionality, improve existing implementations in place
+- Maintain clear separation of concerns while optimizing performance
+
+### 2. Reducing Lock Contention
+- Replace global locks with per-venue or per-component locks where possible
+- Use async locks appropriately but minimize their scope
+- Consider lock-free algorithms for high-frequency operations
+
+### 3. Optimizing Order Reconciliation
+- Use efficient diff algorithms with O(1) lookups via hashmaps/dictionaries
+- Normalize prices to tick boundaries for comparison to reduce order churning
+- Process buy and sell sides in parallel when possible
+- Pre-partition data by side for efficiency
+
+### 4. Token Bucket Optimizations
+- Pre-compute values like fill_rate_per_ms to reduce floating-point operations
+- Minimize time() calls by calculating elapsed time in milliseconds
+- Optimize consume methods to reduce allocation overhead
+- Consider lock-free implementations for ultra-low latency scenarios
+
+### 5. Serialization Performance
+- Use faster JSON libraries like orjson when available
+- Implement zero-copy serialization where possible
+- Pre-allocate buffers to reduce garbage collection pressure
+- Optimize message processing loops for efficiency
+
+### 6. State Management Efficiency
+- Use optimized data structures like custom LRU caches
+- Minimize allocations in hot paths
+- Add performance metrics collection to monitor bottlenecks
+- Optimize state update operations for frequency
+
+### 7. Rate Limiting Strategies
+- Implement early-exit mechanisms in rate limiting
+- Use optimized token consumption algorithms
+- Reduce sleep frequency and improve responsiveness
+- Consider burst allowance for better throughput
+
+### 8. Message Processing
+- Optimize WebSocket message handling loops
+- Reduce processing overhead in message handlers
+- Implement efficient message routing
+- Use direct processing instead of queuing when appropriate
+
+### 9. Memory Management
+- Pre-allocate commonly used objects to reduce allocations
+- Use __slots__ for classes to reduce memory footprint
+- Implement efficient caching mechanisms
+- Minimize object creation in hot paths
+
+### 10. Testing and Monitoring
+- Create benchmark tests to measure performance improvements
+- Implement performance metrics collection in production code
+- Monitor lock contention and other bottlenecks
+- Continuously profile and optimize critical paths

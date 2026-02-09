@@ -335,7 +335,7 @@ class QuotingService:
 
     async def _cancel_side(self, side: OrderSide):
         """Emergency cancel for a specific side."""
-        orders_to_cancel = self.state_tracker.get_open_orders(side=side)
+        orders_to_cancel = await self.state_tracker.get_open_orders(side=side)
         if not orders_to_cancel:
             return
 
@@ -391,7 +391,7 @@ class QuotingService:
             # 4. Risk Validation - optimized with early exit
             valid_orders = []
             # Note: We validate against *open* orders in the tracker + current pos
-            active_orders_ref = [t.order for t in self.state_tracker.get_open_orders()]
+            active_orders_ref = [t.order for t in await self.state_tracker.get_open_orders()]
 
             for o in desired_orders:
                 if self.risk_manager.validate_order(
@@ -415,7 +415,7 @@ class QuotingService:
             )
 
             if self._perf_metrics['reconcile_calls'] % 100 == 0:
-                logger.debug(f"Reconciliation performance: avg={self._perf_metrics['avg_reconcile_time']:.3f}ms over {self._perf_metrics['reconcile_calls']} calls')
+                logger.debug(f"Reconciliation performance: avg={self._perf_metrics['avg_reconcile_time']:.3f}ms over {self._perf_metrics['reconcile_calls']} calls")
 
     async def _reconcile_orders(self, desired_orders: List[Order]):
         """
@@ -485,7 +485,7 @@ class QuotingService:
         Returns (to_cancel_ids, to_place_orders) tuple.
         """
         active_list = [
-            t.order for t in self.state_tracker.get_open_orders(side=side)
+            t.order for t in await self.state_tracker.get_open_orders(side=side)
         ]
 
         # Use a more efficient matching algorithm
@@ -516,7 +516,7 @@ class QuotingService:
         return to_cancel_ids, to_place_orders
 
     async def _cancel_all(self):
-        all_active = self.state_tracker.get_open_orders()
+        all_active = await self.state_tracker.get_open_orders()
         if not all_active:
             return
 
@@ -548,7 +548,7 @@ class QuotingService:
         if self.storage and not self.dry_run:
             # Try to resolve order details
             found_order = None
-            known_orders = self.state_tracker.get_open_orders()
+            known_orders = await self.state_tracker.get_open_orders()
 
             for tracker_item in known_orders:
                 if tracker_item.order.exchange_id == exchange_id:

@@ -439,7 +439,7 @@ class MultiExchangeStrategyManager:
         for side in [OrderSide.BUY, OrderSide.SELL]:
             desired_list = desired_by_side.get(side, [])
             active_list = [
-                t.order for t in venue.state_tracker.get_open_orders(side=side)
+                t.order for t in await venue.state_tracker.get_open_orders(side=side)
             ]
 
             # Use optimized diff algorithm
@@ -498,7 +498,7 @@ class MultiExchangeStrategyManager:
         logger.debug(f"_reconcile_orders_venue for {exchange} took {(end_time - start_time) * 1000:.3f}ms")
 
     async def _cancel_all_venue(self, venue: OptimizedVenueContext):
-        all_active = venue.state_tracker.get_open_orders()
+        all_active = await venue.state_tracker.get_open_orders()
         if not all_active:
             return
             
