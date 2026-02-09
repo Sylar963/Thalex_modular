@@ -61,13 +61,13 @@ class ConfigFactory:
             venue_testnet = venue_cfg.get("testnet", True)
             venue_symbols = venue_cfg.get("symbols", [])
             venue_tick_size = venue_cfg.get("tick_size", 0.5)
-            
+
             # Custom URLs for flexible environment setup
             api_url = venue_cfg.get("api_url")
             ws_url = venue_cfg.get("ws_url")
             ws_public_url = venue_cfg.get("ws_public_url")
             ws_private_url = venue_cfg.get("ws_private_url")
-            
+
             gw = None
 
             try:
@@ -199,3 +199,20 @@ class ConfigFactory:
             )
 
         return components
+
+    @staticmethod
+    def create_history_prefetchers(
+        bot_config: dict,
+        db_adapter,
+    ) -> dict:
+        from src.adapters.storage.history_prefetcher import BybitHistoryPrefetcher
+
+        prefetchers = {}
+        venues_config = bot_config.get("venues", {})
+        for venue_name, venue_cfg in venues_config.items():
+            if not venue_cfg.get("enabled", False):
+                continue
+            if venue_name == "bybit":
+                prefetchers["bybit"] = BybitHistoryPrefetcher(db_adapter)
+                logger.info("History prefetcher created for Bybit.")
+        return prefetchers

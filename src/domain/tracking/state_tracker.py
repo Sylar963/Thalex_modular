@@ -442,14 +442,19 @@ class StateTracker:
     def get_position(self, symbol: str) -> Position:
         return self.positions.get(symbol, Position(symbol, 0.0, 0.0))
 
-    async def get_open_orders(self, side: Optional[OrderSide] = None) -> List[TrackedOrder]:
+    async def get_open_orders(
+        self, side: Optional[OrderSide] = None, include_pending: bool = False
+    ) -> List[TrackedOrder]:
         """
-        Get open orders with optimized locking
+        Get open orders with optimized locking, optionally including pending ones.
         """
         start_time = time.perf_counter()
 
         async with self._lock:
             result = list(self.confirmed_orders.values())
+            if include_pending:
+                result.extend(self.pending_orders.values())
+
             if side:
                 result = [t for t in result if t.order.side == side]
 

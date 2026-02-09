@@ -276,3 +276,13 @@ class SafetyComponent(ABC):
     def record_success(self) -> None:
         """Record a success event (e.g., successful cycle)."""
         pass
+
+
+class IHistoryPrefetchService(ABC):
+    @abstractmethod
+    async def prefetch(self, symbol: str) -> int:
+        pass
+
+    @abstractmethod
+    async def close(self) -> None:
+        pass

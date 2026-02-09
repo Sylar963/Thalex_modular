@@ -76,6 +76,14 @@ class BasicRiskManager(RiskManager):
             )
 
         if abs(projected_total) > max_limit:
+            # Check if this order is reducing our exposure (even if it doesn't clear the breach)
+            if abs(projected_total) < abs(current_exposure):
+                logger.info(
+                    f"Risk: Allowing Reducing order even if still in breach. "
+                    f"Proj: {projected_total:.4f}, Curr: {current_exposure:.4f}"
+                )
+                return True
+
             logger.warning(
                 f"Order REJECTED: Projected {projected_total:.4f} exceeds limit {max_limit}. "
                 f"(Curr: {current_exposure} + Active: {active_exposure_change} + New: {new_impact})"

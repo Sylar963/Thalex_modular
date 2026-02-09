@@ -307,6 +307,9 @@ class MultiExchangeStrategyManager:
                 symbol=symbol, size=size, entry_price=entry_price, exchange=exchange
             )
             self.portfolio.set_position(position)
+            if self.risk_manager:
+                self.risk_manager.update_position(position)
+            
             await self.sync_engine.update_position(exchange, symbol, position)
 
             if self.storage and not self.dry_run:
@@ -391,21 +394,12 @@ class MultiExchangeStrategyManager:
         elif exchange_name.lower() == "bybit":
             min_edge = min_edge * 1.0  # Standard responsiveness
 
-        # 3. Handle Momentum Sub-strategy (Adds and Exits)
-        await self._manage_momentum_strategy(venue)
-
-        if (
-            venue.last_mid_price > 0
-            and abs(current_mid - venue.last_mid_price) < min_edge
-        ):
-            # logger.debug(f"Skipping strategy run: Price change {abs(current_mid - venue.last_mid_price)} < {min_edge}")
-            return
-
-        venue.last_mid_price = current_mid
-
         # Use per-venue lock instead of global lock
         async with venue._venue_lock:
             start_time = time.perf_counter()
+
+            # 3. Handle Momentum Sub-strategy (Adds and Exits) - NOW INSIDE LOCK
+            await self._manage_momentum_strategy(venue)
 
             exchange = venue.config.gateway.name
             position = self.portfolio.get_position(venue.config.symbol, exchange)
@@ -427,10 +421,15 @@ class MultiExchangeStrategyManager:
                     rounded = round(o.price / tick_size) * tick_size
                     desired_orders[i] = replace(o, price=rounded, exchange=exchange)
 
+            # Fetch ALL open orders (confirmed + pending) for risk validation
+            all_open_tracked = await venue.state_tracker.get_open_orders(include_pending=True)
+            all_open_orders = [t.order for t in all_open_tracked]
+
             valid_orders = []
             for o in desired_orders:
+                # pass BOTH existing open orders AND newly calculated ones for this batch
                 if self.risk_manager.validate_order(
-                    o, self.portfolio, active_orders=valid_orders
+                    o, self.portfolio, active_orders=all_open_orders + valid_orders
                 ):
                     valid_orders.append(o)
                 else:
@@ -493,7 +492,7 @@ class MultiExchangeStrategyManager:
         for side in [OrderSide.BUY, OrderSide.SELL]:
             desired_list = desired_by_side.get(side, [])
             active_list = [
-                t.order for t in await venue.state_tracker.get_open_orders(side=side)
+                t.order for t in await venue.state_tracker.get_open_orders(side=side, include_pending=True)
             ]
 
             # Use optimized diff algorithm
@@ -776,6 +775,14 @@ class MultiExchangeStrategyManager:
                 type=OrderType.MARKET,
                 exchange=exchange,
             )
+
+            # Check Risk Before Placing
+            # We pass current portfolio position for validation
+            current_pos = self.portfolio.get_position(symbol, exchange)
+            if self.risk_manager and not self.risk_manager.validate_order(order, current_pos):
+                logger.warning(f"Momentum Add REJECTED by Risk Manager: {order}")
+                return
+
             resp = await venue.config.gateway.place_order(order)
             if resp.status != OrderStatus.REJECTED:
                 self._momentum_adds.setdefault(venue_key, []).append(

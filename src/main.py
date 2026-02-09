@@ -281,6 +281,20 @@ async def main():
         if storage:
             await storage.connect()
 
+        if args.multi_venue and storage:
+            prefetchers = ConfigFactory.create_history_prefetchers(bot_config, storage)
+            for cfg in exchange_configs:
+                venue = cfg.gateway.name.lower()
+                if venue in prefetchers:
+                    logger.info(
+                        f"Prefetching 15-day history for {venue}:{cfg.symbol}..."
+                    )
+                    count = await prefetchers[venue].prefetch(cfg.symbol)
+                    logger.info(f"Prefetched {count} bars for {venue}:{cfg.symbol}")
+            for p in prefetchers.values():
+                await p.close()
+            logger.info("History prefetch complete.")
+
         if args.multi_venue:
             await multi_service.start()
         else:
