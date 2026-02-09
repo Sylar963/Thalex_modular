@@ -19,6 +19,7 @@ from ..domain.market.trend_service import HistoricalTrendService
 from ..domain.signals.inventory_bias import InventoryBiasEngine
 from ..domain.tracking.sync_engine import SyncEngine, GlobalState
 from ..domain.tracking.state_tracker import StateTracker
+from ..domain.tracking.position_tracker import PortfolioTracker, Fill
 from ..domain.entities import (
     Ticker,
     Trade,
@@ -108,6 +109,7 @@ class MultiExchangeStrategyManager:
         ] = {}  # venue_key (exchange:symbol) -> list of adds
 
         self.portfolio = Portfolio()
+        self.pnl_tracker = PortfolioTracker()
         self._running = False
         self._tasks: List[asyncio.Task] = []
         # Removed global reconcile lock - now using per-venue locks
@@ -153,6 +155,7 @@ class MultiExchangeStrategyManager:
         gw.set_order_callback(venue.state_tracker.on_order_update)
         gw.set_position_callback(self._make_position_callback(gw.name))
         gw.set_balance_callback(self._handle_balance_update)
+        gw.set_execution_callback(self._make_execution_callback(gw.name))
 
         await gw.connect()
 
@@ -348,6 +351,31 @@ class MultiExchangeStrategyManager:
 
             if self.storage and not self.dry_run:
                 asyncio.create_task(self.storage.save_trade(trade))
+
+        return callback
+
+    def _make_execution_callback(self, exchange: str) -> Callable:
+        async def callback(trade: Trade):
+            trade = replace(trade, exchange=exchange)
+            logger.info(
+                f"[{exchange}] FILL: {trade.side.value} {trade.size} @ {trade.price}"
+            )
+            if self.storage and not self.dry_run:
+                asyncio.create_task(self.storage.save_execution(trade))
+
+            fill = Fill(
+                order_id=trade.order_id,
+                fill_price=trade.price,
+                fill_size=trade.size,
+                fill_time=trade.timestamp,
+                side=trade.side.value,
+            )
+            tracker = self.pnl_tracker.get_tracker(trade.symbol)
+            tracker.update_on_fill(fill)
+            realized = tracker.realized_pnl
+            logger.info(
+                f"[{exchange}] PnL: realized=${realized:.4f}, pos={tracker.current_position}"
+            )
 
         return callback
 

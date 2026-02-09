@@ -70,7 +70,7 @@ class BybitAdapter(BaseExchangeAdapter):
         self._public_loop_task: Optional[asyncio.Task] = None
         self.ws_public: Optional[aiohttp.ClientWebSocketResponse] = None
         self.balance_callback: Optional[Callable] = None
-        
+
         # BBO cache to merge delta updates from tickers and orderbook
         self._bbo_cache: Dict[str, Dict] = {}
 
@@ -266,12 +266,10 @@ class BybitAdapter(BaseExchangeAdapter):
     async def _msg_loop(self):
         while self.connected and self.ws_private:
             try:
-                msg_raw = await asyncio.wait_for(
-                    self.ws_private.receive(), timeout=5.0
-                )
+                msg_raw = await asyncio.wait_for(self.ws_private.receive(), timeout=5.0)
                 if not msg_raw or msg_raw.type != aiohttp.WSMsgType.TEXT:
                     continue
-                
+
                 msg = self._fast_json_decode(msg_raw.data)
                 await self._handle_message(msg)
             except asyncio.TimeoutError:
@@ -287,11 +285,14 @@ class BybitAdapter(BaseExchangeAdapter):
         topic = msg.get("topic")
         # logger.debug(f"WS Msg: {topic}") # Too noisy?
         if topic:
-             pass 
+            pass
 
         if topic == "order":
             for item in msg.get("data", []):
                 await self._handle_order_update(item)
+        elif topic == "execution":
+            for item in msg.get("data", []):
+                await self._handle_execution_update(item)
         elif topic == "position":
             for item in msg.get("data", []):
                 await self._handle_position_update(item)
@@ -322,6 +323,38 @@ class BybitAdapter(BaseExchangeAdapter):
         await self.notify_order_update(
             exchange_id, status, filled_size, avg_price, local_id
         )
+
+    async def _handle_execution_update(self, data: Dict):
+        symbol = data.get("symbol", "")
+        exec_id = data.get("execId", "")
+        order_id = data.get("orderId", "")
+        side = data.get("side", "")
+        exec_price = self._safe_float(data.get("execPrice"))
+        exec_qty = self._safe_float(data.get("execQty"))
+        exec_fee = self._safe_float(data.get("execFee"))
+        exec_time = data.get("execTime")
+
+        if exec_qty > 0:
+            internal_symbol = InstrumentService.get_internal_symbol(symbol, self.name)
+            timestamp = int(exec_time) / 1000.0 if exec_time else time.time()
+
+            trade = Trade(
+                id=exec_id,
+                order_id=order_id,
+                symbol=internal_symbol,
+                side=OrderSide.BUY if side == "Buy" else OrderSide.SELL,
+                price=exec_price,
+                size=exec_qty,
+                exchange=self.name,
+                fee=exec_fee,
+                timestamp=timestamp,
+            )
+            logger.info(
+                f"BYBIT FILL: {internal_symbol} {side} {exec_qty} @ {exec_price} (fee={exec_fee})"
+            )
+
+            if self.execution_callback:
+                asyncio.create_task(self.execution_callback(trade))
 
     async def _handle_position_update(self, data: Dict):
         symbol = data.get("symbol")
@@ -383,13 +416,9 @@ class BybitAdapter(BaseExchangeAdapter):
 
         url = f"{self.base_url}/v5/order/create"
 
-
-        async with self.session.post(
-            url, data=payload_str, headers=headers
-        ) as resp:
+        async with self.session.post(url, data=payload_str, headers=headers) as resp:
             data = await resp.json()
             if data.get("retCode") == 0:
-
                 result = data.get("result", {})
                 exchange_id = result.get("orderId", "")
                 updated = replace(
@@ -415,10 +444,7 @@ class BybitAdapter(BaseExchangeAdapter):
         headers = self._get_headers(payload_str)
 
         url = f"{self.base_url}/v5/order/cancel"
-        async with self.session.post(
-            url, data=payload_str, headers=headers
-        ) as resp:
-
+        async with self.session.post(url, data=payload_str, headers=headers) as resp:
             data = await resp.json()
             ret_code = data.get("retCode")
             if ret_code == 0:
@@ -458,7 +484,6 @@ class BybitAdapter(BaseExchangeAdapter):
         async with self.session.get(url, headers=headers) as resp:
             data = await resp.json()
             if data.get("retCode") == 0:
-
                 result = data.get("result", {})
                 raw_orders = result.get("list", [])
                 orders = []
@@ -502,10 +527,7 @@ class BybitAdapter(BaseExchangeAdapter):
         headers = self._get_headers(payload_str)
 
         url = f"{self.base_url}/v5/order/cancel-all"
-        async with self.session.post(
-            url, data=payload_str, headers=headers
-        ) as resp:
-
+        async with self.session.post(url, data=payload_str, headers=headers) as resp:
             data = await resp.json()
             if data.get("retCode") == 0:
                 logger.info(f"Successfully cancelled all orders on Bybit for {symbol}")
@@ -530,7 +552,7 @@ class BybitAdapter(BaseExchangeAdapter):
         mapped_symbol = InstrumentService.get_exchange_symbol(symbol, self.name)
         url = f"{self.base_url}/v5/market/recent-trade"
         params = {"category": "linear", "symbol": mapped_symbol, "limit": limit}
-        
+
         try:
             async with self.session.get(url, params=params) as resp:
                 data = await resp.json()
@@ -539,16 +561,20 @@ class BybitAdapter(BaseExchangeAdapter):
                     trades = []
                     for item in trades_data:
                         ts_ms = int(item.get("time"))
-                        trades.append(Trade(
-                            id=item.get("execId", ""),
-                            order_id="",
-                            symbol=symbol,
-                            side=OrderSide.BUY if item.get("side") == "Buy" else OrderSide.SELL,
-                            price=float(item.get("price")),
-                            size=float(item.get("size")),
-                            exchange=self.name,
-                            timestamp=ts_ms / 1000.0
-                        ))
+                        trades.append(
+                            Trade(
+                                id=item.get("execId", ""),
+                                order_id="",
+                                symbol=symbol,
+                                side=OrderSide.BUY
+                                if item.get("side") == "Buy"
+                                else OrderSide.SELL,
+                                price=float(item.get("price")),
+                                size=float(item.get("size")),
+                                exchange=self.name,
+                                timestamp=ts_ms / 1000.0,
+                            )
+                        )
                     return trades
                 else:
                     logger.error(f"Bybit get_recent_trades error: {data}")
@@ -561,7 +587,7 @@ class BybitAdapter(BaseExchangeAdapter):
         """Subscribe to ticker, orderbook, and trade updates for a symbol."""
         await self._ensure_public_conn()
         mapped_symbol = InstrumentService.get_exchange_symbol(symbol, self.name)
-        
+
         # Subscribe to:
         # - tickers (for mark/index/last) - PLURAL in V5
         # - orderbook.1 (for fast BBO)
@@ -569,12 +595,14 @@ class BybitAdapter(BaseExchangeAdapter):
         topics = [
             f"tickers.{mapped_symbol}",
             f"orderbook.1.{mapped_symbol}",
-            f"publicTrade.{mapped_symbol}"
+            f"publicTrade.{mapped_symbol}",
         ]
-        
+
         if self.ws_public and not self.ws_public.closed:
             await self.ws_public.send_json({"op": "subscribe", "args": topics})
-            logger.info(f"Subscribed to tickers, orderbook & trades for {symbol}: {topics}")
+            logger.info(
+                f"Subscribed to tickers, orderbook & trades for {symbol}: {topics}"
+            )
 
     async def _ensure_public_conn(self):
         if self.ws_public is None or self.ws_public.closed:
@@ -589,6 +617,7 @@ class BybitAdapter(BaseExchangeAdapter):
     async def _public_msg_loop(self):
         """Unified loop for public topics (Ticker, Trades)."""
         import zlib
+
         while self.connected:
             try:
                 # Reconnect logic
@@ -601,7 +630,7 @@ class BybitAdapter(BaseExchangeAdapter):
                             msg_raw = await asyncio.wait_for(ws.receive(), timeout=10.0)
                             if not msg_raw:
                                 continue
-                            
+
                             if msg_raw.type == aiohttp.WSMsgType.TEXT:
                                 msg = self._fast_json_decode(msg_raw.data)
                             elif msg_raw.type == aiohttp.WSMsgType.BINARY:
@@ -610,19 +639,24 @@ class BybitAdapter(BaseExchangeAdapter):
                                     decompressed = zlib.decompress(msg_raw.data)
                                     msg = self._fast_json_decode(decompressed)
                                 except Exception as e:
-                                    logger.error(f"Failed to decompress/decode binary msg: {e}")
+                                    logger.error(
+                                        f"Failed to decompress/decode binary msg: {e}"
+                                    )
                                     continue
                             elif msg_raw.type == aiohttp.WSMsgType.PING:
                                 await ws.pong()
                                 continue
-                            elif msg_raw.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                            elif msg_raw.type in (
+                                aiohttp.WSMsgType.CLOSED,
+                                aiohttp.WSMsgType.ERROR,
+                            ):
                                 break
                             else:
                                 continue
 
                             if not isinstance(msg, dict):
                                 continue
-                            
+
                             # Debug log for subscription confirmation or data
                             if "success" in msg:
                                 logger.info(f"Public WS Msg Result: {msg}")
@@ -653,22 +687,39 @@ class BybitAdapter(BaseExchangeAdapter):
         # topic format: tickers.BTCUSDT
         raw_symbol = topic.replace("tickers.", "")
         symbol = InstrumentService.get_internal_symbol(raw_symbol, self.name)
-        
+
         # Initialize or fetch cache
-        cache = self._bbo_cache.setdefault(symbol, {
-            "bid": 0.0, "ask": 0.0, "bid_size": 0.0, "ask_size": 0.0,
-            "last": 0.0, "mark": 0.0, "index": 0.0, "vol": 0.0
-        })
+        cache = self._bbo_cache.setdefault(
+            symbol,
+            {
+                "bid": 0.0,
+                "ask": 0.0,
+                "bid_size": 0.0,
+                "ask_size": 0.0,
+                "last": 0.0,
+                "mark": 0.0,
+                "index": 0.0,
+                "vol": 0.0,
+            },
+        )
 
         # Update cache with non-zero/non-None values from ticker
-        if "bid1Price" in data: cache["bid"] = self._safe_float(data["bid1Price"])
-        if "ask1Price" in data: cache["ask"] = self._safe_float(data["ask1Price"])
-        if "bid1Size" in data: cache["bid_size"] = self._safe_float(data["bid1Size"])
-        if "ask1Size" in data: cache["ask_size"] = self._safe_float(data["ask1Size"])
-        if "lastPrice" in data: cache["last"] = self._safe_float(data["lastPrice"])
-        if "markPrice" in data: cache["mark"] = self._safe_float(data["markPrice"])
-        if "indexPrice" in data: cache["index"] = self._safe_float(data["indexPrice"])
-        if "volume24h" in data: cache["vol"] = self._safe_float(data["volume24h"])
+        if "bid1Price" in data:
+            cache["bid"] = self._safe_float(data["bid1Price"])
+        if "ask1Price" in data:
+            cache["ask"] = self._safe_float(data["ask1Price"])
+        if "bid1Size" in data:
+            cache["bid_size"] = self._safe_float(data["bid1Size"])
+        if "ask1Size" in data:
+            cache["ask_size"] = self._safe_float(data["ask1Size"])
+        if "lastPrice" in data:
+            cache["last"] = self._safe_float(data["lastPrice"])
+        if "markPrice" in data:
+            cache["mark"] = self._safe_float(data["markPrice"])
+        if "indexPrice" in data:
+            cache["index"] = self._safe_float(data["indexPrice"])
+        if "volume24h" in data:
+            cache["vol"] = self._safe_float(data["volume24h"])
 
         # Update position mark price if exists
         if symbol in self.positions:
@@ -677,7 +728,6 @@ class BybitAdapter(BaseExchangeAdapter):
         # Only emit if we have a valid mid price
         if cache["bid"] > 0 and cache["ask"] > 0:
             ticker = Ticker(
-
                 symbol=symbol,
                 bid=cache["bid"],
                 ask=cache["ask"],
@@ -696,7 +746,7 @@ class BybitAdapter(BaseExchangeAdapter):
     async def _handle_orderbook_msg(self, msg: Dict):
         raw_symbol = msg.get("topic", "").split(".")[-1]  # orderbook.1.BTCUSDT
         symbol = InstrumentService.get_internal_symbol(raw_symbol, self.name)
-        
+
         data = msg.get("data", {})
         bids = data.get("b", [])
         asks = data.get("a", [])
@@ -705,10 +755,19 @@ class BybitAdapter(BaseExchangeAdapter):
         best_bid = bids[0] if bids else None
         best_ask = asks[0] if asks else None
 
-        cache = self._bbo_cache.setdefault(symbol, {
-            "bid": 0.0, "ask": 0.0, "bid_size": 0.0, "ask_size": 0.0,
-            "last": 0.0, "mark": 0.0, "index": 0.0, "vol": 0.0
-        })
+        cache = self._bbo_cache.setdefault(
+            symbol,
+            {
+                "bid": 0.0,
+                "ask": 0.0,
+                "bid_size": 0.0,
+                "ask_size": 0.0,
+                "last": 0.0,
+                "mark": 0.0,
+                "index": 0.0,
+                "vol": 0.0,
+            },
+        )
 
         if best_bid:
             cache["bid"] = self._safe_float(best_bid[0])
@@ -720,7 +779,6 @@ class BybitAdapter(BaseExchangeAdapter):
         # Only emit if we have a valid mid price
         if cache["bid"] > 0 and cache["ask"] > 0:
             ticker = Ticker(
-
                 symbol=symbol,
                 bid=cache["bid"],
                 ask=cache["ask"],
@@ -735,7 +793,6 @@ class BybitAdapter(BaseExchangeAdapter):
             )
             if self.ticker_callback:
                 await self.ticker_callback(ticker)
-
 
     async def _handle_public_trade_msg(self, msg: Dict):
         # topic: publicTrade.BTCUSDT

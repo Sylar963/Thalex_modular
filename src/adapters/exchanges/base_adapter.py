@@ -17,7 +17,14 @@ class TokenBucket:
     Uses atomic operations and reduced floating-point math for better performance.
     """
 
-    __slots__ = ('capacity', '_tokens', 'fill_rate', 'last_update', '_capacity_int', '_fill_rate_per_ms')
+    __slots__ = (
+        "capacity",
+        "_tokens",
+        "fill_rate",
+        "last_update",
+        "_capacity_int",
+        "_fill_rate_per_ms",
+    )
 
     def __init__(self, capacity: int, fill_rate: float):
         self.capacity = float(capacity)
@@ -97,6 +104,7 @@ class BaseExchangeAdapter(ExchangeGateway):
         self.order_callback: Optional[Callable] = None
         self.position_callback: Optional[Callable] = None
         self.balance_callback: Optional[Callable] = None
+        self.execution_callback: Optional[Callable] = None  # For bot fills
 
     def _get_timestamp(self) -> int:
         """Standardized method to get exchange-aligned timestamp in milliseconds."""
@@ -123,6 +131,9 @@ class BaseExchangeAdapter(ExchangeGateway):
 
     def set_balance_callback(self, callback: Callable):
         self.balance_callback = callback
+
+    def set_execution_callback(self, callback: Callable):
+        self.execution_callback = callback
 
     async def notify_order_update(
         self,
