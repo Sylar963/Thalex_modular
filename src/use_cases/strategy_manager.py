@@ -398,6 +398,7 @@ class MultiExchangeStrategyManager:
             venue.last_mid_price > 0
             and abs(current_mid - venue.last_mid_price) < min_edge
         ):
+            # logger.debug(f"Skipping strategy run: Price change {abs(current_mid - venue.last_mid_price)} < {min_edge}")
             return
 
         venue.last_mid_price = current_mid
