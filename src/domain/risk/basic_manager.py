@@ -101,6 +101,17 @@ class BasicRiskManager(RiskManager):
         if abs(position.size) > limit:
             logger.warning(f"Risk Breach: {key} size {position.size} > limit {limit}")
             self._breached = True
+        else:
+            if self._breached:
+                all_within_limits = all(
+                    abs(p.size) <= self._get_limit(p.exchange, p.symbol)
+                    for p in self._positions.values()
+                )
+                if all_within_limits:
+                    logger.info(
+                        f"All positions back within limits. Clearing breach flag for {key}."
+                    )
+                    self._breached = False
 
     def _get_limit_for_order(self, order: Order) -> float:
         exchange = getattr(order, "exchange", "")

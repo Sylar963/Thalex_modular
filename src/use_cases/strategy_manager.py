@@ -52,13 +52,18 @@ class OptimizedVenueContext:
         self.state_tracker = StateTracker()
         self.market_state = MarketState()
         self.last_mid_price = 0.0
-        self._venue_lock = asyncio.Lock()  # Per-venue lock instead of global
+        self._venue_lock = asyncio.Lock()
         self._last_strategy_run = 0.0
         self._perf_metrics = {
             "strategy_runs": 0,
             "avg_run_time": 0.0,
             "total_run_time": 0.0,
         }
+        self._consecutive_failures = 0
+        self._failure_backoff_until = 0.0
+        self._reducing_order_id: Optional[str] = None
+        self._reducing_order_timestamp = 0.0
+        self._first_ticker_logged = False
 
 
 class MultiExchangeStrategyManager:
@@ -388,7 +393,33 @@ class MultiExchangeStrategyManager:
                 f"Venue {venue.config.gateway.name} healthy - Ticker: {venue.market_state.ticker}"
             )
 
-        # 2. Check for Risk Breach - this still needs global state but can be optimized
+        # 2. Synchronize Position Before Risk Check (CRITICAL for accurate state)
+        # Fetch fresh position data from exchange to prevent stale state during rapid fills
+        try:
+            gw = venue.config.gateway
+            symbol = venue.config.symbol
+            fresh_position = await gw.get_position(symbol)
+
+            await venue.state_tracker.update_position(
+                symbol, fresh_position.size, fresh_position.entry_price
+            )
+
+            pos = Position(
+                symbol=symbol,
+                size=fresh_position.size,
+                entry_price=fresh_position.entry_price,
+                exchange=gw.name,
+            )
+            self.portfolio.set_position(pos)
+            if self.risk_manager:
+                self.risk_manager.update_position(pos)
+
+        except Exception as e:
+            logger.warning(
+                f"Failed to sync position for {venue.config.gateway.name}: {e}"
+            )
+
+        # 3. Check for Risk Breach
         if self.risk_manager.has_breached():
             logger.critical("RISK BREACH DETECTED - ENTERING SMART REDUCING MODE")
             await self._run_smart_reducing_mode(venue)
@@ -578,19 +609,40 @@ class MultiExchangeStrategyManager:
                 )
 
         if to_place_orders:
+            now = time.time()
+            if now < venue._failure_backoff_until:
+                remaining = venue._failure_backoff_until - now
+                logger.warning(
+                    f"[{exchange}] Skipping order placement due to circuit breaker. "
+                    f"Backoff ends in {remaining:.1f}s (consecutive failures: {venue._consecutive_failures})"
+                )
+                return
+
             try:
                 new_orders = await gw.place_orders_batch(to_place_orders)
                 for o in new_orders:
                     if o.status == OrderStatus.OPEN and o.exchange_id:
                         await venue.state_tracker.submit_order(o)
                         await venue.state_tracker.on_order_ack(o.id, o.exchange_id)
+
+                venue._consecutive_failures = 0
+                venue._failure_backoff_until = 0.0
+
             except ConnectionError as e:
+                venue._consecutive_failures += 1
+                backoff_duration = min(2 ** (venue._consecutive_failures - 1), 16)
+                venue._failure_backoff_until = now + backoff_duration
                 logger.warning(
-                    f"Connection error during place_orders_batch for {exchange}: {e}"
+                    f"Connection error during place_orders_batch for {exchange}: {e}. "
+                    f"Circuit breaker activated. Backoff: {backoff_duration}s (failure #{venue._consecutive_failures})"
                 )
             except Exception as e:
+                venue._consecutive_failures += 1
+                backoff_duration = min(2 ** (venue._consecutive_failures - 1), 16)
+                venue._failure_backoff_until = now + backoff_duration
                 logger.error(
-                    f"Unexpected error during place_orders_batch for {exchange}: {e}"
+                    f"Unexpected error during place_orders_batch for {exchange}: {e}. "
+                    f"Circuit breaker activated. Backoff: {backoff_duration}s (failure #{venue._consecutive_failures})"
                 )
 
         end_time = time.perf_counter()
@@ -659,17 +711,42 @@ class MultiExchangeStrategyManager:
         }
 
     async def _run_smart_reducing_mode(self, venue: OptimizedVenueContext):
-        """
-        Intelligently liquidates or manages positions during a risk breach.
-        """
-        # Use per-venue lock instead of global lock
         async with venue._venue_lock:
             exchange = venue.config.gateway.name
             symbol = venue.config.symbol
             position = self.portfolio.get_position(symbol, exchange)
 
             if abs(position.size) < 1e-9:
-                return  # No position to reduce
+                venue._reducing_order_id = None
+                venue._reducing_order_timestamp = 0.0
+                return
+
+            now = time.time()
+
+            if venue._reducing_order_id:
+                all_open = await venue.state_tracker.get_open_orders(
+                    include_pending=True
+                )
+                order_still_active = any(
+                    t.order.id == venue._reducing_order_id for t in all_open
+                )
+
+                if order_still_active:
+                    time_since_placed = now - venue._reducing_order_timestamp
+                    if time_since_placed < 30:
+                        logger.debug(
+                            f"Reducing order {venue._reducing_order_id} still active "
+                            f"({time_since_placed:.1f}s ago). Skipping duplicate placement."
+                        )
+                        return
+                    else:
+                        logger.warning(
+                            f"Reducing order {venue._reducing_order_id} stale "
+                            f"(placed {time_since_placed:.1f}s ago). Replacing..."
+                        )
+                        venue._reducing_order_id = None
+                else:
+                    venue._reducing_order_id = None
 
             trend_val = self._venue_trends.get(symbol, 0.0)
             trend_side = (
@@ -684,21 +761,21 @@ class MultiExchangeStrategyManager:
             elif position.size < 0 and trend_side == "UP":
                 is_counter_trend = True
 
-            # Calculate Exit Quote
             ticker = venue.market_state.ticker
             if not ticker:
                 return
 
             desired_orders = []
+            order_id = f"{'exit' if is_counter_trend else 'tp'}_{int(now)}"
+
             if is_counter_trend:
-                # AGGRESSIVE EXIT: Counter-trend trades are dangerous
                 logger.warning(
                     f"Counter-trend position detected in breach ({trend_side}). Exiting aggressively."
                 )
                 price = ticker.bid if position.size > 0 else ticker.ask
                 desired_orders.append(
                     Order(
-                        id=f"exit_{int(time.time())}",
+                        id=order_id,
                         symbol=symbol,
                         side=OrderSide.SELL if position.size > 0 else OrderSide.BUY,
                         price=price,
@@ -708,20 +785,17 @@ class MultiExchangeStrategyManager:
                     )
                 )
             else:
-                # DEFENSIVE EXIT: Trend-following trades get a chance to break-even
                 logger.info(
                     f"Trend-following position in breach ({trend_side}). Setting break-even TP."
                 )
-                fee_bps = 5  # 0.05% approx
+                fee_bps = 5
                 break_even = position.entry_price * (
                     1 + (fee_bps / 10000 if position.size > 0 else -fee_bps / 10000)
                 )
 
-                # Ensure break_even is not worse than current market significantly?
-                # For now, just use it.
                 desired_orders.append(
                     Order(
-                        id=f"tp_{int(time.time())}",
+                        id=order_id,
                         symbol=symbol,
                         side=OrderSide.SELL if position.size > 0 else OrderSide.BUY,
                         price=break_even,
@@ -730,6 +804,9 @@ class MultiExchangeStrategyManager:
                         exchange=exchange,
                     )
                 )
+
+            venue._reducing_order_id = order_id
+            venue._reducing_order_timestamp = now
 
             await self._reconcile_orders_venue(venue, desired_orders)
 
