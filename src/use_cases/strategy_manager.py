@@ -30,6 +30,20 @@ from ..domain.entities import (
     Portfolio,
     MarketState,
 )
+from ..domain.strategies.orb_breakout import ORBBreakoutStrategy, TradeSignal
+from ..domain.strategies.orb_trade_manager import (
+    ORBTradeManager,
+    TradeState,
+    ActionType,
+)
+
+
+from ..domain.strategies.orb_breakout import ORBBreakoutStrategy, TradeSignal
+from ..domain.strategies.orb_trade_manager import (
+    ORBTradeManager,
+    TradeState,
+    ActionType,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +96,7 @@ class MultiExchangeStrategyManager:
         regime_analyzer: Optional[RegimeAnalyzer] = None,
         safety_components: Optional[List[SafetyComponent]] = None,
         dry_run: bool = False,
+        orb_config: Optional[Dict] = None,
     ):
         self.venues: Dict[str, OptimizedVenueContext] = {}
         for cfg in exchanges:
@@ -117,6 +132,39 @@ class MultiExchangeStrategyManager:
         self.min_edge_threshold = 0.5
 
         self.sync_engine.on_state_change = self._on_global_state_change
+
+        # ORB Strategy Initialization
+        self.orb_strategy: Optional[ORBBreakoutStrategy] = None
+        self.orb_managers: Dict[str, ORBTradeManager] = {}
+
+        if orb_config:
+            strategy_params = orb_config.get("params", {})
+            self.orb_strategy = ORBBreakoutStrategy(
+                risk_pct=strategy_params.get("risk_pct_per_trade", 17.0),
+                leverage=strategy_params.get("leverage", 10),
+                max_concurrent=strategy_params.get("max_concurrent_positions", 5),
+            )
+            logger.info("ORB Strategy Enabled")
+
+            # Initialize per-symbol managers
+            for venue in self.venues.values():
+                if not venue.config.enabled:
+                    continue
+
+                mgr = ORBTradeManager(
+                    symbol=venue.config.symbol,
+                    momentum_check_seconds=strategy_params.get(
+                        "momentum_check_seconds", 30.0
+                    ),
+                    shave_pct=strategy_params.get("shave_pct", 0.90),
+                    max_retries=strategy_params.get("max_retries", 2),
+                    subsequent_target_pct=orb_config.get("signals", {}).get(
+                        "subsequent_target_pct_of_range", 50
+                    )
+                    / 100.0,
+                )
+                self.orb_managers[venue.config.symbol] = mgr
+                logger.info(f"Initialized ORB Manager for {venue.config.symbol}")
 
     async def start(self):
         logger.info("Starting MultiExchangeStrategyManager...")
@@ -335,6 +383,12 @@ class MultiExchangeStrategyManager:
                     # Let's simple record success if check passes for now.
                     component.record_success()
 
+            # ORB Manager Update
+            if self.orb_managers:
+                mgr = self.orb_managers.get(ticker.symbol)
+                if mgr:
+                    mgr.on_tick(ticker.mid_price, ticker.timestamp)
+
             if is_healthy:
                 # Fix for Deadlock: Decouple strategy run from WebSocket loop
                 # If we await here, the WS loop blocks, preventing RPC responses (Order Acks) from being processed.
@@ -446,6 +500,11 @@ class MultiExchangeStrategyManager:
             logger.debug(
                 f"Skipping strategy cycle for {venue.config.gateway.name}: Not ready"
             )
+            return
+
+        # ORB Strategy Execution
+        if self.orb_strategy and venue.config.strategy is None:
+            await self._manage_orb_strategy(venue)
             return
 
         # 1. Update Long-Term Trend
@@ -1028,3 +1087,97 @@ class MultiExchangeStrategyManager:
 
         if hasattr(self.storage, "save_bot_status"):
             await self.storage.save_bot_status(status)
+
+    async def _manage_orb_strategy(self, venue: OptimizedVenueContext):
+        if not self.orb_strategy or not self.or_engine:
+            return
+
+        symbol = venue.config.symbol
+        mgr = self.orb_managers.get(symbol)
+        if not mgr:
+            return
+
+        # 1. Update ORB Evaluator with latest OR signals
+        or_signals = self.or_engine.get_signals(symbol)
+        current_price = venue.market_state.ticker.mid_price
+
+        # Get Equity for sizing
+        equity = (
+            self.portfolio.total_equity if self.portfolio.total_equity > 0 else 234.0
+        )  # Fallback
+
+        trade_signal = self.orb_strategy.evaluate(
+            symbol=symbol,
+            or_signals=or_signals,
+            current_price=current_price,
+            timestamp=time.time(),
+            equity=equity,
+        )
+
+        if trade_signal:
+            mgr.on_signal(trade_signal)
+            if trade_signal.direction:
+                self.orb_strategy.on_trade_opened()
+
+        # 2. Execute Pending Actions from Manager
+        actions = mgr.get_pending_actions()
+        for action in actions:
+            await self._execute_orb_action(venue, action)
+
+    async def _execute_orb_action(self, venue: OptimizedVenueContext, action):
+        logger.info(
+            f"ORB ACTION: {action.action} {action.symbol} {action.direction} {action.size:.4f} ({action.reason})"
+        )
+
+        side = OrderSide.BUY if action.direction == "long" else OrderSide.SELL
+
+        # Market Order
+        order = Order(
+            id=f"orb_{action.action}_{int(time.time() * 1000)}",
+            symbol=action.symbol,
+            side=side,
+            price=0.0,
+            size=action.size,
+            type=OrderType.MARKET,
+            exchange=venue.config.gateway.name,
+        )
+
+        # Risk Check (skip for exits/shaves to ensure we can get out)
+        if action.action in (ActionType.ENTER, ActionType.ADD):
+            # Validate with Risk Manager if needed, though ORB handles its own sizing
+            pass
+
+        if not self.dry_run:
+            try:
+                resp = await venue.config.gateway.place_order(order)
+                if resp.status == OrderStatus.REJECTED:
+                    logger.warning(f"ORB Order REJECTED: {resp.error_message}")
+                    return
+
+                # If EXIT, notify strategy to decrement count
+                if action.action == ActionType.EXIT:
+                    self.orb_strategy.on_trade_closed()
+
+                # Update Manager state on fill
+                # We assume immediate fill for now or hook into execution callback
+                mgr = self.orb_managers.get(action.symbol)
+                if mgr and action.action == ActionType.ENTER:
+                    # For real trading, we rely on the websocket fill callback to trigger on_entry_fill
+                    # BUT if we want immediate state transition for momentum check start:
+                    # We might want to optimistic fill or wait.
+                    # Given the FSM design, on_entry_fill transitions to MOMENTUM_CHECK.
+                    # We should let the fill callback handle it.
+                    pass
+            except Exception as e:
+                logger.error(f"Failed to execute ORB order: {e}")
+        else:
+            # Shadow mode simulation
+            # Manually trigger fill for manager
+            if action.action == ActionType.ENTER:
+                mgr = self.orb_managers.get(action.symbol)
+                if mgr:
+                    mgr.on_entry_fill(
+                        venue.market_state.ticker.mid_price, action.size, time.time()
+                    )
+            elif action.action == ActionType.EXIT:
+                self.orb_strategy.on_trade_closed()

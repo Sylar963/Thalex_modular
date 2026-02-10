@@ -77,8 +77,10 @@ class OpenRangeSignalEngine(SignalEngine):
         timezone: str = "UTC",
         use_bias: bool = False,
         validation_threshold: float = 0.20,
+        symbol_configs: Optional[Dict[str, Dict]] = None,
     ):
         self.validation_threshold = validation_threshold
+        self.symbol_configs = symbol_configs or {}
         self._config = {
             "session_start_hour": int(session_start_utc.split(":")[0]),
             "session_start_minute": int(session_start_utc.split(":")[1])
@@ -104,7 +106,22 @@ class OpenRangeSignalEngine(SignalEngine):
 
     def _get_state(self, symbol: str) -> OpenRangeState:
         if symbol not in self.states:
-            self.states[symbol] = OpenRangeState(**self._config)
+            config = self._config.copy()
+
+            # Apply per-symbol overrides
+            if symbol in self.symbol_configs:
+                sym_cfg = self.symbol_configs[symbol]
+                if "target_pct_from_mid" in sym_cfg:
+                    config["target_pct_from_mid"] = (
+                        sym_cfg["target_pct_from_mid"] / 100.0
+                    )
+                if "subsequent_target_pct_of_range" in sym_cfg:
+                    config["subsequent_target_pct_of_range"] = (
+                        sym_cfg["subsequent_target_pct_of_range"] / 100.0
+                    )
+                # Session times could be overridden here too if needed
+
+            self.states[symbol] = OpenRangeState(**config)
         return self.states[symbol]
 
     def _is_in_session(self, ts: float, state: OpenRangeState) -> bool:
