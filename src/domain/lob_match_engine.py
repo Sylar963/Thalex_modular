@@ -20,6 +20,21 @@ class SimOrder:
 
 
 class LOBMatchEngine:
+    __slots__ = (
+        "latency_ms",
+        "maker_fee",
+        "taker_fee",
+        "slippage_ticks",
+        "tick_size",
+        "bid_book",
+        "ask_book",
+        "balance",
+        "position_size",
+        "position_entry_price",
+        "fills",
+        "fill_callback",
+    )
+
     def __init__(
         self,
         latency_ms: float = 50.0,
@@ -81,6 +96,21 @@ class LOBMatchEngine:
             self.ask_book.append(sim_order)
             self.ask_book.sort(key=lambda x: x.order.price)
 
+    def cancel_order(self, order_id: str) -> bool:
+        for book in [self.bid_book, self.ask_book]:
+            for i, sim_order in enumerate(book):
+                if (
+                    sim_order.order.id == order_id
+                    or sim_order.order.exchange_id == order_id
+                ):
+                    book.pop(i)
+                    return True
+        return False
+
+    def cancel_all(self):
+        self.bid_book.clear()
+        self.ask_book.clear()
+
     def _execute_fill(
         self, sim_order: SimOrder, price: float, size: float, ts: float, is_maker: bool
     ):
@@ -123,6 +153,18 @@ class LOBMatchEngine:
         )
         self.fills.append(fill)
 
+        if self.fill_callback:
+            asyncio.create_task(self._notify_fill(fill))
+
+        logger.info(
+            f"SIM FILL: {side.value if hasattr(side, 'value') else side} {size:.4f} @ {price:.2f} | "
+            f"PNL: {realized_pnl:.4f} | Balance: {self.balance:.4f} | Pos: {self.position_size:.4f}"
+        )
+
+    async def _notify_fill(self, fill: FillEffect):
+        if self.fill_callback:
+            await self.fill_callback(fill)
+
     def get_equity(self, current_price: float) -> float:
         unrealized = (
             (current_price - self.position_entry_price) * self.position_size
@@ -130,3 +172,21 @@ class LOBMatchEngine:
             else 0.0
         )
         return self.balance + unrealized
+
+    def get_state(self) -> Dict:
+        return {
+            "balance": self.balance,
+            "position_size": self.position_size,
+            "position_entry_price": self.position_entry_price,
+            "open_bids": len(self.bid_book),
+            "open_asks": len(self.ask_book),
+            "total_fills": len(self.fills),
+        }
+
+    def get_open_orders(self) -> List[Order]:
+        orders = []
+        for sim_order in self.bid_book:
+            orders.append(sim_order.order)
+        for sim_order in self.ask_book:
+            orders.append(sim_order.order)
+        return orders

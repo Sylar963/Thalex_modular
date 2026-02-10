@@ -32,6 +32,7 @@ class ConfigFactory:
         bot_config: dict,
         force_monitor_mode: bool = False,
         time_sync_manager: Optional[TimeSyncManager] = None,
+        dry_run: bool = False,
     ) -> List[ExchangeConfig]:
         """
         Creates a list of ExchangeConfig objects based on the provided configuration.
@@ -139,16 +140,29 @@ class ConfigFactory:
                     logger.warning(f"Skipping {venue_name}: Missing credentials.")
                     continue
 
+                if dry_run:
+                    from src.adapters.exchanges.mock_adapter import MockExchangeGateway
+
+                    sim_config = bot_config.get("simulation", {})
+                    gw = MockExchangeGateway(
+                        real_adapter=gw,
+                        initial_balance=sim_config.get("starting_balance", 10000.0),
+                        latency_ms=sim_config.get("latency_ms", 50.0),
+                        slippage_ticks=sim_config.get("slippage_ticks", 0.5),
+                        maker_fee=sim_config.get("maker_fee", -0.0001),
+                        taker_fee=sim_config.get("taker_fee", 0.0003),
+                        tick_size=venue_tick_size,
+                    )
+                    logger.info(
+                        f"Shadow Mode: Wrapped {venue_name} in MockExchangeGateway"
+                    )
+
                 for sym in venue_symbols:
-                    # Strategy Setup
                     venue_strategy = None
-                    if (
-                        not force_monitor_mode
-                    ):  # Only setup strategy if NOT in monitor mode
+                    if not force_monitor_mode:
                         v_strat_params = venue_cfg.get("strategy_params")
                         if v_strat_params:
                             venue_strategy = AvellanedaStoikovStrategy()
-                            # Merge global and local params (simplified version of main.py logic)
                             merged = strategy_params.copy()
                             merged.update(v_strat_params)
                             venue_strategy.setup(merged)

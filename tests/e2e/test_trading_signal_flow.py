@@ -3,7 +3,7 @@ import asyncio
 import time
 from unittest.mock import MagicMock, AsyncMock
 from src.use_cases.strategy_manager import MultiExchangeStrategyManager, ExchangeConfig
-from src.domain.sim_match_engine import SimMatchEngine
+from src.domain.lob_match_engine import LOBMatchEngine
 from src.domain.signals.volume_candle import VolumeCandleSignalEngine
 from src.domain.signals.open_range import OpenRangeSignalEngine
 from src.domain.risk.basic_manager import BasicRiskManager
@@ -26,8 +26,8 @@ class MockStrategy(Strategy):
 @pytest.mark.asyncio
 async def test_momentum_add_flow():
     # 1. Setup Simulation Environment
-    sim_engine = SimMatchEngine(latency_ms=0)
-    sim_engine.set_initial_state(balance=10000.0, position_size=0.0)
+    sim_engine = LOBMatchEngine(latency_ms=0)
+    sim_engine.balance = 10000.0
 
     gateway = MockExchangeGateway("mock_exchange", sim_engine)
 
@@ -134,11 +134,10 @@ async def test_momentum_add_flow():
 @pytest.mark.asyncio
 async def test_smart_reducing_mode():
     # 1. Setup
-    sim_engine = SimMatchEngine(latency_ms=0)
-    # Start with a SHORT position (Counter-Flow to UP trend)
-    sim_engine.set_initial_state(
-        balance=10000.0, position_size=-5.0, entry_price=10000.0
-    )
+    sim_engine = LOBMatchEngine(latency_ms=0)
+    sim_engine.balance = 10000.0
+    sim_engine.position_size = -5.0
+    sim_engine.position_entry_price = 10000.0
 
     gateway = MockExchangeGateway("mock_exchange", sim_engine)
     config = ExchangeConfig(gateway=gateway, symbol="BTC-PERP")

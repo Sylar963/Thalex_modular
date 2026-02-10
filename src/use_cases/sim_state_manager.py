@@ -5,10 +5,7 @@ import logging
 from typing import List, Dict, Optional, AsyncGenerator
 from dataclasses import dataclass, field
 from ..domain.entities.pnl import EquitySnapshot, FillEffect
-from ..domain.entities import Ticker, MarketState, Position, Order, Trade, OrderSide
-from ..domain.lob_match_engine import LOBMatchEngine
-from ..domain.strategies.avellaneda import AvellanedaStoikovStrategy
-from ..domain.risk.basic_manager import BasicRiskManager
+from ..domain.entities import Ticker, Trade, OrderSide
 from ..domain.interfaces import StorageGateway
 
 logger = logging.getLogger(__name__)
@@ -36,13 +33,8 @@ class SimStateManager:
         self.max_history = max_history
         self._subscribers: List[asyncio.Queue] = []
         self._lock = asyncio.Lock()
-
-        # Modular Components
-        self.match_engine: Optional[LOBMatchEngine] = None
-        self.strategy: Optional[AvellanedaStoikovStrategy] = None
-        self.risk_manager: Optional[BasicRiskManager] = None
         self.storage: Optional[StorageGateway] = None
-        self._loop_task: Optional[asyncio.Task] = None
+        self._snapshot_task: Optional[asyncio.Task] = None
 
     def set_storage(self, storage: StorageGateway):
         self.storage = storage
@@ -60,155 +52,107 @@ class SimStateManager:
                 symbol=symbol,
                 initial_balance=initial_balance,
                 current_balance=initial_balance,
-                position_size=0.0,
-                position_entry_price=0.0,
-                equity_history=[],
-                fills=[],
-                last_price=0.0,
-                mark_price=0.0,
             )
 
-            # Initialize Engines
-            self.match_engine = LOBMatchEngine()
-            self.match_engine.balance = initial_balance
-            self.match_engine.fill_callback = self.record_fill
-
-            self.strategy = AvellanedaStoikovStrategy()
-            # Default config, should ideally come from params
-            self.strategy.setup(
-                {"gamma": 0.5, "volatility": 0.01, "position_limit": 5.0}
-            )
-
-            self.risk_manager = BasicRiskManager()
-            self.risk_manager.setup({"max_position": 5.0})
-
-            # Start the processing loop
-            self._loop_task = asyncio.create_task(self._simulation_loop())
-
+            self._snapshot_task = asyncio.create_task(self._periodic_snapshot())
             logger.info(
-                f"SimStateManager started: {symbol} with {initial_balance} balance in {mode} mode"
+                f"SimStateManager started: {symbol} | "
+                f"balance={initial_balance} | mode={mode}"
             )
 
     async def stop(self):
         async with self._lock:
             self.state.running = False
-            if self._loop_task:
-                self._loop_task.cancel()
+            if self._snapshot_task:
+                self._snapshot_task.cancel()
                 try:
-                    await self._loop_task
+                    await self._snapshot_task
                 except asyncio.CancelledError:
                     pass
-                self._loop_task = None
+                self._snapshot_task = None
 
             for q in self._subscribers:
                 await q.put(None)
             self._subscribers.clear()
             logger.info("SimStateManager stopped")
 
-    async def _simulation_loop(self):
-        """
-        Main loop to verify liveliness.
-        """
-        logger.info("Live Simulation Loop Started")
+    async def _periodic_snapshot(self):
         try:
             while self.state.running:
                 await asyncio.sleep(1.0)
+                if self.state.last_price > 0:
+                    price = (
+                        self.state.mark_price
+                        if self.state.mark_price > 0
+                        else self.state.last_price
+                    )
+                    unrealized = (
+                        (price - self.state.position_entry_price)
+                        * self.state.position_size
+                        if self.state.position_size != 0
+                        else 0.0
+                    )
+                    equity = self.state.current_balance + unrealized
+
+                    snapshot = EquitySnapshot(
+                        timestamp=time.time(),
+                        balance=self.state.current_balance,
+                        position_value=abs(self.state.position_size) * price,
+                        equity=equity,
+                        unrealized_pnl=unrealized,
+                    )
+                    await self._record_equity_snapshot(snapshot)
         except asyncio.CancelledError:
-            logger.info("Live Simulation Loop Cancelled")
-        except Exception as e:
-            logger.error(f"Error in Live Simulation Loop: {e}")
+            pass
 
     async def on_ticker(self, ticker: Ticker):
-        """
-        Called by MarketFeedService when a new ticker arrives.
-        This drives the simulation.
-        """
         if not self.state.running or ticker.symbol != self.state.symbol:
             return
+        self.state.last_price = ticker.last
+        self.state.mark_price = (
+            ticker.mark_price if ticker.mark_price > 0 else ticker.last
+        )
 
-        async with self._lock:
-            # 1. Update Market State
-            self.state.last_price = ticker.last
-            # Prefer mark_price from ticker if available
-            self.state.mark_price = ticker.mark_price if ticker.mark_price > 0 else ticker.last
+    async def on_position_update(self, symbol: str, size: float, entry_price: float):
+        if not self.state.running or symbol != self.state.symbol:
+            return
+        self.state.position_size = size
+        self.state.position_entry_price = entry_price
 
-            self.match_engine.on_ticker(ticker)
-
-            # 2. Strategy Logic
-            market_state = MarketState(ticker=ticker, timestamp=ticker.timestamp)
-            pos = Position(
-                self.state.symbol,
-                self.match_engine.position_size,
-                self.match_engine.position_entry_price,
-            )
-
-            quotes = self.strategy.calculate_quotes(market_state, pos)
-
-            # 3. Submit Orders to Match Engine
-            self.match_engine.bid_book.clear()
-            self.match_engine.ask_book.clear()
-
-            for q in quotes:
-                if self.risk_manager.validate_order(q, pos):
-                    self.match_engine.submit_order(q, ticker.timestamp)
-
-            # 4. Update Equity Snapshot
-            # Use mid price or mark price for equity calc? 
-            # Usually equity is balance + UPNL. UPNL uses mark price.
-            # But get_equity in match_engine might use mid.
-            # Let's standardize on mark price if available for UPNL part.
-            
-            current_price = self.state.mark_price if self.state.mark_price > 0 else (ticker.bid + ticker.ask) / 2
-            current_equity = self.match_engine.balance + (current_price - self.match_engine.position_entry_price) * self.match_engine.position_size
-            
-            snapshot = EquitySnapshot(
-                timestamp=ticker.timestamp,
-                balance=self.match_engine.balance,
-                position_value=0,  # Simplified
-                equity=current_equity,
-                unrealized_pnl=current_equity - self.match_engine.balance,
-            )
-
-            # Update internal state (lighter update)
-            self.state.position_size = self.match_engine.position_size
-            self.state.position_entry_price = self.match_engine.position_entry_price
-            self.state.current_balance = self.match_engine.balance
-
-            await self.record_equity_snapshot(snapshot)
+    async def on_balance_update(self, balance: float):
+        if not self.state.running:
+            return
+        self.state.current_balance = balance
 
     async def record_fill(self, fill: FillEffect):
-        """
-        Callback from LOBMatchEngine.
-        Persists fill as a mock Trade in bot_executions.
-        """
         self.state.fills.append(fill)
         self.state.current_balance = fill.balance_after
 
         if len(self.state.fills) > self.max_history:
             self.state.fills = self.state.fills[-self.max_history :]
 
-        logger.info(f"Live Sim Fill: {fill.side} {fill.size} @ {fill.price}")
+        logger.info(
+            f"Shadow Fill: {fill.side} {fill.size:.4f} @ {fill.price:.2f} | PNL: {fill.realized_pnl:.4f}"
+        )
 
-        # Persist to DB if storage is available
         if self.storage:
             try:
-                # Map FillEffect to Trade
                 trade = Trade(
                     id=str(uuid.uuid4()),
-                    order_id=str(uuid.uuid4()),  # Mock Order ID
+                    order_id=str(uuid.uuid4()),
                     symbol=fill.symbol,
                     price=fill.price,
                     size=fill.size,
                     side=OrderSide(fill.side),
                     timestamp=fill.timestamp,
-                    exchange=f"sim_{self.state.mode}",  # Distinguish from real fills
+                    exchange=f"sim_{self.state.mode}",
                     fee=fill.fee,
                 )
                 asyncio.create_task(self.storage.save_execution(trade))
             except Exception as e:
                 logger.error(f"Failed to persist sim execution: {e}")
 
-    async def record_equity_snapshot(self, snapshot: EquitySnapshot):
+    async def _record_equity_snapshot(self, snapshot: EquitySnapshot):
         self.state.equity_history.append(snapshot)
 
         if len(self.state.equity_history) > self.max_history:
@@ -223,9 +167,8 @@ class SimStateManager:
     def get_status(self) -> Dict:
         s = self.state
         unrealized = 0.0
-        # Prefer mark_price for UPNL
         price_for_upnl = s.mark_price if s.mark_price > 0 else s.last_price
-        
+
         if s.position_size != 0 and price_for_upnl > 0:
             unrealized = (price_for_upnl - s.position_entry_price) * s.position_size
 

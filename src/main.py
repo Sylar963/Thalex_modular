@@ -168,15 +168,15 @@ async def main():
     dry_run = mode == "shadow"
 
     if dry_run:
-        from src.domain.sim_match_engine import SimMatchEngine
+        from src.domain.lob_match_engine import LOBMatchEngine
         from src.use_cases.sim_state_manager import sim_state_manager
 
-        sim_engine = SimMatchEngine(
+        sim_engine = LOBMatchEngine(
             latency_ms=args.latency_ms,
             slippage_ticks=args.slippage_ticks,
             tick_size=getattr(gateway, "tick_size", 0.5),
         )
-        sim_engine.set_initial_state(args.initial_balance)
+        sim_engine.balance = args.initial_balance
         sim_state = sim_state_manager
         await sim_state.start(symbol, args.initial_balance, mode="shadow")
         logger.info(f"Shadow mode initialized with balance: {args.initial_balance}")
@@ -217,10 +217,11 @@ async def main():
 
         # Use shared factory to create exchange configurations
         exchange_configs = ConfigFactory.create_exchange_configs(
-            bot_config, time_sync_manager=time_sync_manager
+            bot_config, time_sync_manager=time_sync_manager, dry_run=dry_run
         )
         for cfg in exchange_configs:
-            time_sync_manager.add_venue(cfg.gateway)
+            real_gw = getattr(cfg.gateway, "_real", cfg.gateway)
+            time_sync_manager.add_venue(real_gw)
 
         safety_components = ConfigFactory.create_safety_components(bot_config)
         canary_sensor = ConfigFactory.create_canary_sensor(bot_config)

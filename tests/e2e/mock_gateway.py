@@ -3,11 +3,11 @@ import asyncio
 import time
 from src.domain.interfaces import ExchangeGateway
 from src.domain.entities import Order, OrderStatus, Ticker, Trade, Position, Balance
-from src.domain.sim_match_engine import SimMatchEngine
+from src.domain.lob_match_engine import LOBMatchEngine
 
 
 class MockExchangeGateway(ExchangeGateway):
-    def __init__(self, name: str, sim_engine: SimMatchEngine):
+    def __init__(self, name: str, sim_engine: LOBMatchEngine):
         self.name = name
         self.sim_engine = sim_engine
         self.connected = False
@@ -55,7 +55,7 @@ class MockExchangeGateway(ExchangeGateway):
         order.exchange = self.name
 
         # Submit to Sim Engine
-        self.sim_engine.submit_order(order)
+        self.sim_engine.submit_order(order, time.time())
 
         # Ack immediately
         if self.order_callback:

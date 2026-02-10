@@ -23,7 +23,7 @@ from ..domain.entities.pnl import EquitySnapshot
 from ..domain.tracking.state_tracker import StateTracker
 
 if TYPE_CHECKING:
-    from ..domain.sim_match_engine import SimMatchEngine
+    from ..domain.lob_match_engine import LOBMatchEngine
     from .sim_state_manager import SimStateManager
 
 logger = logging.getLogger(__name__)
@@ -38,7 +38,7 @@ class QuotingService:
         risk_manager: RiskManager,
         storage_gateway: Optional[StorageGateway] = None,
         dry_run: bool = False,
-        sim_engine: Optional["SimMatchEngine"] = None,
+        sim_engine: Optional["LOBMatchEngine"] = None,
         sim_state: Optional["SimStateManager"] = None,
         regime_analyzer: Optional[RegimeAnalyzer] = None,
         state_tracker: Optional[StateTracker] = None,
@@ -69,9 +69,9 @@ class QuotingService:
         # Pre-allocate commonly used objects to reduce allocations
         self._reconciliation_cache = {}
         self._perf_metrics = {
-            'reconcile_calls': 0,
-            'total_reconcile_time': 0.0,
-            'avg_reconcile_time': 0.0
+            "reconcile_calls": 0,
+            "total_reconcile_time": 0.0,
+            "avg_reconcile_time": 0.0,
         }
 
     async def start(self, symbol: str):
@@ -392,7 +392,9 @@ class QuotingService:
             # 4. Risk Validation - optimized with early exit
             valid_orders = []
             # Note: We validate against *open* orders in the tracker + current pos
-            active_orders_ref = [t.order for t in await self.state_tracker.get_open_orders()]
+            active_orders_ref = [
+                t.order for t in await self.state_tracker.get_open_orders()
+            ]
 
             for o in desired_orders:
                 if self.risk_manager.validate_order(
@@ -408,15 +410,17 @@ class QuotingService:
             # Update performance metrics
             end_time = time.perf_counter()
             reconcile_time = (end_time - start_time) * 1000  # Convert to ms
-            self._perf_metrics['reconcile_calls'] += 1
-            self._perf_metrics['total_reconcile_time'] += reconcile_time
-            self._perf_metrics['avg_reconcile_time'] = (
-                self._perf_metrics['total_reconcile_time'] /
-                self._perf_metrics['reconcile_calls']
+            self._perf_metrics["reconcile_calls"] += 1
+            self._perf_metrics["total_reconcile_time"] += reconcile_time
+            self._perf_metrics["avg_reconcile_time"] = (
+                self._perf_metrics["total_reconcile_time"]
+                / self._perf_metrics["reconcile_calls"]
             )
 
-            if self._perf_metrics['reconcile_calls'] % 100 == 0:
-                logger.debug(f"Reconciliation performance: avg={self._perf_metrics['avg_reconcile_time']:.3f}ms over {self._perf_metrics['reconcile_calls']} calls")
+            if self._perf_metrics["reconcile_calls"] % 100 == 0:
+                logger.debug(
+                    f"Reconciliation performance: avg={self._perf_metrics['avg_reconcile_time']:.3f}ms over {self._perf_metrics['reconcile_calls']} calls"
+                )
         finally:
             self._is_reconciling = False
 
@@ -498,12 +502,18 @@ class QuotingService:
         # Create lookup dictionaries for O(1) access
         active_by_price_size = {}
         for act in active_list:
-            key = (round(act.price / self.tick_size), act.size)  # Normalize price to tick boundaries
+            key = (
+                round(act.price / self.tick_size),
+                act.size,
+            )  # Normalize price to tick boundaries
             active_by_price_size[key] = act
 
         desired_by_price_size = {}
         for des in desired_list:
-            key = (round(des.price / self.tick_size), des.size)  # Normalize price to tick boundaries
+            key = (
+                round(des.price / self.tick_size),
+                des.size,
+            )  # Normalize price to tick boundaries
             desired_by_price_size[key] = des
 
         # Find orders to cancel (in active but not in desired)
