@@ -257,8 +257,13 @@ class MMVisualizer:
 
         regimes = indicators.get("regimes")
         hft = indicators.get("hft")
+        signals = indicators.get("signals")
 
-        if (regimes is None or regimes.empty) and (hft is None or hft.empty):
+        if (
+            (regimes is None or regimes.empty)
+            and (hft is None or hft.empty)
+            and (signals is None or signals.empty)
+        ):
             return go.Figure()
 
         # Create subplots
@@ -268,13 +273,14 @@ class MMVisualizer:
             shared_xaxes=True,
             vertical_spacing=0.05,
             subplot_titles=[
-                "Trend Strength (Regimes)",
-                "Liquidity Score",
-                "HFT Toxicity",
+                "Trend Strength (Regimes/Signals)",
+                "Liquidity & Volatility",
+                "HFT Toxicity & Risk",
             ],
         )
 
         # 1. Trend
+        has_trend = False
         if regimes is not None and not regimes.empty:
             for col, color in [
                 ("trend_fast", "cyan"),
@@ -287,21 +293,38 @@ class MMVisualizer:
                             x=regimes["time"],
                             y=regimes[col],
                             mode="lines",
-                            name=col,
+                            name=f"Regime {col}",
                             line=dict(color=color, width=1),
                         ),
                         row=1,
                         col=1,
                     )
+                    has_trend = True
 
-            # 2. Liquidity
+        # Fallback to market signals momentum if regimes trend is missing
+        if not has_trend and signals is not None and not signals.empty:
+            if "momentum" in signals.columns:
+                fig.add_trace(
+                    go.Scatter(
+                        x=signals["time"],
+                        y=signals["momentum"],
+                        mode="lines",
+                        name="Signal Momentum",
+                        line=dict(color="cyan", width=1.5),
+                    ),
+                    row=1,
+                    col=1,
+                )
+
+        # 2. Liquidity & Volatility
+        if regimes is not None and not regimes.empty:
             if "liquidity_score" in regimes.columns:
                 fig.add_trace(
                     go.Scatter(
                         x=regimes["time"],
                         y=regimes["liquidity_score"],
                         mode="lines",
-                        name="Liquidity Score",
+                        name="Regime Liquidity",
                         line=dict(color="lime", width=1),
                         fill="tozeroy",
                     ),
@@ -309,7 +332,21 @@ class MMVisualizer:
                     col=1,
                 )
 
-        # 3. Toxicity
+        if signals is not None and not signals.empty:
+            if "volatility" in signals.columns:
+                fig.add_trace(
+                    go.Scatter(
+                        x=signals["time"],
+                        y=signals["volatility"],
+                        mode="lines",
+                        name="Signal Volatility",
+                        line=dict(color="orange", width=1, dash="dot"),
+                    ),
+                    row=2,
+                    col=1,
+                )
+
+        # 3. Toxicity & Signals
         if hft is not None and not hft.empty:
             if "toxicity_score" in hft.columns:
                 fig.add_trace(
@@ -317,8 +354,22 @@ class MMVisualizer:
                         x=hft["time"],
                         y=hft["toxicity_score"],
                         mode="lines",
-                        name="Toxicity",
+                        name="HFT Toxicity",
                         line=dict(color="red", width=1),
+                    ),
+                    row=3,
+                    col=1,
+                )
+
+        if signals is not None and not signals.empty:
+            if "vamp_value" in signals.columns:
+                fig.add_trace(
+                    go.Scatter(
+                        x=signals["time"],
+                        y=signals["vamp_value"],
+                        mode="lines",
+                        name="VAMP Signal",
+                        line=dict(color="violet", width=1),
                     ),
                     row=3,
                     col=1,

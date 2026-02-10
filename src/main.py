@@ -252,6 +252,7 @@ async def main():
             canary_sensor=canary_sensor,
             inventory_bias_engine=inventory_bias_engine,
             storage=storage,
+            regime_analyzer=regime_analyzer,
             safety_components=safety_components,
             dry_run=dry_run,
         )

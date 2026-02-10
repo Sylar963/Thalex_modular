@@ -10,10 +10,9 @@ from ..domain.interfaces import (
     Strategy,
     RiskManager,
     StorageGateway,
-    RiskManager,
-    StorageGateway,
     SignalEngine,
     SafetyComponent,
+    RegimeAnalyzer,
 )
 from ..domain.market.trend_service import HistoricalTrendService
 from ..domain.signals.inventory_bias import InventoryBiasEngine
@@ -80,6 +79,7 @@ class MultiExchangeStrategyManager:
         canary_sensor: Optional[SignalEngine] = None,
         inventory_bias_engine: Optional[InventoryBiasEngine] = None,
         storage: Optional[StorageGateway] = None,
+        regime_analyzer: Optional[RegimeAnalyzer] = None,
         safety_components: Optional[List[SafetyComponent]] = None,
         dry_run: bool = False,
     ):
@@ -94,6 +94,7 @@ class MultiExchangeStrategyManager:
         self.or_engine = or_engine
         self.canary_sensor = canary_sensor
         self.inventory_bias_engine = inventory_bias_engine
+        self.regime_analyzer = regime_analyzer
         self.storage = storage
         self.safety_components = safety_components or []
         self.dry_run = dry_run
@@ -245,6 +246,25 @@ class MultiExchangeStrategyManager:
                                 ticker.symbol, "open_range", or_signals
                             )
                         )
+
+            if self.regime_analyzer:
+                self.regime_analyzer.update(ticker)
+                regime = self.regime_analyzer.get_regime()
+
+                # Persist regime every 1s per symbol to avoid DB bloat
+                venue_key = f"{exchange}:{ticker.symbol}"
+                now = ticker.timestamp
+                last_regime_persist = getattr(self, "_last_regime_persist", {})
+                if not hasattr(self, "_last_regime_persist"):
+                    self._last_regime_persist = last_regime_persist
+
+                if (
+                    self.storage
+                    and not self.dry_run
+                    and (now - last_regime_persist.get(venue_key, 0.0)) >= 1.0
+                ):
+                    last_regime_persist[venue_key] = now
+                    asyncio.create_task(self.storage.save_regime(ticker.symbol, regime))
 
             if self.canary_sensor:
                 self.canary_sensor.update(ticker)
