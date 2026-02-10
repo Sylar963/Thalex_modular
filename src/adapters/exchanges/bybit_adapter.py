@@ -359,13 +359,17 @@ class BybitAdapter(BaseExchangeAdapter):
     async def _handle_position_update(self, data: Dict):
         symbol = data.get("symbol")
         if symbol:
+            internal_symbol = InstrumentService.get_internal_symbol(symbol, self.name)
             amount = self._safe_float(data.get("size"))
+            side = data.get("side", "")
+            if side == "Sell" and amount > 0:
+                amount = -amount
             entry_price = self._safe_float(data.get("entryPrice"))
             mark_price = self._safe_float(data.get("markPrice"))
             unrealized_pnl = self._safe_float(data.get("unrealizedPnl"))
 
-            self.positions[symbol] = Position(
-                symbol,
+            self.positions[internal_symbol] = Position(
+                internal_symbol,
                 amount,
                 entry_price,
                 exchange=self.name,
@@ -374,7 +378,7 @@ class BybitAdapter(BaseExchangeAdapter):
             )
 
             if self.position_callback:
-                await self.position_callback(symbol, amount, entry_price)
+                await self.position_callback(internal_symbol, amount, entry_price)
 
     async def _handle_wallet_update(self, data: Dict):
         logger.info(f"raw wallet data: {data}")
