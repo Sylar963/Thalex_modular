@@ -156,6 +156,10 @@ async def main():
             subsequent_target_pct_of_range=or_params.get(
                 "subsequent_target_pct_of_range", 220
             ),
+            timezone=or_params.get("timezone", "UTC"),
+            use_bias=or_params.get("use_bias", False),
+            validation_threshold=or_params.get("validation_threshold", 0.20),
+            symbol_configs=or_params.get("symbol_configs"),
         )
         logger.info("OpenRangeSignalEngine initialized")
 
@@ -243,6 +247,10 @@ async def main():
             )
             logger.info("InventoryBiasEngine initialized")
 
+        orb_config = None
+        if bot_config.get("strategy", {}).get("type") == "orb":
+            orb_config = bot_config.get("strategy")
+
         multi_service = MultiExchangeStrategyManager(
             exchanges=exchange_configs,
             strategy=strategy,
@@ -256,6 +264,7 @@ async def main():
             regime_analyzer=regime_analyzer,
             safety_components=safety_components,
             dry_run=dry_run,
+            orb_config=orb_config,
         )
 
         throttling_params = bot_config.get("throttling", {})

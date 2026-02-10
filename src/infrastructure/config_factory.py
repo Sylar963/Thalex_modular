@@ -160,12 +160,21 @@ class ConfigFactory:
                 for sym in venue_symbols:
                     venue_strategy = None
                     if not force_monitor_mode:
-                        v_strat_params = venue_cfg.get("strategy_params")
-                        if v_strat_params:
-                            venue_strategy = AvellanedaStoikovStrategy()
-                            merged = strategy_params.copy()
-                            merged.update(v_strat_params)
-                            venue_strategy.setup(merged)
+                        strat_type = bot_config.get("strategy", {}).get(
+                            "type", "avellaneda"
+                        )
+                        if strat_type == "orb":
+                            # ORB strategy is managed CENTRALLY, not per-venue object
+                            # So we leave venue_strategy=None here
+                            venue_strategy = None
+                        else:
+                            # Default to Avellaneda/Stoikov
+                            v_strat_params = venue_cfg.get("strategy_params")
+                            if v_strat_params:
+                                venue_strategy = AvellanedaStoikovStrategy()
+                                merged = strategy_params.copy()
+                                merged.update(v_strat_params)
+                                venue_strategy.setup(merged)
 
                     exchange_configs.append(
                         ExchangeConfig(
