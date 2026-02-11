@@ -39,8 +39,8 @@ class BinanceAdapter(BaseExchangeAdapter):
 
     def __init__(
         self,
-        api_key: str,
-        api_secret: str,
+        api_key: str = "",
+        api_secret: str = "",
         testnet: bool = True,
         time_sync_manager: Optional[TimeSyncManager] = None,
     ):
@@ -57,6 +57,13 @@ class BinanceAdapter(BaseExchangeAdapter):
 
         self._msg_loop_task: Optional[asyncio.Task] = None
         self._keepalive_task: Optional[asyncio.Task] = None
+
+        # Public mode flag
+        self.public_only = not (api_key and api_secret)
+        if self.public_only:
+            logger.info(
+                "BinanceAdapter initialized in PUBLIC ONLY mode (No Trade/Account updates)"
+            )
 
     @property
     def name(self) -> str:
@@ -76,6 +83,9 @@ class BinanceAdapter(BaseExchangeAdapter):
             raise
 
     def _sign(self, params: Dict) -> str:
+        if self.public_only:
+            raise RuntimeError("Cannot sign request in public-only mode")
+
         query_string = urlencode(params)
         signature = hmac.new(
             self.api_secret.encode("utf-8"),
@@ -88,23 +98,40 @@ class BinanceAdapter(BaseExchangeAdapter):
         logger.info(
             f"Connecting to Binance ({'Testnet' if self.testnet else 'Mainnet'})..."
         )
-        self.session = aiohttp.ClientSession(headers={"X-MBX-APIKEY": self.api_key})
+
+        headers = {}
+        if not self.public_only:
+            headers["X-MBX-APIKEY"] = self.api_key
+
+        self.session = aiohttp.ClientSession(headers=headers)
 
         if self.time_sync_manager:
             await self.time_sync_manager.sync_all()
 
-        self.listen_key = await self._create_listen_key()
-        if not self.listen_key:
-            raise ConnectionError("Failed to obtain listenKey from Binance")
+        if not self.public_only:
+            self.listen_key = await self._create_listen_key()
+            if not self.listen_key:
+                raise ConnectionError("Failed to obtain listenKey from Binance")
 
-        ws_url = f"{self.ws_base_url}/ws/{self.listen_key}"
-        self.ws = await self.session.ws_connect(ws_url)
+            # Connect to Private User Data Stream
+            ws_url = f"{self.ws_base_url}/ws/{self.listen_key}"
+            self.ws = await self.session.ws_connect(ws_url)
+            self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+        else:
+            # Public mode: No initial WS connection (will connect on subscribe)
+            # Or we can maintain a connection to base stream if needed,
+            # but usually Binance streams are path-based.
+            # We'll expect subscribe_ticker to handle its own connection or use combined stream.
+            # For simplicity in this architecture, we might want a base connection or just
+            # let subscriptions handle it.
+            pass
+
         self.connected = True
 
-        self._msg_loop_task = asyncio.create_task(self._msg_loop())
-        self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+        if self.ws:
+            self._msg_loop_task = asyncio.create_task(self._msg_loop())
 
-        logger.info("Binance Adapter connected.")
+        logger.info(f"Binance Adapter connected (Public: {self.public_only}).")
 
     async def disconnect(self):
         self.connected = False
@@ -119,6 +146,9 @@ class BinanceAdapter(BaseExchangeAdapter):
         logger.info("Binance Adapter disconnected.")
 
     async def _create_listen_key(self) -> Optional[str]:
+        if self.public_only:
+            return None
+
         url = f"{self.base_url}/fapi/v1/listenKey"
         async with self.session.post(url) as resp:
             if resp.status == 200:
@@ -128,6 +158,9 @@ class BinanceAdapter(BaseExchangeAdapter):
             return None
 
     async def _keepalive_loop(self):
+        if self.public_only:
+            return
+
         resync_interval = 60
         keepalive_interval = 30 * 60
         elapsed = 0
@@ -385,32 +418,47 @@ class BinanceAdapter(BaseExchangeAdapter):
     async def subscribe_ticker(self, symbol: str):
         mapped_symbol = InstrumentService.get_exchange_symbol(symbol, self.name)
         stream = f"{mapped_symbol.lower()}@bookTicker"
+
+        # If we have a main WS connection (Private), we can't easily multiplex public streams
+        # on the listenKey stream in Binance Futures (unlike Spot).
+        # So we usually need a separate connection for public streams anyway if we want to be clean.
+        # But for valid Multi-Stream, we should use the Combined Stream URL.
+
+        # For this implementation, we will spawn a separate dedicated task for this ticker
+        # if we aren't using a combined stream manager (which we aren't yet).
+
         ws_url = f"{self.ws_base_url}/ws/{stream}"
         asyncio.create_task(self._ticker_stream(ws_url, symbol))
 
     async def _ticker_stream(self, url: str, symbol: str):
-        async with self.session.ws_connect(url) as ws:
-            while self.connected:
-                try:
-                    msg = await asyncio.wait_for(ws.receive_json(), timeout=5.0)
-                    ticker = Ticker(
-                        symbol=symbol,
-                        bid=float(msg.get("b", 0)),
-                        ask=float(msg.get("a", 0)),
-                        bid_size=float(msg.get("B", 0)),
-                        ask_size=float(msg.get("A", 0)),
-                        last=0.0,
-                        volume=0.0,
-                        exchange=self.name,
-                        timestamp=float(msg.get("T", time.time() * 1000)) / 1000.0,
-                    )
-                    if self.ticker_callback:
-                        await self.ticker_callback(ticker)
-                except asyncio.TimeoutError:
-                    continue
-                except Exception as e:
-                    logger.error(f"Binance ticker stream error: {e}")
-                    break
+        # Dedicated socket for this ticker (Simple but effective for single-ticker bots)
+        try:
+            async with self.session.ws_connect(url) as ws:
+                logger.info(f"Subscribed to ticker stream for {symbol}")
+                while self.connected:
+                    try:
+                        msg = await asyncio.wait_for(ws.receive_json(), timeout=5.0)
+                        ticker = Ticker(
+                            symbol=symbol,
+                            bid=float(msg.get("b", 0)),
+                            ask=float(msg.get("a", 0)),
+                            bid_size=float(msg.get("B", 0)),
+                            ask_size=float(msg.get("A", 0)),
+                            last=0.0,
+                            volume=0.0,
+                            exchange=self.name,
+                            timestamp=float(msg.get("T", time.time() * 1000)) / 1000.0,
+                        )
+                        if self.ticker_callback:
+                            await self.ticker_callback(ticker)
+                    except asyncio.TimeoutError:
+                        # Ping/Pong handled by aiohttp automatic
+                        continue
+                    except Exception as e:
+                        logger.error(f"Binance ticker stream error: {e}")
+                        break
+        except Exception as main_e:
+            logger.error(f"Failed to connect to ticker stream {url}: {main_e}")
 
     async def get_position(self, symbol: str) -> Position:
         return self.positions.get(

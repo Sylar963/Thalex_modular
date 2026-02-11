@@ -120,6 +120,21 @@ class AvellanedaStoikovStrategy(Strategy):
         mid_price = ticker.mid_price
         timestamp = market_state.timestamp or time.time()
 
+        # --- LEAD-LAG ORACLE INTEGRATION ---
+        # If a Fair Price signal exists and is fresh, use it as the anchor.
+        # Otherwise, fall back to local mid-price.
+        fair_price = market_state.signals.get("fair_price")
+
+        # Check freshness? For now assume signal engine handles it or we trust the value.
+        # Ideally we check timestamp delta.
+        # But 'fair_price' is just a float value here.
+        # If we need metadata, we should look for 'fair_price_meta' or similar.
+
+        anchor_price = fair_price if fair_price and fair_price > 0 else mid_price
+
+        if anchor_price != mid_price:
+            pass  # We could log this div, but it happens every tick.
+
         # Determine tick size
         if tick_size:
             self.tick_size = tick_size
@@ -199,7 +214,7 @@ class AvellanedaStoikovStrategy(Strategy):
         # A. Fee-based Minimum Spread
         # spread >= price * (2*fee + margin) * multiplier
         fee_based_min = (
-            mid_price
+            anchor_price
             * (self.maker_fee_rate * 2 + self.profit_margin_rate)
             * self.fee_coverage_multiplier
         )
@@ -256,14 +271,15 @@ class AvellanedaStoikovStrategy(Strategy):
 
         # Signal Offsets
         res_offset = (
-            market_state.signals.get("reservation_price_offset", 0.0) * mid_price
+            market_state.signals.get("reservation_price_offset", 0.0) * anchor_price
         )
 
         # --- 3. Final Prices ---
         half_spread = final_spread / 2.0
 
-        raw_bid = mid_price - half_spread - inventory_skew + res_offset
-        raw_ask = mid_price + half_spread - inventory_skew + res_offset
+        # Anchor price is now potentially FairPrice, not just mid_price
+        raw_bid = anchor_price - half_spread - inventory_skew + res_offset
+        raw_ask = anchor_price + half_spread - inventory_skew + res_offset
 
         # --- 4. Rounding & Sanity ---
         bid_price = self._round_to_tick(raw_bid)

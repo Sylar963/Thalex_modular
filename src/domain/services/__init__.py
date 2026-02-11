@@ -1,0 +1,1 @@
+from .fair_price_service import FairPriceService
