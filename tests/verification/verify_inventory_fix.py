@@ -9,101 +9,107 @@ from src.domain.strategies.avellaneda import AvellanedaStoikovStrategy
 from src.domain.entities import MarketState, Ticker, Position
 
 
-def verify_inventory_fix():
-    print("--- Verifying Inventory Fix ---")
+def verify_inventory_dampening():
+    print("--- Verifying Inventory Dampening ---")
 
     # Setup Strategy
     strategy = AvellanedaStoikovStrategy()
     config = {
-        "gamma": 0.5,
+        "gamma": 0.0,  # Disable gamma for cleaner spread check
         "volatility": 0.05,
-        "min_spread": 1000,  # Large min spread to clear fee floor
+        "min_spread": 0,  # Disable min spread
         "tick_size": 0.0001,
         "avellaneda": {
             "position_fade_time": 3600,
             "volatility_multiplier": 1.0,
             "inventory_weight": 0.0,
             "base_spread_factor": 0.0,
-            "inventory_factor": 0.5,  # Factor to test
+            "inventory_factor": 0.5,
         },
         "maker_fee_rate": 0.0,
         "profit_margin_rate": 0.0,
     }
     strategy.setup(config)
 
-    # Test Cases
+    # Scenarios
+    # 1. Normal (0.5x risk) -> Linear
+    # 2. High (5x risk) -> Dampened: 1 + sqrt(4) = 3.0 (vs 5.0)
+    # 3. Max (10x risk) -> Dampened: 1 + sqrt(9) = 4.0 (vs 10.0)
+
     scenarios = [
-        {"symbol": "SUIUSDT", "price": 0.8971, "pos": 500, "limit": 100},
-        {"symbol": "BTCUSDT", "price": 90000.0, "pos": 0.5, "limit": 0.1},
+        {"symbol": "NORMAL", "price": 100.0, "pos": 5.0, "limit": 10.0},  # Ratio 0.5
+        {"symbol": "HIGH_5X", "price": 100.0, "pos": 50.0, "limit": 10.0},  # Ratio 5.0
+        {
+            "symbol": "MAX_10X",
+            "price": 100.0,
+            "pos": 100.0,
+            "limit": 10.0,
+        },  # Ratio 10.0
     ]
 
     for sc in scenarios:
         price = sc["price"]
+        limit = sc["limit"]
+        pos = sc["pos"]
+
+        raw_ratio = pos / limit
+
+        # Expected Risk Score (Dampened)
+        if raw_ratio <= 1.0:
+            exp_risk = raw_ratio
+        else:
+            exp_risk = 1.0 + math.sqrt(raw_ratio - 1.0)
+
+        # Expected Spread Component
+        # inv_factor(0.5) * risk * vol(0.05) * price
+        exp_spread_add = 0.5 * exp_risk * 0.05 * price
+        exp_spread_pct = (exp_spread_add / price) * 100
+
+        # Expected Linear Spread (Old)
+        linear_risk = raw_ratio
+        linear_spread_add = 0.5 * linear_risk * 0.05 * price
+        linear_spread_pct = (linear_spread_add / price) * 100
+
+        print(f"\nScenario: {sc['symbol']} (Ratio {raw_ratio:.1f})")
+        print(
+            f"Expected Risk Score: {exp_risk:.2f} (Linear would be {linear_risk:.1f})"
+        )
+        print(
+            f"Expected Spread Add: {exp_spread_pct:.2f}% (Linear would be {linear_spread_pct:.2f}%)"
+        )
+
+        # Run Strategy
         ticker = Ticker(
             symbol=sc["symbol"],
             bid=price - 0.01,
             ask=price + 0.01,
-            bid_size=100.0,
-            ask_size=100.0,
+            bid_size=10,
+            ask_size=10,
             last=price,
-            volume=10000.0,
+            volume=1000,
             exchange="bybit",
-            timestamp=1000.0,
+            timestamp=1000,
         )
         market_state = MarketState(ticker=ticker, timestamp=1000)
-        # Mocking Limit via config update for simplicity in loop?
-        # Actually strategy uses config limit. We can override instance var.
-        strategy.position_limit = sc["limit"]
+        strategy.position_limit = limit
+        position = Position(symbol=sc["symbol"], size=pos, entry_price=price)
 
-        position = Position(symbol=sc["symbol"], size=sc["pos"], entry_price=price)
-
-        # Calculate
         strategy.calculate_quotes(market_state, position, exchange="bybit")
-        metrics = strategy.get_last_metrics()  # Metrics capture doesn't separate inventory component explicitly in 'volatility' field logic... wait.
+        metrics = strategy.get_last_metrics()
 
-        # We need to manually calculate expected inventory component since get_last_metrics
-        # doesn't expose 'inventory_component' separately (it's part of optimal_spread).
-        # However, we can calculate what it SHOULD be.
+        actual_spread = metrics["spread"]
+        actual_risk = metrics["inventory_risk"]
 
-        # Formula: inv_factor * inv_risk * vol_term * price
-        # vol_term = vol * mult = 0.05 * 1.0 = 0.05
-        # risk = abs(pos)/limit = 5.0 (capped at 10)
+        print(f"ACTUAL Risk Score: {actual_risk:.2f}")
+        print(
+            f"ACTUAL Spread: {actual_spread:.4f} ({(actual_spread / price) * 100:.2f}%)"
+        )
 
-        vol_term = 0.05
-        risk = abs(sc["pos"]) / sc["limit"]
-        inv_factor = 0.5
-
-        expected_inv_comp = inv_factor * risk * vol_term * price
-
-        print(f"\nScenario: {sc['symbol']} @ ${price}")
-        print(f"Risk: {risk}")
-        print(f"Expected Inv Component ($): {expected_inv_comp:.6f}")
-        print(f"Expected Inv Component (%): {(expected_inv_comp / price) * 100:.2f}%")
-
-        # We can't easily assert on internal variable without subclassing or modifying code to expose it.
-        # But we can assume if the code change ran without error, the scaling is applied.
-        # Let's check if the spread is at least reasonable.
-        # Before fix: it would have been adding 0.5 * 5 * 0.05 = 0.125 (raw) to spread.
-        # SUI: 0.125 on 0.89 is ~14%.
-        # BTC: 0.125 on 90000 is 0.0001%.
-
-        # With fix:
-        # SUI: 0.125 * 0.89 = 0.11125 (~12.5% still? No wait.
-        # inventory_component = inventory_factor * inventory_risk * volatility_term * price
-        # 0.5 * 5.0 * 0.05 * 0.89 = 0.111.
-        # This effectively means "At 5x leverage, widen spread by X% * 5".
-        # If daily vol is 5%, and we are 5x leverage, we widen by 12.5%.
-        # This seems mathematically consistent for Avellaneda: higher risk -> wider spread proportional to price/vol.
-
-        # The key is that identical risk (5x limit) yields identical % impact on spread.
-        return_pct = (expected_inv_comp / price) * 100
-        print(f"Impact %: {return_pct:.2f}%")
-
-        if 12.0 < return_pct < 13.0:
-            print("PASS: Impact is proportional to price.")
+        if abs(actual_risk - exp_risk) < 0.1:
+            print("PASS: Risk score matches dampened curve.")
         else:
-            print("FAIL: Impact is not proportional.")
+            print("FAIL: Risk score mismatch.")
 
 
 if __name__ == "__main__":
-    verify_inventory_fix()
+    verify_inventory_dampening()

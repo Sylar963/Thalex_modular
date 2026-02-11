@@ -102,6 +102,11 @@ class AvellanedaStoikovStrategy(Strategy):
             f"Avellaneda Strategy Configured: PosLimit={self.position_limit}, Gamma={self.gamma}, Vol={self.volatility}"
         )
 
+    # --- Constants for Heuristic Dampening ---
+    MAX_INVENTORY_RISK_SCORE = 5.0
+    MAX_SKEW_RATIO = 3.0
+    DAMPENING_THRESHOLD_RATIO = 1.0
+
     def calculate_quotes(
         self,
         market_state: MarketState,
@@ -111,7 +116,13 @@ class AvellanedaStoikovStrategy(Strategy):
         exchange: Optional[str] = None,
     ) -> List[Order]:
         """
-        Calculate optimal bid and ask orders using legacy heuristic logic.
+        Calculate optimal bid and ask orders using Heuristic Avellaneda-Stoikov logic.
+
+        Key Improvements over legacy:
+        - Geometric Dampening: Uses square root scaling for inventory risk ratios > 1.0
+          to prevent spread explosion at high leverage (e.g. 10x).
+        - Skew Capping: Caps absolute skew ratio to prevent runaway quotes.
+        - Unit Corrections: Properly scales volatility and inventory components by price.
         """
         if not market_state.ticker or market_state.ticker.mid_price <= 0:
             return []
@@ -235,8 +246,26 @@ class AvellanedaStoikovStrategy(Strategy):
         # Inventory Risk Component
         current_pos = position.size
         safe_pos_limit = max(0.001, self.position_limit)
-        inventory_risk = abs(current_pos) / safe_pos_limit
-        inventory_risk = min(inventory_risk, 10.0)  # Cap risk
+
+        # Calculate raw ratio
+        raw_risk_ratio = abs(current_pos) / safe_pos_limit
+
+        # Dampened Risk Logic:
+        # Linear for ratio <= 1.0 (Normal operation)
+        # Square root for ratio > 1.0 (High leverage / Overload)
+        # This prevents spread explosion at 10x leverage (Ratio 10.0)
+        if raw_risk_ratio <= self.DAMPENING_THRESHOLD_RATIO:
+            inventory_risk = raw_risk_ratio
+        else:
+            # Ratio 10.0 -> 1.0 + sqrt(9.0) = 4.0
+            # Reduces impact from 10x to 4x equivalent
+            inventory_risk = self.DAMPENING_THRESHOLD_RATIO + math.sqrt(
+                raw_risk_ratio - self.DAMPENING_THRESHOLD_RATIO
+            )
+
+        inventory_risk = min(
+            inventory_risk, self.MAX_INVENTORY_RISK_SCORE
+        )  # Cap risk score
 
         inventory_component = (
             inventory_factor * inventory_risk * volatility_term * anchor_price
@@ -278,7 +307,9 @@ class AvellanedaStoikovStrategy(Strategy):
         # FIX: Cap the skew ratio to prevent extreme leverage from pushing quotes to infinity
         # At 10x leverage, ratio could be 10.0. We cap at 3.0 (heuristic).
         raw_skew_ratio = current_pos / safe_pos_limit
-        capped_skew_ratio = max(min(raw_skew_ratio, 3.0), -3.0)
+        capped_skew_ratio = max(
+            min(raw_skew_ratio, self.MAX_SKEW_RATIO), -self.MAX_SKEW_RATIO
+        )
 
         inventory_skew = capped_skew_ratio * skew_base_spread * inventory_skew_factor
 
