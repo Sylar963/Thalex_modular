@@ -42,7 +42,7 @@ metrics
 
 # Thalex specific
 thalex_credentials.json
-
+config.txt
 # Local development settings
 .env.local
 .env.development.local

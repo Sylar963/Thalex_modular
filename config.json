@@ -1,42 +1,24 @@
 {
-    "primary_instrument": "BTC-PERPETUAL",
+    "primary_instrument": "SUIUSDT",
     "venues": {
         "thalex": {
-            "enabled": false
-            ,
+            "enabled": false,
             "symbols": ["BTC-PERPETUAL"],
             "testnet": false,
-            "ws_url": null,
-            "strategy_params": {
-                "gamma": 0.3,
-                "volatility": 0.02,
-                "position_limit": 0.1,
-                "min_spread": 50,
-                "quote_levels": 1,
-                "level_spacing_factor": 0.5,
-                "order_size": 0.001
-            }
+            "ws_url": null
         },
         "bybit": {
             "enabled": true,
-            "symbols": ["HYPEUSDT"],
+            "symbols": ["SUIUSDT"],
             "testnet": false,
             "api_url": null,
             "ws_public_url": null,
             "ws_private_url": null,
-            "strategy_params": {
-                "gamma": 0.3,
-                "volatility": 0.02,
-                "position_limit": 2.0,
-                "min_spread": 50,
-                "quote_levels": 3,
-                "level_spacing_factor": 0.5,
-                "order_size": 0.5
-            }
+            "strategy_params": {}
         },
         "binance": {
-            "enabled": false,
-            "symbols": ["BTCUSDT"],
+            "enabled": true,
+            "symbols": ["SUIUSDT"],
             "testnet": false
         },
         "hyperliquid": {
@@ -52,7 +34,7 @@
             },
             {
                 "venue": "bybit",
-                "symbols": ["BTCUSDT", "ETHUSDT"]
+                "symbols": ["BTCUSDT", "ETHUSDT","HYPEUSDT","SUIUSDT"]
             }
         ]
     },
@@ -61,42 +43,65 @@
         "cancel_rate_limit": 900.0
     },
     "strategy": {
-        "name": "avellaneda",
+        "type": "avellaneda",
         "params": {
-            "gamma": 0.5,
-            "volatility": 0.05,
-            "position_limit": 5.0,
-            "min_spread": 20,
-            "quote_levels": 1,
+            "gamma": 0.28,
+            "volatility": 0.0565,
+            "position_limit": 3.0,
+            "order_size": 10,
+            "min_spread": 26,
+            "quote_levels": 3,
             "level_spacing_factor": 0.5,
-            "order_size": 0.001
+            "recalc_interval": 0.5
         }
     },
     "risk": {
-        "max_position": 10.0,
-        "max_order_size": 1.0,
+        "max_position": 50.0,
+        "max_order_size": 100.0,
         "venue_limits": {
             "thalex": 1.0,
-            "bybit": 5.0,
+            "bybit": 100.0,
             "binance": 1.0,
             "hyperliquid": 1.0
         }
     },
+    "fair_price_engine": {
+        "enabled": true,
+        "oracle": {
+            "exchange": "binance",
+            "symbol": "SUIUSDT"
+        },
+        "window_seconds": 300,
+        "min_samples": 10
+    },
     "signals": {
         "volume_candle": {
             "volume_threshold": 10.0,
-            "max_candles": 50
+            "max_candles": 200
         },
         "open_range": {
             "enabled": true,
-            "session_start_utc": "20:00",
-            "session_end_utc": "20:15",
-            "target_pct_from_mid": 1.49,
-            "subsequent_target_pct_of_range": 220,
-            "timezone": "America/Tijuana"
+            "timezone": "America/Tijuana",
+            "session_start_utc": "20:15",
+            "session_end_utc": "20:30",
+            "target_pct_from_mid": 3.49,
+            "subsequent_target_pct_of_range": 320.0,
+            "symbol_configs": {
+               "SUIUSDT": { 
+                   "target_pct_from_mid": 3.49,
+                   "subsequent_target_pct_of_range": 320.0
+               }
+            }
         }
     },
     "throttling": {
         "min_edge_threshold": 0.5
+    },
+    "simulation": {
+        "starting_balance": 233.0,
+        "latency_ms": 50,
+        "slippage_ticks": 0.5,
+        "maker_fee": -0.0001,
+        "taker_fee": 0.0003
     }
 }
