@@ -92,6 +92,7 @@ class MultiExchangeStrategyManager:
         or_engine: Optional[SignalEngine] = None,
         canary_sensor: Optional[SignalEngine] = None,
         inventory_bias_engine: Optional[InventoryBiasEngine] = None,
+        fair_price_service: Optional[Any] = None,
         storage: Optional[StorageGateway] = None,
         regime_analyzer: Optional[RegimeAnalyzer] = None,
         safety_components: Optional[List[SafetyComponent]] = None,
@@ -109,6 +110,7 @@ class MultiExchangeStrategyManager:
         self.or_engine = or_engine
         self.canary_sensor = canary_sensor
         self.inventory_bias_engine = inventory_bias_engine
+        self.fair_price_service = fair_price_service
         self.regime_analyzer = regime_analyzer
         self.storage = storage
         self.safety_components = safety_components or []
@@ -336,6 +338,30 @@ class MultiExchangeStrategyManager:
                             ticker.ask,
                         )
                     )
+
+            if self.fair_price_service:
+                # Check if this ticker is relevant for Oracle or Target
+                # This logic assumes the service knows its symbols
+                is_oracle = ticker.symbol == self.fair_price_service.oracle_symbol and (
+                    self.fair_price_service.oracle_exchange is None
+                    or ticker.exchange == self.fair_price_service.oracle_exchange
+                )
+
+                if is_oracle:
+                    self.fair_price_service.update_oracle(
+                        ticker.mid_price, ticker.timestamp
+                    )
+                elif ticker.symbol == self.fair_price_service.target_symbol:
+                    self.fair_price_service.update_target(
+                        ticker.mid_price, ticker.timestamp
+                    )
+
+                # Update current venue's market state with the computed Fair Price
+                # Note: We probably only want to do this for the Target venue?
+                # But it doesn't hurt to have it available globally if keys don't collide.
+                fp_signal = self.fair_price_service.get_signal()
+                if fp_signal.get("ready"):
+                    venue.market_state.signals.update(fp_signal)
 
             if self.inventory_bias_engine:
                 position = self.portfolio.get_position(ticker.symbol, exchange)
@@ -598,9 +624,10 @@ class MultiExchangeStrategyManager:
             if self.signal_engine:
                 venue.market_state.signals.update(self.signal_engine.get_signals())
 
-            active_strategy = (
-                venue.config.strategy if venue.config.strategy else self.strategy
-            )
+            active_strategy = venue.config.strategy
+            if not active_strategy:
+                # No strategy assigned to this venue (Read-Only / Oracle)
+                return
 
             desired_orders = active_strategy.calculate_quotes(
                 venue.market_state, position, tick_size=tick_size, exchange=exchange

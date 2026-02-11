@@ -73,11 +73,21 @@ class BinanceAdapter(BaseExchangeAdapter):
         """Fetch current Binance server time in milliseconds."""
         url = f"{self.base_url}/fapi/v1/time"
         try:
-            async with self.session.get(url) as resp:
-                if resp.status == 200:
-                    data = self._fast_json_decode(await resp.read())
-                    return int(data.get("serverTime", 0))
-                raise Exception(f"Binance API error: {resp.status}")
+            if self.session and not self.session.closed:
+                async with self.session.get(url) as resp:
+                    if resp.status == 200:
+                        data = self._fast_json_decode(await resp.read())
+                        return int(data.get("serverTime", 0))
+                    raise Exception(f"Binance API error: {resp.status}")
+            else:
+                # Fallback for when TimeSync triggers before connect()
+                async with aiohttp.ClientSession() as temp_session:
+                    async with temp_session.get(url) as resp:
+                        if resp.status == 200:
+                            data = self._fast_json_decode(await resp.read())
+                            return int(data.get("serverTime", 0))
+                        raise Exception(f"Binance API error: {resp.status}")
+
         except Exception as e:
             logger.error(f"Failed to fetch Binance server time: {e}")
             raise
@@ -438,6 +448,28 @@ class BinanceAdapter(BaseExchangeAdapter):
                 while self.connected:
                     try:
                         msg = await asyncio.wait_for(ws.receive_json(), timeout=5.0)
+
+                        # Apply TimeSync offset to convert Server Time to Local Time
+                        # Offset = Server - Local => Local = Server - Offset
+                        offset = 0
+                        if self.time_sync_manager:
+                            offset = self.time_sync_manager.get_offset(self.name)
+
+                        raw_ts = float(msg.get("E", msg.get("T", time.time() * 1000)))
+                        adjusted_ts = (raw_ts - offset) / 1000.0
+
+                        # CRITICAL FIX: Initial Snapshot / Illiquid Pair Handling
+                        # If the "Event Time" is wildly old (>5s), it likely means Binance sent the "last known state"
+                        # for an illiquid pair (or upon connect), not a network delay.
+                        # For an Oracle, this IS the current price. We clamp it to 'now' to satisfy LatencyMonitor.
+                        now = time.time()
+                        if (now - adjusted_ts) > 5.0:
+                            logger.warning(
+                                f"Stale Binance data detected ({now - adjusted_ts:.1f}s old). "
+                                f"Clamping timestamp to Now (Oracle Mode)."
+                            )
+                            adjusted_ts = now
+
                         ticker = Ticker(
                             symbol=symbol,
                             bid=float(msg.get("b", 0)),
@@ -447,7 +479,7 @@ class BinanceAdapter(BaseExchangeAdapter):
                             last=0.0,
                             volume=0.0,
                             exchange=self.name,
-                            timestamp=float(msg.get("T", time.time() * 1000)) / 1000.0,
+                            timestamp=adjusted_ts,
                         )
                         if self.ticker_callback:
                             await self.ticker_callback(ticker)

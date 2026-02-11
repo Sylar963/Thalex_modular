@@ -113,15 +113,15 @@ class ConfigFactory:
                         )
 
                 elif venue_name == "binance":
-                    key = os.getenv("BINANCE_API_KEY")
-                    secret = os.getenv("BINANCE_API_SECRET")
-                    if key and secret:
-                        gw = BinanceAdapter(
-                            key,
-                            secret,
-                            testnet=venue_testnet,
-                            time_sync_manager=time_sync_manager,
-                        )
+                    key = os.getenv("BINANCE_API_KEY", "")
+                    secret = os.getenv("BINANCE_API_SECRET", "")
+                    # Initialize even if keys are empty (Public Only Mode)
+                    gw = BinanceAdapter(
+                        key,
+                        secret,
+                        testnet=venue_testnet,
+                        time_sync_manager=time_sync_manager,
+                    )
 
                 elif venue_name == "hyperliquid":
                     key = os.getenv("HYPERLIQUID_PRIVATE_KEY")
@@ -136,7 +136,8 @@ class ConfigFactory:
                     logger.warning(f"Unknown venue type: {venue_name}")
                     continue
 
-                if not gw:
+                if not gw and venue_name != "binance":
+                    # Binance can work in public-only mode
                     logger.warning(f"Skipping {venue_name}: Missing credentials.")
                     continue
 
@@ -170,7 +171,7 @@ class ConfigFactory:
                         else:
                             # Default to Avellaneda/Stoikov
                             v_strat_params = venue_cfg.get("strategy_params")
-                            if v_strat_params:
+                            if v_strat_params is not None:
                                 venue_strategy = AvellanedaStoikovStrategy()
                                 merged = strategy_params.copy()
                                 merged.update(v_strat_params)
@@ -255,3 +256,39 @@ class ConfigFactory:
         sensor = CanarySensor(window_ms=window_ms)
         logger.info(f"Canary sensor enabled (window={window_ms}ms).")
         return sensor
+
+    @staticmethod
+    def create_fair_price_service(bot_config: dict):
+        from src.domain.services.fair_price_service import FairPriceService
+
+        fp_config = bot_config.get("fair_price_engine", {})
+        if not fp_config.get("enabled", False):
+            return None
+
+        oracle_conf = fp_config.get("oracle", {})
+        target_symbol = bot_config.get("primary_instrument")
+
+        # If multi-venue, primary might be ambiguous, but usually we focus on the main one
+        # or we might need a map. For now, assume single target or primary config.
+        # Ideally, FairPriceService is per-target.
+
+        # If we have multiple targets, we might need a Manager or multiple Services.
+        # configuration guide assumes simple "oracle" -> "target" relationship.
+
+        if not target_symbol:
+            # Fallback to first symbol in venues?
+            # For now, let's use a safe default or warn
+            logger.warning("No primary_instrument found for FairPriceService target.")
+            return None
+
+        service = FairPriceService(
+            oracle_symbol=oracle_conf.get("symbol", "BTCUSDT"),
+            target_symbol=target_symbol,
+            oracle_exchange=oracle_conf.get("exchange"),
+            window_duration=fp_config.get("window_seconds", 300),
+            min_samples=fp_config.get("min_samples", 10),
+        )
+        logger.info(
+            f"FairPriceService initialized: {oracle_conf.get('symbol')} -> {target_symbol}"
+        )
+        return service

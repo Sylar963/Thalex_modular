@@ -28,8 +28,10 @@ class LatencyMonitor(SafetyComponent):
         lag = now - timestamp
 
         if lag > self.max_latency:
+            ticker = context.get("ticker")
+            info = f"{ticker.symbol}@{ticker.exchange}" if ticker else "unknown"
             logger.warning(
-                f"Latency Limit Exceeded: {lag:.4f}s > {self.max_latency}s. Halting."
+                f"Latency Limit Exceeded [{info}]: {lag:.4f}s > {self.max_latency}s. Halting."
             )
             return False
 

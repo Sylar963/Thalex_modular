@@ -27,6 +27,7 @@ class FairPriceService(SignalEngine):
         self,
         oracle_symbol: str,
         target_symbol: str,
+        oracle_exchange: Optional[str] = None,
         window_duration: int = 300,
         min_samples: int = 10,
     ):
@@ -34,11 +35,13 @@ class FairPriceService(SignalEngine):
         Args:
             oracle_symbol: The symbol acting as the leader (e.g., BTCUSDT).
             target_symbol: The symbol being traded (e.g., BTC-PERPETUAL).
+            oracle_exchange: Specific exchange for the oracle (e.g., 'binance').
             window_duration: Window size in seconds for offset calculation.
             min_samples: Minimum samples required to broadcast a valid fair price.
         """
         self.oracle_symbol = oracle_symbol
         self.target_symbol = target_symbol
+        self.oracle_exchange = oracle_exchange
         self.window_duration = window_duration
         self.min_samples = min_samples
 
@@ -110,12 +113,21 @@ class FairPriceService(SignalEngine):
 
     # SignalEngine Interface (Optional compliance)
     def update(self, ticker: Ticker):
-        # This is a bit complex because we need TWO inputs.
-        # This Service likely needs to be fed explicitly by StrategyManager
-        # or wired to both Adapters.
+        """
+        Standard interface update.
+        In this specific service, we prefer update_oracle/update_target for clarity,
+        but we can route based on symbol if needed.
+        """
+        if ticker.symbol == self.oracle_symbol:
+            self.update_oracle(ticker.mid_price, ticker.timestamp)
+        elif ticker.symbol == self.target_symbol:
+            self.update_target(ticker.mid_price, ticker.timestamp)
+
+    def update_trade(self, trade):
+        """Not utilized for Fair Value calculation yet."""
         pass
 
-    def get_signals(self) -> Dict[str, float]:
+    def get_signals(self, symbol: Optional[str] = None) -> Dict[str, float]:
         if self.fair_price:
             return {"fair_price": self.fair_price}
         return {}

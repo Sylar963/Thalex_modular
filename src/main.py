@@ -229,6 +229,7 @@ async def main():
 
         safety_components = ConfigFactory.create_safety_components(bot_config)
         canary_sensor = ConfigFactory.create_canary_sensor(bot_config)
+        fair_price_service = ConfigFactory.create_fair_price_service(bot_config)
 
         for cfg in exchange_configs:
             logger.info(f"Configured {cfg.gateway.name} for {cfg.symbol}")
@@ -260,6 +261,7 @@ async def main():
             or_engine=or_engine,
             canary_sensor=canary_sensor,
             inventory_bias_engine=inventory_bias_engine,
+            fair_price_service=fair_price_service,
             storage=storage,
             regime_analyzer=regime_analyzer,
             safety_components=safety_components,
