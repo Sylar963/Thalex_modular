@@ -465,8 +465,15 @@ class OpenRangeSignalEngine(SignalEngine):
         self._session_just_completed = False
         return result
 
-    def get_signals(self) -> Dict[str, float]:
-        return self.signals.copy()
+    def get_signals(self, symbol: Optional[str] = None) -> Dict[str, float]:
+        if symbol:
+            return self.signals.get(symbol, {}).copy()
+        # If no symbol provided, this might break if caller expects flat dict.
+        # But based on usage, we either want a specific symbol's signals or a map of all?
+        # The Interface says Dict[str, float].
+        # If no symbol, we can't really return a flat dict of floats unless we flatten everything.
+        # For now, let's assume if no symbol, we return an empty dict or we urge callers to pass symbol.
+        return {}
 
     def _update_signals(self, symbol: str):
         state = self._get_state(symbol)

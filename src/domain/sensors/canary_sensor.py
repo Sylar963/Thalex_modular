@@ -92,7 +92,7 @@ class CanarySensor(SignalEngine):
             }
         )
 
-    def get_signals(self) -> Dict[str, float]:
+    def get_signals(self, symbol: Optional[str] = None) -> Dict[str, float]:
         return {
             "toxicity_score": self._toxicity_score,
             "pull_rate": self._pull_rate,

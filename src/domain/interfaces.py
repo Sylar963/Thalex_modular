@@ -144,7 +144,7 @@ class SignalEngine(ABC):
         pass
 
     @abstractmethod
-    def get_signals(self) -> Dict[str, float]:
+    def get_signals(self, symbol: Optional[str] = None) -> Dict[str, float]:
         """Return current signal values."""
         pass
 

@@ -60,7 +60,7 @@ class InventoryBiasEngine(SignalEngine):
 
         self._calculate_bias()
 
-    def get_signals(self) -> Dict[str, float]:
+    def get_signals(self, symbol: Optional[str] = None) -> Dict[str, float]:
         return {
             "suppress_bids": self._suppress_bids,
             "suppress_asks": self._suppress_asks,

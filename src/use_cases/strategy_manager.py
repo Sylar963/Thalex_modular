@@ -411,7 +411,7 @@ class MultiExchangeStrategyManager:
                 if hasattr(self.signal_engine, "pop_completed_candle"):
                     completed = self.signal_engine.pop_completed_candle()
                     if completed and self.storage and not self.dry_run:
-                        signals = self.signal_engine.get_signals()
+                        signals = self.signal_engine.get_signals(trade.symbol)
                         asyncio.create_task(
                             self.storage.save_signal(trade.symbol, "vamp", signals)
                         )
@@ -953,8 +953,8 @@ class MultiExchangeStrategyManager:
         symbol = venue.config.symbol
         venue_key = f"{exchange}:{symbol}"
 
-        vamp_signals = self.signal_engine.get_signals()
-        or_signals = self.or_engine.get_signals()
+        vamp_signals = self.signal_engine.get_signals(symbol)
+        or_signals = self.or_engine.get_signals(symbol)
         trend_val = self._venue_trends.get(symbol, 0.0)
         trend_side = (
             self.trend_service.get_trend_side(trend_val)

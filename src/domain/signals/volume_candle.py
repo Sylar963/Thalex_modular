@@ -95,7 +95,7 @@ class VolumeCandleSignalEngine(SignalEngine):
         if self.current_candle.volume >= self.volume_threshold:
             self._complete_candle()
 
-    def get_signals(self) -> Dict[str, float]:
+    def get_signals(self, symbol: Optional[str] = None) -> Dict[str, float]:
         return self.signals.copy()
 
     def _complete_candle(self):
