@@ -211,7 +211,10 @@ class MultiExchangeStrategyManager:
         # Fetch initial balances
         try:
             if hasattr(gw, "get_balances"):
-                await gw.get_balances()
+                balances = await gw.get_balances()
+                if balances:
+                    for b in balances:
+                        self.portfolio.update_balance(b)
         except Exception as e:
             logger.warning(f"Failed to fetch initial balances for {gw.name}: {e}")
 
@@ -474,6 +477,7 @@ class MultiExchangeStrategyManager:
         return callback
 
     async def _handle_balance_update(self, balance):
+        self.portfolio.update_balance(balance)
         await self.sync_engine.update_balance(balance)
         if self.storage:
             await self.storage.save_balance(balance)

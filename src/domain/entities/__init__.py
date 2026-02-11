@@ -106,19 +106,18 @@ class Position:
         """
         if current_price <= 0:
             return self
-            
+
         new_upnl = 0.0
         if self.size != 0:
             # Linear PnL Formula
             new_upnl = (current_price - self.entry_price) * self.size
-            
+
         return replace(
             self,
             mark_price=current_price,
             unrealized_pnl=new_upnl,
-            timestamp=time.time()
+            timestamp=time.time(),
         )
-
 
 
 @dataclass(slots=True)
@@ -129,9 +128,41 @@ class MarketState:
     timestamp: float = field(default_factory=time.time)
 
 
+@dataclass(slots=True)
+class Balance:
+    exchange: str
+    asset: str
+    total: float
+    available: float
+    margin_used: float = 0.0
+    equity: float = 0.0
+    timestamp: float = field(default_factory=time.time)
+
+
 @dataclass
 class Portfolio:
     positions: Dict[str, Position] = field(default_factory=dict)
+    balances: Dict[str, Balance] = field(default_factory=dict)
+
+    @property
+    def total_equity(self) -> float:
+        """
+        Returns the total equity across all exchanges.
+        Note: This assumes all balance equities are in the same currency (e.g. USD/USDT)
+        or that non-USD equities are negligible for this calculation.
+        """
+        return sum(b.equity for b in self.balances.values())
+
+    def update_balance(self, balance: Balance):
+        # Key by exchange (assuming one main account/asset per exchange for now)
+        # or key by (exchange, asset).
+        # Given StrategyManager uses total_equity, we probably want to key by exchange+asset if possible
+        # but to keep it simple and consistent with how we might use it:
+        # If we just overwrite by exchange, we lose multi-asset tracking.
+        # But if the bot is mono-asset (USDT), it's fine.
+        # Let's use a composite key to be safe.
+        key = f"{balance.exchange}:{balance.asset}"
+        self.balances[key] = balance
 
     def get_position(self, symbol: str, exchange: str = "") -> Position:
         key = f"{exchange}:{symbol}" if exchange else symbol
@@ -161,14 +192,3 @@ class Portfolio:
 
     def all_positions(self) -> List[Position]:
         return list(self.positions.values())
-
-
-@dataclass(slots=True)
-class Balance:
-    exchange: str
-    asset: str
-    total: float
-    available: float
-    margin_used: float = 0.0
-    equity: float = 0.0
-    timestamp: float = field(default_factory=time.time)
