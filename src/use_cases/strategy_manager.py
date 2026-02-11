@@ -639,6 +639,16 @@ class MultiExchangeStrategyManager:
                     rounded = round(o.price / tick_size) * tick_size
                     desired_orders[i] = replace(o, price=rounded, exchange=exchange)
 
+            # --- Metrics Caching for API ---
+            if hasattr(active_strategy, "get_last_metrics"):
+                metrics = active_strategy.get_last_metrics()
+                if metrics:
+                    # Enrich with Venue context
+                    metrics["exchange"] = exchange
+                    metrics["symbol"] = venue.config.symbol
+                    # Store in robust memory cache on venue context
+                    venue._last_strategy_metrics = metrics
+
             # Fetch ALL open orders (confirmed + pending) for risk validation
             all_open_tracked = await venue.state_tracker.get_open_orders(
                 include_pending=True

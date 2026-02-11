@@ -410,8 +410,8 @@ class BybitAdapter(BaseExchangeAdapter):
             "symbol": mapped_symbol,
             "side": "Buy" if order.side == OrderSide.BUY else "Sell",
             "orderType": "Limit" if order.type == OrderType.LIMIT else "Market",
-            "qty": str(order.size),
-            "price": str(order.price),
+            "qty": self._format_number(order.size),
+            "price": self._format_number(order.price),
             "timeInForce": "PostOnly" if order.post_only else "GTC",
             "orderLinkId": order.id,
         }

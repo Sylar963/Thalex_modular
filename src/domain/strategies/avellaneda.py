@@ -226,7 +226,11 @@ class AvellanedaStoikovStrategy(Strategy):
         # B. Components
         gamma_component = 1.0 + gamma
         volatility_term = self.volatility * volatility_mult
-        volatility_component = volatility_term * math.sqrt(self.position_fade_time)
+        # Volatility Component (Corrected Units)
+        # Convert fade time to days (since vol is daily)
+        # Scale by price (since vol is percentage)
+        time_scaling = math.sqrt(self.position_fade_time / 86400.0)
+        volatility_component = (volatility_term * anchor_price) * time_scaling
 
         # Inventory Risk Component
         current_pos = position.size
@@ -234,11 +238,15 @@ class AvellanedaStoikovStrategy(Strategy):
         inventory_risk = abs(current_pos) / safe_pos_limit
         inventory_risk = min(inventory_risk, 10.0)  # Cap risk
 
-        inventory_component = inventory_factor * inventory_risk * volatility_term
+        inventory_component = (
+            inventory_factor * inventory_risk * volatility_term * anchor_price
+        )
 
         # Market Impact (Placeholder from signals)
         impact_signal = market_state.signals.get("market_impact", 0.0)
-        market_impact_comp = impact_signal * 0.5 * (1 + self.volatility)
+        # Assuming impact_signal is a relative factor (e.g. 0.01 for 1% impact)
+        # We scale it by price to get dollar impact
+        market_impact_comp = impact_signal * 0.5 * (1 + self.volatility) * anchor_price
 
         toxicity_score = market_state.signals.get("toxicity_score", 0.0)
         toxicity_spread_mult = 1.0 + (toxicity_score * 0.5)
@@ -352,7 +360,31 @@ class AvellanedaStoikovStrategy(Strategy):
                     )
                 )
 
+        # --- 6. Metrics Capture ---
+        self._last_metrics = {
+            "timestamp": timestamp,
+            "mid_price": mid_price,
+            "anchor_price": anchor_price,
+            "reservation_price": (raw_ask + raw_bid) / 2.0,  # Approximate Res Price
+            "bid_price": bid_price,
+            "ask_price": ask_price,
+            "spread": final_spread,
+            "gamma": gamma,
+            "volatility": volatility_component,
+            "inventory_risk": inventory_risk,
+            "inventory_skew": inventory_skew,
+            "position": current_pos,
+            "quote_levels": self.quote_levels,
+        }
+
         return orders
+
+    def get_last_metrics(self) -> Dict[str, Any]:
+        """
+        Return internal metrics from the last calculation cycle.
+        Useful for monitoring 'Gamma Band', Inventory Risk, and Reservation Price.
+        """
+        return getattr(self, "_last_metrics", {})
 
     def _round_to_tick(self, price: float) -> float:
         return round(price / self.tick_size) * self.tick_size

@@ -167,6 +167,13 @@ class BaseExchangeAdapter(ExchangeGateway):
         # We decode to utf-8 str because some libs (like thalex py) expect str.
         return orjson.dumps(data).decode("utf-8")
 
+    def _format_number(self, value: float, precision: int = 10) -> str:
+        """Format a float to a decimal string, avoiding scientific notation."""
+        if value == 0:
+            return "0"
+        s = "{:.{p}f}".format(value, p=precision)
+        return s.rstrip("0").rstrip(".") if "." in s else s
+
     def _fast_json_decode(self, data: Union[str, bytes]) -> Any:
         return orjson.loads(data)
 
