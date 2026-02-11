@@ -131,12 +131,13 @@ class MarketAnalyzer:
         capital,
         min_order_size,
         target_return=0.02,
+        vol_spread_factor=0.15,
     ) -> Dict:
         fee_cost_per_unit = price * (self.maker_fee * 2)
         min_profitable_spread = fee_cost_per_unit * 1.5
         min_profitable_ticks = math.ceil(min_profitable_spread / tick_size)
 
-        vol_spread = price * daily_vol * 0.15
+        vol_spread = price * daily_vol * vol_spread_factor
         vol_spread_ticks = math.ceil(vol_spread / tick_size)
 
         recommended_spread_ticks = max(min_profitable_ticks, vol_spread_ticks)

@@ -10,7 +10,15 @@ from .report_generator import ReportGenerator
 
 
 async def analyze_symbol(
-    symbol, capital, min_qty_override, fetcher, analyzer, visualizer, reporter
+    symbol,
+    capital,
+    min_qty_override,
+    fetcher,
+    analyzer,
+    visualizer,
+    reporter,
+    spread_factor=0.15,
+    dump_config=False,
 ):
     print(f"\nAnalyzing {symbol}...")
 
@@ -41,8 +49,34 @@ async def analyze_symbol(
     ob_analysis = analyzer.analyze_orderbook(ob)
 
     params = analyzer.recommend_params(
-        price, tick_size, vol_data[1], vol_profile[0], capital, min_qty
+        price,
+        tick_size,
+        vol_data[1],
+        vol_profile[0],
+        capital,
+        min_qty,
+        vol_spread_factor=spread_factor,
     )
+
+    if dump_config:
+        import json
+
+        s_conf = {
+            "type": "avellaneda",
+            "params": {
+                "gamma": params["gamma"],
+                "volatility": round(vol_data[1], 4),
+                "position_limit": float(params["position_limit"]),
+                "order_size": float(params["order_size"]),
+                "min_spread": int(params["min_spread_ticks"]),
+                "quote_levels": int(params["quote_levels"]),
+                "level_spacing_factor": float(params["level_spacing_factor"]),
+                "recalc_interval": 0.5,
+            },
+        }
+        print(f"\n--- CONFIG SNIPPET FOR {symbol} ---")
+        print(json.dumps(s_conf, indent=4))
+        print("-----------------------------------\n")
 
     # 4. Heatmap Data
     matrix, spreads, sizes = analyzer.generate_profitability_matrix(
@@ -130,6 +164,17 @@ async def main():
         "--size", type=float, help="Override minimum order size (e.g. 0.1)"
     )
     parser.add_argument(
+        "--spread-factor",
+        type=float,
+        default=0.15,
+        help="Volatility spread factor (default 0.15). Lower for tighter spreads.",
+    )
+    parser.add_argument(
+        "--dump-config",
+        action="store_true",
+        help="Dump config.json snippet for the strategy.",
+    )
+    parser.add_argument(
         "--mode",
         choices=["analyze", "performance"],
         default="analyze",
@@ -157,6 +202,8 @@ async def main():
                     analyzer,
                     visualizer,
                     reporter,
+                    spread_factor=args.spread_factor,
+                    dump_config=args.dump_config,
                 )
             else:
                 res = await analyze_performance(

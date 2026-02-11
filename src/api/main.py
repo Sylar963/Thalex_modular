@@ -18,6 +18,7 @@ from .v1.endpoints import (
     aggregated,
     signals,
     bot,
+    strategy,
 )
 
 
@@ -67,6 +68,7 @@ app.include_router(config.router, prefix="/api/v1/config", tags=["Configuration"
 app.include_router(aggregated.router, prefix="/api/v1/aggregated", tags=["Aggregated"])
 app.include_router(signals.router, prefix="/api/v1/signals", tags=["Signals"])
 app.include_router(bot.router, prefix="/api/v1/bot", tags=["Bot Control"])
+app.include_router(strategy.router, prefix="/api/v1/strategy", tags=["Strategy"])
 
 
 @app.get("/health")

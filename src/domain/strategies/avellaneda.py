@@ -264,18 +264,23 @@ class AvellanedaStoikovStrategy(Strategy):
 
         # Linear Inventory Skew
         # Shift = (CurrentPos / Limit) * Spread * Factor
-        # Positive Pos (Long) -> Shift > 0 -> Lower Prices (Sell harder, Buy less)
-        # But wait:
-        # If Long: logic says "lower prices" to dump inventory?
-        # Logic in legacy:
-        # bid = mid - half - skew
-        # ask = mid + half - skew
-        # If skew > 0 (Long), Bid drops, Ask drops. Correct.
+
+        # FIX: Decouple skew from inventory-widened spread to prevent quadratic explosion
+        # Use optimal_spread WITHOUT inventory_component as base
+        skew_base_spread = (
+            base_spread * gamma_component + volatility_component + market_impact_comp
+        )
+        # Also ensure we respect min spread for skew base
+        skew_base_spread = max(skew_base_spread, fee_coverage_spread)
 
         inventory_skew_factor = self.inventory_weight * 0.5
-        inventory_skew = (
-            (current_pos / safe_pos_limit) * final_spread * inventory_skew_factor
-        )
+
+        # FIX: Cap the skew ratio to prevent extreme leverage from pushing quotes to infinity
+        # At 10x leverage, ratio could be 10.0. We cap at 3.0 (heuristic).
+        raw_skew_ratio = current_pos / safe_pos_limit
+        capped_skew_ratio = max(min(raw_skew_ratio, 3.0), -3.0)
+
+        inventory_skew = capped_skew_ratio * skew_base_spread * inventory_skew_factor
 
         # Signal Offsets
         res_offset = (
