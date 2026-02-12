@@ -47,8 +47,8 @@
         "params": {
             "gamma": 0.28,
             "volatility": 0.0565,
-            "position_limit": 3.0,
-            "order_size": 10,
+            "position_limit": 50.0,
+            "order_size": 20,
             "min_spread": 26,
             "quote_levels": 3,
             "level_spacing_factor": 0.5,
